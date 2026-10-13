@@ -319,6 +319,16 @@ hours on a CPU.
 
 `omnifrog.exe` is one file: it needs nothing beside it but the system's own libraries.
 
+**The installer.** `omnifrog-<version>-windows-x86_64-setup.exe` puts `omnifrog.exe` and
+`omnifrog-gui.exe` under `%LOCALAPPDATA%\Programs\Omnifrog`, with an empty `tools\` folder beside
+them and a Start-menu shortcut to the window. It is per user and asks for no administrator; `/S`
+runs it without a wizard and `/D=<dir>` (last on the line, no quotes) chooses the folder. It
+installs none of what the steps below ask for, and its uninstaller leaves the configuration, what
+`setup` installed and whatever was put in `tools\`. It is not signed: Windows asks before running
+it. `.github/workflows/windows-installer.yml` builds it — on a pull request that touches
+`packaging/windows/`, on a run started by hand, and on a `v*` tag, which also attaches it to a
+draft release.
+
 1. **Python 3.12** from python.org, with the `py` launcher it installs — the Microsoft Store's
    `python` does not do.
 2. **An NVIDIA driver recent enough for CUDA 12.8** (the 570 series or later). `setup` finds the card
