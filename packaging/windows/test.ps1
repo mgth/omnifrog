@@ -24,7 +24,7 @@ $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Omnifrog'
 $install = Start-Process -FilePath $Setup -ArgumentList '/S', "/D=$dir" -Wait -PassThru
 Check ($install.ExitCode -eq 0) "silent install exits 0 (got $($install.ExitCode))"
 
-foreach ($name in 'omnifrog.exe', 'omnifrog-gui.exe', 'README.md', 'uninstall.exe', 'tools') {
+foreach ($name in 'omnifrog.exe', 'omnifrog-gui.exe', 'README.md', 'LICENSE.txt', 'uninstall.exe', 'tools') {
     Check (Test-Path (Join-Path $dir $name)) "$name is installed"
 }
 Check (Test-Path $link) 'the Start-menu shortcut is there'
@@ -48,7 +48,7 @@ while ((Test-Path (Join-Path $dir 'omnifrog.exe')) -and (Get-Date) -lt $deadline
 }
 Start-Sleep -Seconds 2
 
-foreach ($name in 'omnifrog.exe', 'omnifrog-gui.exe', 'README.md', 'uninstall.exe') {
+foreach ($name in 'omnifrog.exe', 'omnifrog-gui.exe', 'README.md', 'LICENSE.txt', 'uninstall.exe') {
     Check (-not (Test-Path (Join-Path $dir $name))) "$name is removed"
 }
 Check (-not (Test-Path $link)) 'the Start-menu shortcut is removed'

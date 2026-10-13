@@ -360,4 +360,4 @@ keeps the film's full name.
 
 ## Licence
 
-GPL-3.0-or-later (to be confirmed before publication).
+GPL-3.0-or-later, see [LICENSE](LICENSE).

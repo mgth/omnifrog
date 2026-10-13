@@ -2,7 +2,7 @@
 ;
 ;   makensis -DVERSION=0.1.0 -DSTAGE=<dir> -DOUTFILE=<setup.exe> omnifrog.nsi
 ;
-; STAGE holds omnifrog.exe, omnifrog-gui.exe and README.md.
+; STAGE holds omnifrog.exe, omnifrog-gui.exe, README.md and LICENSE.
 ;
 ; Per user, no elevation: the files go under %LOCALAPPDATA%\Programs\Omnifrog,
 ; with an empty tools\ folder beside them, where the programs look for ffmpeg,
@@ -50,6 +50,7 @@ ShowUninstDetails show
 ; ── Pages ────────────────────────────────────────────────────────────────────
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "${STAGE}/LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !define MUI_FINISHPAGE_TITLE "Omnifrog ${VERSION} is installed"
@@ -71,6 +72,7 @@ Section "Omnifrog"
   File "${STAGE}/omnifrog.exe"
   File "${STAGE}/omnifrog-gui.exe"
   File "${STAGE}/README.md"
+  File "/oname=LICENSE.txt" "${STAGE}/LICENSE"
   CreateDirectory "$INSTDIR\tools"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -98,6 +100,7 @@ Section "Uninstall"
   Delete "$INSTDIR\omnifrog.exe"
   Delete "$INSTDIR\omnifrog-gui.exe"
   Delete "$INSTDIR\README.md"
+  Delete "$INSTDIR\LICENSE.txt"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR\tools"
   RMDir "$INSTDIR"

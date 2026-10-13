@@ -92,7 +92,7 @@ jobs:
 
       - name: Pack
         run: |
-          cp README.md stage/
+          cp README.md LICENSE stage/
           makensis -V2 \
             -DVERSION="${{ steps.version.outputs.version }}" \
             -DSTAGE="$PWD/stage" \
