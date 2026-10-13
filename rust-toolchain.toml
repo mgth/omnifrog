@@ -1,0 +1,6 @@
+# The window (crates/gui) is built on egui 0.36, which needs Rust >= 1.95:
+# the same toolchain as Omniphony Studio's egui client.
+# The core and the command line still build with 1.89 (rust-version).
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

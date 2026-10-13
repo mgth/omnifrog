@@ -1,0 +1,26 @@
+[package]
+name = "omnifrog-cli"
+description = "The omnifrog command line"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "omnifrog"
+path = "src/main.rs"
+
+[dependencies]
+omnifrog-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_yaml_ng.workspace = true
+serde_json.workspace = true
+
+# `head` closing the pipe is not an error worth a panic: the default SIGPIPE
+# disposition, which Rust switches off, is what a listing command wants.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,45 @@
+[package]
+name = "omnifrog-bench"
+description = "The omnifrog model test bench: zones of a film, every model run on each, rated by ear and measured against the outputs rated best"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# The library is the test set, its files and its measures, with no UI in it;
+# the binary is the window over it, and the same work as subcommands.
+[[bin]]
+name = "omnifrog-bench"
+path = "src/main.rs"
+
+[features]
+default = ["pipewire"]
+# On Linux, the outputs of the machine are asked of PipeWire itself, which
+# names them as the desktop does. It takes libpipewire's headers to build
+# and its library to run; without it the outputs are ALSA's. Nothing on
+# another system.
+pipewire = ["cpal/pipewire"]
+
+[dependencies]
+omnifrog-core.workspace = true
+serde.workspace = true
+# A measure is read back as it was written, to the last bit: an imported
+# set is compared with the numbers of the program it came from.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+clap.workspace = true
+rayon.workspace = true
+realfft.workspace = true
+# The same UI stack and versions as omnifrog-gui.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+    "accesskit",
+] }
+egui = "0.36.2"
+rfd = "0.16"
+cpal = "0.18"
