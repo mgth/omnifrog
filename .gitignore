@@ -1,0 +1,3 @@
+/target
+*.part
+__pycache__/

@@ -1,0 +1,43 @@
+[package]
+name = "omnifrog-gui"
+description = "The omnifrog window: set up the machine, choose a film and its two tracks, follow the run"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.95"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "omnifrog-gui"
+path = "src/main.rs"
+
+[dependencies]
+omnifrog-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The same UI stack and versions as Omniphony Studio's egui client;
+# glow rather than wgpu, since nothing here draws more than widgets.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+    "accesskit",
+] }
+egui = "0.36.2"
+rfd = "0.16"
+
+# A cancelled run stops with everything it started: the worker leads a
+# process group (Unix) or sits in a job object (Windows), killed as one.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

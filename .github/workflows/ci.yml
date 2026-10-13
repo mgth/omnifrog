@@ -1,0 +1,66 @@
+# The gate on every push and pull request: format, build, lint and test, on
+# Linux and on Windows — the two platforms this program is for. Nothing here
+# needs a GPU, a model, or any of the tools a run drives: the tests build
+# their own fixtures.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # The Windows runner takes over half an hour to build the window's
+    # egui stack from nothing; the cache holds it from then on.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # The test bench plays through cpal, which builds against ALSA's and
+      # PipeWire's headers on Linux, the latter read by bindgen through
+      # libclang. No test opens a device.
+      - name: Install audio headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Build
+        run: cargo build --all-targets --locked
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all --locked

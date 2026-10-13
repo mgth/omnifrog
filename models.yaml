@@ -1,0 +1,330 @@
+# The separation models omnifrog knows, every entry driven through MSST. `key` is what the configuration and the command line name, `code`
+# is the short form in the output file's name (`<film>.Omnifrog-<vo code>-<vf code>-<encoder>.mka`).
+# `role` is a hint: a "voices" model also serves the original, the worker returns both stems.
+# `rate: 44100` means the worker is handed 48 kHz samples under a 44.1 kHz header, so the
+# Roformer neither resamples nor knows; `rate: 48000` is a true header (Bandit, 48 kHz native).
+# `overlap` replaces the published config's inference.num_overlap (0 or absent = the author's):
+# every sample is computed that many times, so the time is proportional to it.
+# A user file beside the configuration adds or replaces entries by key.
+models:
+  # ---- Roformers of 2025-2026 (Hugging Face, the authors' own repositories) ----
+  - key: uhav
+    name: BS-Roformer HyperACE v2 Voc (unwa)
+    code: uhav
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/bs_roformer_voc_hyperacev2.ckpt, file: bs_roformer_voc_hyperacev2.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/config.yaml, file: bs_hyperace_v2_voc.yaml }
+    module:     { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_voc/bs_roformer.py, file: bs_roformer_hyperace_v2.py }
+    overlap: 2
+    batch: 1
+    notes: "Vocals 11.4 (Dec. 2025). Modified architecture shipped with its own bs_roformer.py. Three to eight times slower than Leap."
+  - key: ubb7
+    name: Mel-Band Big Beta 7 (unwa)
+    code: ubb7
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/Mel-Band-Roformer-big/resolve/main/big_beta7.ckpt, file: big_beta7.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/Mel-Band-Roformer-big/resolve/main/big_beta7.yaml, file: big_beta7.yaml }
+    notes: "Vocals 11.2, bleedless 39 (Feb. 2026). Single-target stem: the rest is derived by subtraction."
+  - key: ulin
+    name: BS-Roformer Large Inst (unwa)
+    code: ulin
+    role: objects
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-Large-Inst/resolve/main/bs_large_v2_inst.ckpt, file: bs_large_v2_inst.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-Large-Inst/resolve/main/config.yaml, file: bs_large_v2_inst.yaml }
+    module:     { url: https://huggingface.co/pcunwa/BS-Roformer-Large-Inst/resolve/main/bs_roformer.py, file: bs_roformer_large.py }
+    notes: "Instrumental 17.6, bleedless 44 (Jan. 2026): the least dialogue left in the rest."
+  - key: ulpi
+    name: BS-Roformer Leap Inst (unwa)
+    code: ulpi
+    role: objects
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/bs_roformer_leap_inst.ckpt, file: bs_roformer_leap_inst.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/bs_leap_inst_conf.yaml, file: bs_leap_inst_conf.yaml }
+    notes: "Instrumental 17.8 (June 2026)."
+  - key: ulxi
+    name: BS-Roformer Leap Xe Inst (unwa)
+    code: ulxi
+    role: objects
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/Xe/bs_leap_xe_inst.ckpt, file: bs_leap_xe_inst.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/Xe/leap_xe_config_inst.yaml, file: leap_xe_config_inst.yaml }
+    notes: "Instrumental 17.5, fullness 35 (June 2026)."
+  - key: uhai
+    name: BS-Roformer HyperACE v2 Inst (unwa)
+    code: uhai
+    role: objects
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_inst/bs_roformer_inst_hyperacev2.ckpt, file: bs_roformer_inst_hyperacev2.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_inst/config.yaml, file: bs_hyperace_v2_inst.yaml }
+    module:     { url: https://huggingface.co/pcunwa/BS-Roformer-HyperACE/resolve/main/v2_inst/bs_roformer.py, file: bs_roformer_hyperace_v2.py }
+    overlap: 2
+    notes: "Instrumental 17.4, fullness 38 (Dec. 2025). Three to eight times slower than Leap."
+  - key: ulpv
+    name: BS-Roformer Leap (unwa)
+    code: ulpv
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/bs_roformer_leap_voc.ckpt, file: bs_roformer_leap_voc.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/bs_leap_voc_conf.yaml, file: bs_leap_voc_conf.yaml }
+    notes: "Vocals 11.7, bleedless 39 (June 2026)."
+  - key: ulxv
+    name: BS-Roformer Leap Xe (unwa)
+    code: ulxv
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/Xe/bs_leap_xe_voc.ckpt, file: bs_leap_xe_voc.ckpt }
+    config:     { url: https://huggingface.co/pcunwa/BS-Roformer-Leap/resolve/main/Xe/leap_xe_config_voc.yaml, file: leap_xe_config_voc.yaml }
+    notes: "Vocals 11.8, fullness 18 (June 2026)."
+  - key: aft1
+    name: BS-Roformer FT1 (anvuew)
+    code: aft1
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://huggingface.co/anvuew/BS-RoFormer/resolve/main/bs_roformer_ft1_anvuew_sdr_12.55.ckpt, file: bs_roformer_ft1_anvuew_sdr_12.55.ckpt }
+    config:     { url: https://huggingface.co/anvuew/BS-RoFormer/resolve/main/config.yaml, file: bs_roformer_anvuew_ft1.yaml }
+    notes: "Vocals 11.5 (April 2026)."
+  - key: gfu4
+    name: Mel-Band Gabox Fullness V4
+    code: gfu4
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/inst_Fv4.ckpt, file: inst_Fv4.ckpt }
+    config:     { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/inst_gabox.yaml, file: inst_gabox.yaml }
+  - key: gfv9
+    name: Mel-Band Gabox FV9
+    code: gfv9
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/Inst_GaboxFv9.ckpt, file: Inst_GaboxFv9.ckpt }
+    config:     { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/inst_gabox.yaml, file: inst_gabox.yaml }
+  - key: gfl10
+    name: Mel-Band Gabox Flowers V10
+    code: gfl10
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/inst_gaboxFlowersV10.ckpt, file: inst_gaboxFlowersV10.ckpt }
+    config:     { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/instrumental/v10.yaml, file: v10.yaml }
+  - key: gvf7
+    name: Mel-Band Gabox voc_fv7
+    code: gvf7
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/vocals/voc_fv7.ckpt, file: voc_fv7.ckpt }
+    config:     { url: https://huggingface.co/GaboxR67/MelBandRoformers/resolve/main/melbandroformers/vocals/v7.yaml, file: v7.yaml }
+  - key: bcd
+    name: Mel-Band becruily deux
+    code: bcd
+    role: both
+    model_type: mel_band_roformer
+    checkpoint: { url: https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/becruily_deux.ckpt, file: becruily_deux.ckpt }
+    config:     { url: https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/config_deux_becruily.yaml, file: config_deux_becruily.yaml }
+    notes: "Dual vocals + instrumental (Dec. 2025): vocals 11.4, instrumental 17.6."
+
+  # ---- Bandit v2: the one model trained on film sound (DnR v3), 48 kHz native, speech / music / sfx ----
+  - key: bd2
+    name: Bandit v2 (cinema)
+    code: bd2
+    role: both
+    model_type: bandit_v2
+    checkpoint: { url: "https://zenodo.org/records/12701995/files/checkpoint-multi.ckpt?download=1", file: bandit_v2_multi.msst.ckpt, convert: strip-lightning }
+    config:     { url: https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/ccc011abf7f89dd7922bb2888d48493b575c0289/configs/config_dnr_bandit_v2_mus64.yaml, file: config_dnr_bandit_v2_mus64.yaml }
+    rate: 48000
+    notes: "Multilingual. DnR v3 12.3. Lightning checkpoint converted after download."
+  - key: bd2q
+    name: Bandit v2 (max quality)
+    code: bd2q
+    role: both
+    model_type: bandit_v2
+    checkpoint: { url: "https://zenodo.org/records/12701995/files/checkpoint-multi.ckpt?download=1", file: bandit_v2_multi.msst.ckpt, convert: strip-lightning }
+    config:     { url: https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/ccc011abf7f89dd7922bb2888d48493b575c0289/configs/config_dnr_bandit_v2_mus64.yaml, file: config_dnr_bandit_v2_mus64.yaml }
+    rate: 48000
+    bigshifts: 4
+    tta: true
+    notes: "Same checkpoint, four shifted passes and test-time augmentation: about twelve times the work for the same loudness measured locally."
+  - key: bd2f
+    name: Bandit v2 (cinema, French only)
+    code: bd2f
+    role: voices
+    model_type: bandit_v2
+    checkpoint: { url: "https://zenodo.org/records/12701995/files/checkpoint-fra.ckpt?download=1", file: bandit_v2_fra.msst.ckpt, convert: strip-lightning }
+    config:     { url: https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/ccc011abf7f89dd7922bb2888d48493b575c0289/configs/config_dnr_bandit_v2_mus64.yaml, file: config_dnr_bandit_v2_mus64.yaml }
+    rate: 48000
+    notes: "The French-only checkpoint of Bandit v2."
+
+  # ---- The audio-separator registry (mirrored by python-audio-separator's `model-configs` release) ----
+  - key: kv1e
+    name: Mel-Band Kim Inst V1e Plus
+    code: kv1e
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/melband_roformer_inst_v1e_plus.ckpt, file: melband_roformer_inst_v1e_plus.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_melbandroformer_inst.yaml, file: config_melbandroformer_inst.yaml }
+    notes: "A former default for the objects."
+  - key: kv2
+    name: Mel-Band Kim Inst V2
+    code: kv2
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/melband_roformer_inst_v2.ckpt, file: melband_roformer_inst_v2.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_melbandroformer_inst_v2.yaml, file: config_melbandroformer_inst_v2.yaml }
+  - key: kd1
+    name: Mel-Band Kim InstVoc Duality V1
+    code: kd1
+    role: both
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/melband_roformer_instvoc_duality_v1.ckpt, file: melband_roformer_instvoc_duality_v1.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_melbandroformer_instvoc_duality.yaml, file: config_melbandroformer_instvoc_duality.yaml }
+  - key: kd2
+    name: Mel-Band Kim InstVoc Duality V2
+    code: kd2
+    role: both
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/melband_roformer_instvox_duality_v2.ckpt, file: melband_roformer_instvox_duality_v2.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_melbandroformer_instvoc_duality.yaml, file: config_melbandroformer_instvoc_duality.yaml }
+  - key: bci
+    name: Mel-Band Instrumental becruily
+    code: bci
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_becruily.ckpt, file: mel_band_roformer_instrumental_becruily.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_becruily.yaml, file: config_mel_band_roformer_instrumental_becruily.yaml }
+  - key: kf2b
+    name: Mel-Band Kim FT2 Bleedless
+    code: kf2b
+    role: both
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_kim_ft2_bleedless_unwa.ckpt, file: mel_band_roformer_kim_ft2_bleedless_unwa.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_kim_ft_unwa.yaml, file: config_mel_band_roformer_kim_ft_unwa.yaml }
+    overlap: 2
+    notes: "Published at 8 passes, run at 2: the default dub model, four times faster under MSST."
+  - key: vpx
+    name: BS-Roformer 1297 (ViperX)
+    code: vpx
+    role: both
+    model_type: bs_roformer
+    checkpoint: { url: https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt, file: model_bs_roformer_ep_317_sdr_12.9755.ckpt }
+    config:     { url: https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml, file: model_bs_roformer_ep_317_sdr_12.9755.yaml }
+  - key: giv8
+    name: Mel-Band Gabox INSTV8
+    code: giv8
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_instv8_gabox.ckpt, file: mel_band_roformer_instrumental_instv8_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: gbl3
+    name: Mel-Band Gabox Bleedless V3
+    code: gbl3
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_bleedless_v3_gabox.ckpt, file: mel_band_roformer_instrumental_bleedless_v3_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: gfu3
+    name: Mel-Band Gabox Fullness V3
+    code: gfu3
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_fullness_v3_gabox.ckpt, file: mel_band_roformer_instrumental_fullness_v3_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: gfv7z
+    name: Mel-Band Gabox FV7z
+    code: gfv7z
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_fv7z_gabox.ckpt, file: mel_band_roformer_instrumental_fv7z_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: gfv8
+    name: Mel-Band Gabox FV8
+    code: gfv8
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_fv8_gabox.ckpt, file: mel_band_roformer_instrumental_fv8_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: gfvx
+    name: Mel-Band Gabox FVX
+    code: gfvx
+    role: objects
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_instrumental_fvx_gabox.ckpt, file: mel_band_roformer_instrumental_fvx_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_instrumental_gabox.yaml, file: config_mel_band_roformer_instrumental_gabox.yaml }
+  - key: rsi
+    name: BS-Roformer Instrumental Resurrection (unwa)
+    code: rsi
+    role: objects
+    model_type: bs_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/bs_roformer_instrumental_resurrection_unwa.ckpt, file: bs_roformer_instrumental_resurrection_unwa.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_bs_roformer_instrumental_resurrection_unwa.yaml, file: config_bs_roformer_instrumental_resurrection_unwa.yaml }
+  - key: mdx23
+    name: MDX23C InstVoc HQ 2
+    code: mdx23
+    role: objects
+    model_type: mdx23c
+    checkpoint: { url: https://github.com/Anjok0109/ai_magic/releases/download/v5/MDX23C-8KFFT-InstVoc_HQ_2.ckpt, file: MDX23C-8KFFT-InstVoc_HQ_2.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/model_2_stem_full_band_8k.yaml, file: model_2_stem_full_band_8k.yaml }
+    notes: "An earlier generation, kept as a point of comparison."
+  - key: gvf4
+    name: Mel-Band Gabox FV4
+    code: gvf4
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_vocals_fv4_gabox.ckpt, file: mel_band_roformer_vocals_fv4_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_vocals_gabox.yaml, file: config_mel_band_roformer_vocals_gabox.yaml }
+    notes: "A former default for the voices."
+  - key: gvf5
+    name: Mel-Band Gabox FV5
+    code: gvf5
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_vocals_fv5_gabox.ckpt, file: mel_band_roformer_vocals_fv5_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_vocals_gabox.yaml, file: config_mel_band_roformer_vocals_gabox.yaml }
+  - key: gvf6
+    name: Mel-Band Gabox FV6
+    code: gvf6
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_vocals_fv6_gabox.ckpt, file: mel_band_roformer_vocals_fv6_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_vocals_gabox.yaml, file: config_mel_band_roformer_vocals_gabox.yaml }
+  - key: gvv2
+    name: Mel-Band Gabox Vocals V2
+    code: gvv2
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_vocals_v2_gabox.ckpt, file: mel_band_roformer_vocals_v2_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_vocals_gabox.yaml, file: config_mel_band_roformer_vocals_gabox.yaml }
+  - key: gbv
+    name: BS-Roformer Gabox Vocals
+    code: gbv
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/bs_roformer_vocals_gabox.ckpt, file: bs_roformer_vocals_gabox.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_bs_roformer_vocals_gabox.yaml, file: config_bs_roformer_vocals_gabox.yaml }
+  - key: bcv
+    name: Mel-Band Vocals becruily
+    code: bcv
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_vocals_becruily.ckpt, file: mel_band_roformer_vocals_becruily.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_vocals_becruily.yaml, file: config_mel_band_roformer_vocals_becruily.yaml }
+  - key: kf3
+    name: Mel-Band Kim FT3
+    code: kf3
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_kim_ft3_unwa.ckpt, file: mel_band_roformer_kim_ft3_unwa.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_kim_ft_unwa.yaml, file: config_mel_band_roformer_kim_ft_unwa.yaml }
+  - key: kf2
+    name: Mel-Band Kim FT2
+    code: kf2
+    role: voices
+    model_type: mel_band_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/mel_band_roformer_kim_ft2_unwa.ckpt, file: mel_band_roformer_kim_ft2_unwa.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_mel_band_roformer_kim_ft_unwa.yaml, file: config_mel_band_roformer_kim_ft_unwa.yaml }
+  - key: rvv2
+    name: BS-Roformer Vocals Revive V2 (unwa)
+    code: rvv2
+    role: voices
+    model_type: bs_roformer
+    checkpoint: { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/bs_roformer_vocals_revive_v2_unwa.ckpt, file: bs_roformer_vocals_revive_v2_unwa.ckpt }
+    config:     { url: https://github.com/nomadkaraoke/python-audio-separator/releases/download/model-configs/config_bs_roformer_vocals_revive_unwa.yaml, file: config_bs_roformer_vocals_revive_unwa.yaml }

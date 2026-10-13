@@ -1,0 +1,29 @@
+[package]
+name = "omnifrog-core"
+description = "UI-agnostic core of omnifrog: configuration, model catalogue, tool discovery, Python environment and the dubbing pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_yaml_ng.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+ureq.workspace = true
+rayon.workspace = true
+realfft.workspace = true
+
+# The separation lock, on one byte of the lock file rather than on all of
+# it, so the id in the file stays readable to the run that is refused.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }

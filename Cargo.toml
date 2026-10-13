@@ -1,0 +1,41 @@
+# omnifrog — one command re-voices a
+# spatial-audio film (TrueHD Atmos, E-AC-3 JOC, DTS:X, Auro-3D) with the
+# dialogue of its dubbed track, and ships the result as an .mka or a full .mkv.
+#
+# Four crates: `core` is the whole pipeline with no UI, `cli` is the command
+# line over it, `gui` the window over it; `bench` is a development tool, the
+# test bench the separation models are compared on.
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli", "crates/gui", "crates/bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mgth/omnifrog"
+authors = ["Mathieu GRENET"]
+
+[workspace.dependencies]
+omnifrog-core = { path = "crates/core" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+ureq = "2"
+rayon = "1.10"
+realfft = "3.3"
+
+# The pipeline runs over whole programmes; keep dependencies optimised even in dev.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
