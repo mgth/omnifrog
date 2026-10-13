@@ -1,10 +1,10 @@
-"""Mini-worker de separation via le framework MSST de ZFTurbo, appele par l'app C#.
+"""Mini-worker de separation via le framework MSST de ZFTurbo, appele par le programme.
    python separer_msst.py <msst_dir> <config> <checkpoint> <model_type> <bigshifts> <use_tta> <module> [overlap=N] [pymss=P] [bloc=S] [batch=B] <dossier_sortie> <wav1> [wav2 ...]
    python separer_msst.py <msst_dir> <config> <checkpoint> <model_type> <bigshifts> <use_tta> <module> [overlap=N] [pymss=P] [bloc=S] [batch=B] --serveur
    --serveur = worker PERSISTANT : charge torch + le modèle UNE fois, imprime "PRET", puis lit une requête par ligne sur stdin :
             SEP\t<dossier_sortie>\t<wav1>[\t<wav2> ...]   -> sépare le lot (même contrat que ci-dessous : "GLOB", "OK <base>" par entrée), puis "FIN" ; sur erreur "ERR <message>" (le worker survit)
             QUIT (ou fin de stdin)                          -> sortie 0
-            Raison d'être : l'app traite les objets/canaux UN par UN (temporaires réduits) ; sans ce mode chaque élément relançait un process = ré-import de torch
+            Raison d'être : l'appelant traite les objets/canaux UN par UN (temporaires réduits) ; sans ce mode chaque élément relançait un process = ré-import de torch
             + init ROCm/CUDA (des Go de bibliothèques mappées) + rechargement du checkpoint, ce qui gèle la machine à chaque élément quand la RAM est chargée.
    module = "-" ou chemin d'un .py qui REMPLACE la classe du modèle (BSRoformer / MelBandRoformer) de MSST : certains checkpoints (unwa Large-Inst,
             HyperACE) ont une architecture modifiée livrée avec leur propre bs_roformer.py ; on le charge à la place de celui de MSST SANS toucher au framework.
@@ -15,7 +15,7 @@
             pas (sortie à 50 dB sous celle de MSST), 2,4x à 25 %, 3,1x à 5 %, et contre une vérité terrain (voix propres injectées dans un M&E) les mêmes scores
             à 0,04 dB près. pymss absent du venv (ou qui ne s'importe pas), modèle qu'il ne sait pas charger (unwa Large-Inst) ou bigshifts > 1 (il ne les fait pas)
             -> MSST. Un élément à court de VRAM sous pymss repasse seul par MSST (chargé à ce moment-là), le reste du lot continue sous pymss.
-            Au chargement (avant "PRET"), une ligne "MOTEUR <texte>" dit lequel sépare et pourquoi ; l'app l'accroche au bilan de l'étape.
+            Au chargement (avant "PRET"), une ligne "MOTEUR <texte>" dit lequel sépare et pourquoi ; l'appelant l'accroche au bilan de l'étape.
    bloc=S (optional, pymss) = seconds of an element handed to pymss at once (default BLOC_PYMSS_S): pymss keeps a whole block on the device, so this is what
             its memory grows with. The element is cut into equal blocks of at most S seconds (at least four windows) plus one window, the fade, the last one never longer.
             Outside the fades between blocks the output does not depend on it, to rounding (cf. BLOC_PYMSS_S).
@@ -34,10 +34,10 @@ détecte par son nom (speech / vocal / voice), tous les autres sont sommés en �
    - Roformer Gabox: Instrumental / Vocals (ou other / vocals) -> voix = Vocals ; sansvoix = Instrumental
 Si le modèle ne sort qu'UN seul stem (cible unique), l'autre est dérivé par SOUSTRACTION à l'entrée.
 
-⚠️ Sample-rate : l'app écrit l'entrée au rate ATTENDU par le modèle (ModeleSeparation.RateEntree) :
+⚠️ Sample-rate : l'appelant écrit l'entrée au rate ATTENDU par le modèle (`rate` du catalogue) :
    - Roformer 44.1k natif  -> entrée étiquetée 44100 (jeu d'entêtes no-resample : échantillons 48k, entête 44.1k)
    - Bandit v2 48k natif   -> entrée étiquetée 48000 (VRAI entête)
-sinon MSST/librosa resamplerait. Les stems sont relus + réétiquetés 48k côté C#. Sorties en float (WAV).
+sinon MSST/librosa resamplerait. Les stems sont relus + réétiquetés 48k par l'appelant. Sorties en float (WAV).
 Code de sortie 0 = OK, !=0 = erreur (message sur stderr).
 """
 import sys, os, glob, shutil, soundfile as sf, numpy as np
@@ -47,7 +47,7 @@ VOIX = ("speech", "vocal", "voice", "voix")
 
 # Progression GLOBALE : MSST affiche PLUSIEURS barres tqdm imbriquées (BigShifts, chunks) et traite TOUS les
 # Fichiers en un seul appel proc_folder (les "OK" ne sortent qu'a la FIN) -> impossible de suivre fichier par
-# Fichier côté C#. On intercepte donc tqdm AVANT d'importer inférence, et on émet une seule progression ABSOLUE
+# Fichier côté appelant. On intercepte donc tqdm AVANT d'importer inférence, et on émet une seule progression ABSOLUE
 # "GLOB <0..1>" : tout le lot = _TOTAL_PASSES passes-chunk (= nb_fichiers x bigshifts x (3 si TTA sinon 1)),
 # Chacune = une barre "Processing audio chunks". g = (passes_finies + fraction_chunk_courante) / _TOTAL_PASSES
 # -> monotone et fluide, MEME en qualité max (bigshifts/TTA). Les autres barres (BigShifts, Total) sont ignorées.
@@ -138,7 +138,7 @@ def charge(msst_dir, config, checkpoint, model_type, bigshifts, use_tta, module,
    print("Using device: ", device, flush=True)
    torch.backends.cudnn.benchmark = True
    model, cfg = inference.get_model_from_config(args.model_type, args.config_path)
-   if overlap > 0:                                                              # Réglage du catalogue (ModeleSeparation.Overlap) : prime sur la config publiée, sans la modifier sur disque
+   if overlap > 0:                                                              # Réglage du catalogue (`overlap`) : prime sur la config publiée, sans la modifier sur disque
       print(f"num_overlap : {cfg.inference.num_overlap} -> {overlap} (catalogue)", flush=True)
       cfg.inference.num_overlap = overlap
    if batch > 0:                                                                # Configuration's inference.batch_size (device memory ~ x batch)
@@ -377,7 +377,7 @@ def pic_vram():
    except Exception:
       pass
 
-# Mode serveur : une requête par ligne sur stdin (cf. docstring). Une erreur de lot est signalée ("ERR ...") sans tuer le worker : l'app décide.
+# Mode serveur : une requête par ligne sur stdin (cf. docstring). Une erreur de lot est signalée ("ERR ...") sans tuer le worker : l'appelant décide.
 def serveur(separe_lot):
    import traceback
    sys.stdin.reconfigure(encoding="utf-8"); sys.stdout.reconfigure(encoding="utf-8")       # Chemins accentués dans les requêtes : UTF-8 dans les deux sens, quel que soit le code page du lanceur (Windows : cp1252 sinon)
