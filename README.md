@@ -1,8 +1,8 @@
 # omnifrog
 
-omnifrog re-voices a spatial-audio film with the dialogue of its dubbed track, from a command
-line or a window (`omnifrog-gui`, see [The window](#the-window)). One command, a film in, a track
-out:
+omnifrog re-voices a spatial-audio film with the dialogue of its dubbed track. Open its window,
+choose a film, press *Start* (see [Getting started](#getting-started)); or, from a command line,
+one command, a film in, a track out:
 
 ```
 omnifrog dub film.mkv                 # picks the original and the dubbed track, writes film.Omnifrog-<vo>-<vf>-hz.mka
@@ -19,6 +19,60 @@ are levelled to the original's dialogue (BS.1770), placed as static objects, and
 they are, the voices panned onto them) or by Dee — or as IAMF by harlettizer, the voices panned
 onto the objects the same way or put on the bed; mkvmerge writes the `.mka` or the full `.mkv`,
 with the models and every parameter of the job as Matroska tags of the track.
+
+## Getting started
+
+1. **Install it**: on Arch the AUR's `omnifrog`, on another Linux the AppImage of a release, on
+   Windows the installer of a release (see [Linux](#linux) and [Windows](#windows)). None of them ships
+   Python or the tools a run drives: ffmpeg, mkvmerge, harletty and an encoder (see
+   [Requirements](#requirements)).
+2. **Open Omnifrog**: its menu entry or Start-menu shortcut, the AppImage run as it is, or
+   `omnifrog-gui`.
+3. **Setup.** On a machine that is not ready the window opens on this tab. It names the graphics
+   card, lists what is installed and what is missing, with where to get a missing tool and a
+   *Choose…* for one that is not on `PATH`. *⚙ Set up automatically* builds the Python
+   environment for the card and downloads the two separation models.
+4. **Film.** *Choose a film…*, or drop one on the window: the original and the dubbed track are
+   preselected. Choose the output and the format, then *▶ Start*. The run shows its six steps and
+   the time left; *Stop* ends it, and the next run of the same film picks up at the step it was
+   in. Once it is done, *Show in folder* opens where the track went.
+
+The same from a command line is `omnifrog doctor`, `omnifrog setup` and `omnifrog dub film.mkv`,
+see [Commands](#commands).
+
+## The window
+
+`omnifrog-gui` (crate `crates/gui`, egui) does what the command line does, for someone who
+would rather not type it:
+
+- **Setup.** It names the graphics card torch will use and its memory (`nvidia-smi`, the AMD
+  driver's sysfs on Linux, the machine's memory on Apple silicon), and the inference settings that
+  suit it: the largest pymss block the memory holds (600 s is about 15 GB), a batch of one below
+  12 GB, MSST below 4 GB. *Set up automatically* writes those settings (unless the configuration
+  already has its own), builds the Python environment for that device (the same as `setup`) and
+  downloads the two models. It lists what `doctor` lists, with a *Choose…* for every tool and
+  where to get a missing one, the two models, and the work and model folders. A first launch on a
+  machine that is not ready opens on this tab.
+- **Film.** Choose or drop a file: its audio tracks, the original and the dub preselected as
+  `dub` would take them (a scene only as the original, a channel track only as the dub); `.mka`
+  or `.mkv`, a trial of the first N seconds, the format (TrueHD by harlettizer or by Dee, or IAMF
+  — the voices panned onto the objects or on the bed — with its options; kept in the configuration,
+  as `encoder` and `iamf_opts`), the voices' offset,
+  the duplicates, where the track goes, start over. `omnifrog-gui FILM.mkv` opens with it.
+- **Progress.** The six steps (those an earlier run did are marked as such), the current step's
+  bar with an estimate of the time left, the whole run's bar weighted by what each step costs, the
+  elapsed time and the log. *Stop* ends the run with everything it started; the next run of the
+  same film picks up at the step it was in.
+
+The long work — the setup, the downloads, a run — is done by a second copy of the program
+(`omnifrog-gui --worker`, one JSON request on its standard input, one reply per line on its
+standard output: the core's progress events, then how it ended). The window reads the
+configuration, the checks, the device and a film's tracks from `omnifrog-core` directly. The
+worker leads a process group on Unix and sits in a job object on Windows, so *Stop*, closing the
+window or the window crashing ends pip, ffmpeg, harletty, the inference worker and the encoder
+with it. On Linux the worker is started through `/proc/self/exe`, so a window outlives a
+rebuild of its binary: the worker is the window's own build, never a newer one. It needs Rust
+1.95 (egui 0.36); `rust-toolchain.toml` pins 1.97.1.
 
 ## Status
 
@@ -179,40 +233,6 @@ directory while a model is loaded, and a second run is told to wait rather than 
 Progress goes to standard error, a line per percent; `--json` makes it one JSON object per line,
 which is what a front end reads.
 
-## The window
-
-`omnifrog-gui` (crate `crates/gui`, egui) does what the command line does, for someone who
-would rather not type it:
-
-- **Setup.** It names the graphics card torch will use and its memory (`nvidia-smi`, the AMD
-  driver's sysfs on Linux, the machine's memory on Apple silicon), and the inference settings that
-  suit it: the largest pymss block the memory holds (600 s is about 15 GB), a batch of one below
-  12 GB, MSST below 4 GB. *Set up automatically* writes those settings (unless the configuration
-  already has its own), builds the Python environment for that device (the same as `setup`) and
-  downloads the two models. It lists what `doctor` lists, with a *Choose…* for every tool and
-  where to get a missing one, the two models, and the work and model folders. A first launch on a
-  machine that is not ready opens on this tab.
-- **Film.** Choose or drop a file: its audio tracks, the original and the dub preselected as
-  `dub` would take them (a scene only as the original, a channel track only as the dub); `.mka`
-  or `.mkv`, a trial of the first N seconds, the format (TrueHD by harlettizer or by Dee, or IAMF
-  — the voices panned onto the objects or on the bed — with its options; kept in the configuration,
-  as `encoder` and `iamf_opts`), the voices' offset,
-  the duplicates, where the track goes, start over. `omnifrog-gui FILM.mkv` opens with it.
-- **Progress.** The six steps (those an earlier run did are marked as such), the current step's
-  bar with an estimate of the time left, the whole run's bar weighted by what each step costs, the
-  elapsed time and the log. *Stop* ends the run with everything it started; the next run of the
-  same film picks up at the step it was in.
-
-The long work — the setup, the downloads, a run — is done by a second copy of the program
-(`omnifrog-gui --worker`, one JSON request on its standard input, one reply per line on its
-standard output: the core's progress events, then how it ended). The window reads the
-configuration, the checks, the device and a film's tracks from `omnifrog-core` directly. The
-worker leads a process group on Unix and sits in a job object on Windows, so *Stop*, closing the
-window or the window crashing ends pip, ffmpeg, harletty, the inference worker and the encoder
-with it. On Linux the worker is started through `/proc/self/exe`, so a window outlives a
-rebuild of its binary: the worker is the window's own build, never a newer one. It needs Rust
-1.95 (egui 0.36); `rust-toolchain.toml` pins 1.97.1.
-
 ## The test bench
 
 `omnifrog-bench` (crate `crates/bench`, egui) is a development tool, not part of a release:
@@ -359,16 +379,16 @@ it. `.github/workflows/packages.yml` builds and tests it with the Linux AppImage
    `harlettizer.exe` (a harlettizer release), or `dee.exe` for `encoder: dee`, which runs directly —
    there is no Wine on Windows. Each is looked for in the configuration, then in a `tools\` folder
    beside `omnifrog.exe`, then on `PATH`.
-4. Then:
+4. **Omnifrog**, from the Start menu: its *Setup* tab says what steps 1 to 3 left missing, and
+   *⚙ Set up automatically* builds the venv (torch 2.10 for CUDA 12.8 and MSST, a few gigabytes)
+   and downloads the models. Then a film, as in [Getting started](#getting-started). From a
+   command line, the same is:
 
    ```
    omnifrog setup --gpu cuda     a venv with torch 2.10 for CUDA 12.8 and MSST; a few gigabytes
    omnifrog doctor               everything green, and the device torch sees
    omnifrog dub film.mkv
    ```
-
-`omnifrog-gui.exe` is the same with a window: after steps 1 to 3, its *Set up automatically*
-is step 4, and the tools can sit in the same `tools\` folder beside it.
 
 The configuration is `%APPDATA%\omnifrog\config.yaml`; the venv, MSST, the models and the jobs are
 under `%LOCALAPPDATA%\omnifrog\` unless it says otherwise. Keep `work_dir` on a fast disk with
