@@ -29,13 +29,13 @@ jobs:
     # hour; the cache holds it from then on.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -50,7 +50,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p omnifrog-cli -p omnifrog-gui
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: programs
           path: |
@@ -67,7 +67,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       file: ${{ steps.version.outputs.file }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The version is the workspace's. A tag has to say the same.
       - name: Read the version
@@ -82,7 +82,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "file=omnifrog-$version-windows-x86_64-setup.exe" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: programs
           path: stage
@@ -99,7 +99,7 @@ jobs:
             -DOUTFILE="$PWD/${{ steps.version.outputs.file }}" \
             packaging/windows/omnifrog.nsi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: installer
           path: ${{ steps.version.outputs.file }}
@@ -111,9 +111,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: installer
 
@@ -132,7 +132,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: installer
 

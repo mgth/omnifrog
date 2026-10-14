@@ -25,7 +25,7 @@ jobs:
     # egui stack from nothing; the cache holds it from then on.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The test bench plays through cpal, which builds against ALSA's and
       # PipeWire's headers on Linux, the latter read by bindgen through
@@ -40,7 +40,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
