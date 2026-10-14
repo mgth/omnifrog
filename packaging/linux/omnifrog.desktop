@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Omnifrog
+GenericName=Film re-voicing
+Comment=Re-voice a spatial-audio film with the dialogue of its dubbed track
+Exec=omnifrog-gui %f
+Icon=omnifrog
+Terminal=false
+Categories=AudioVideo;Audio;
+MimeType=video/x-matroska;audio/x-matroska;
+StartupWMClass=omnifrog
+StartupNotify=true

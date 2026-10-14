@@ -315,6 +315,27 @@ harlettizer (one whose `iamf` writes `.mka` and has `--overlay` / `--voices-to-b
 iamf` / `iamf-lit`) or Dee; Python 3.11/3.12 for `setup`. A GPU (CUDA or ROCm) for the separation, which is
 hours on a CPU.
 
+## Linux
+
+**Arch.** The AUR has `omnifrog` (the command line, the window and its menu entry), `harlettizer`
+(the encoder) and `harletty-bridge` (whose `harletty` is the decoder):
+
+```
+paru -S omnifrog harlettizer harletty-bridge
+```
+
+**Any other distribution.** `omnifrog-<version>-x86_64.AppImage`, from a release, is the command
+line and the window in one file, for x86-64 with glibc 2.35 or newer. Run as it is, it opens the
+window; `--cli` as its first argument gives the command line:
+
+```
+chmod +x omnifrog-0.1.0-x86_64.AppImage
+./omnifrog-0.1.0-x86_64.AppImage                 the window
+./omnifrog-0.1.0-x86_64.AppImage --cli doctor    what is installed and what is missing
+```
+
+Neither ships the tools a run drives, nor Python: see [Requirements](#requirements).
+
 ## Windows
 
 `omnifrog.exe` is one file: it needs nothing beside it but the system's own libraries.
@@ -325,9 +346,9 @@ them and a Start-menu shortcut to the window. It is per user and asks for no adm
 runs it without a wizard and `/D=<dir>` (last on the line, no quotes) chooses the folder. It
 installs none of what the steps below ask for, and its uninstaller leaves the configuration, what
 `setup` installed and whatever was put in `tools\`. It is not signed: Windows asks before running
-it. `.github/workflows/windows-installer.yml` builds it — on a pull request that touches
-`packaging/windows/`, on a run started by hand, and on a `v*` tag, which also attaches it to a
-draft release.
+it. `.github/workflows/packages.yml` builds and tests it with the Linux AppImage (see
+[Linux](#linux)) — on a pull request that touches `packaging/`, on a run started by hand, and on a
+`v*` tag, which also attaches both to a draft release.
 
 1. **Python 3.12** from python.org, with the `py` launcher it installs — the Microsoft Store's
    `python` does not do.

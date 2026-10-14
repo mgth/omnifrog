@@ -1,0 +1,12 @@
+#!/bin/sh
+# The AppImage's entry point: the window, or the command line when the first
+# argument is --cli.
+#
+#   Omnifrog.AppImage [FILM.mkv]       the window
+#   Omnifrog.AppImage --cli doctor     the command line
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ "$1" = "--cli" ]; then
+    shift
+    exec "$HERE/usr/bin/omnifrog" "$@"
+fi
+exec "$HERE/usr/bin/omnifrog-gui" "$@"
