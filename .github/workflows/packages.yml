@@ -1,0 +1,258 @@
+# The packages a release ships, each one tested before it is attached:
+#
+# - the Windows installer: the two programs built on Windows, packed by NSIS,
+#   then installed and removed on a real Windows;
+# - the Linux AppImage: the two programs built on the oldest supported Ubuntu,
+#   so the C library they need is one every current distribution has, packed
+#   by appimagetool and run once.
+#
+# A pull request that touches the packaging builds and tests them; so does a
+# run started by hand. A `v*` tag does the same and attaches both to a draft
+# release of that tag, for someone to read and publish.
+name: Packages
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - packaging/**
+      - .github/workflows/packages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Read the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The version is the workspace's. A tag has to say the same.
+      - name: Read the version
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          test -n "$version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows-build:
+    name: Windows · build the programs
+    runs-on: windows-latest
+    # A cold build of the window's egui stack on this runner is over half an
+    # hour; the cache holds it from then on.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      # The command line and the window. The test bench is a development
+      # tool and is not shipped.
+      - name: Build
+        run: cargo build --release --locked -p omnifrog-cli -p omnifrog-gui
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-programs
+          path: |
+            target/release/omnifrog.exe
+            target/release/omnifrog-gui.exe
+          if-no-files-found: error
+
+  windows-pack:
+    name: Windows · pack the installer
+    needs: [version, windows-build]
+    # makensis is the same program on Linux, and one `apt-get` away.
+    runs-on: ubuntu-latest
+    outputs:
+      file: ${{ steps.name.outputs.file }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Name the installer
+        id: name
+        run: echo "file=omnifrog-${{ needs.version.outputs.version }}-windows-x86_64-setup.exe" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-programs
+          path: stage
+
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Pack
+        run: |
+          cp README.md LICENSE stage/
+          makensis -V2 \
+            -DVERSION="${{ needs.version.outputs.version }}" \
+            -DSTAGE="$PWD/stage" \
+            -DOUTFILE="$PWD/${{ steps.name.outputs.file }}" \
+            packaging/windows/omnifrog.nsi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: ${{ steps.name.outputs.file }}
+          if-no-files-found: error
+
+  windows-test:
+    name: Windows · install and uninstall
+    needs: [version, windows-pack]
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-installer
+
+      - name: Test
+        shell: pwsh
+        run: >
+          ./packaging/windows/test.ps1
+          -Setup (Resolve-Path "${{ needs.windows-pack.outputs.file }}")
+          -Version "${{ needs.version.outputs.version }}"
+
+  appimage:
+    name: Linux · build, pack and run the AppImage
+    needs: version
+    # The oldest Ubuntu the runners still offer: the programs need the C
+    # library they were built against or a newer one.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      file: ${{ steps.name.outputs.file }}
+    env:
+      # appimagetool and the runtime it embeds, pinned, and checked against
+      # the digests their releases publish.
+      APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+      APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+      RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+      RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Name the AppImage
+        id: name
+        run: echo "file=omnifrog-${{ needs.version.outputs.version }}-x86_64.AppImage" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-22.04-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-22.04-cargo-release-
+
+      - name: Build
+        run: cargo build --release --locked -p omnifrog-cli -p omnifrog-gui
+
+      # The programs may link the C library alone; anything else would have
+      # to be in the AppImage.
+      - name: Check what the programs link
+        run: |
+          for program in omnifrog omnifrog-gui; do
+            needed=$(readelf -d "target/release/$program" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort | tr '\n' ' ')
+            echo "$program: $needed"
+            for lib in $needed; do
+              case "$lib" in
+                libc.so.6|libm.so.6|libgcc_s.so.1|ld-linux-x86-64.so.2) ;;
+                *) echo "::error::$program links $lib"; exit 1 ;;
+              esac
+            done
+          done
+
+      - name: Fetch appimagetool and the runtime
+        run: |
+          mkdir -p tools
+          curl -fsSL -o tools/appimagetool "$APPIMAGETOOL_URL"
+          curl -fsSL -o tools/runtime-x86_64 "$RUNTIME_URL"
+          echo "$APPIMAGETOOL_SHA256  tools/appimagetool" | sha256sum -c
+          echo "$RUNTIME_SHA256  tools/runtime-x86_64" | sha256sum -c
+          chmod +x tools/appimagetool
+
+      - name: Pack
+        run: >
+          APPIMAGETOOL="$PWD/tools/appimagetool"
+          APPIMAGE_RUNTIME="$PWD/tools/runtime-x86_64"
+          packaging/linux/appimage.sh target/release
+          "${{ needs.version.outputs.version }}"
+          "$PWD/${{ steps.name.outputs.file }}"
+
+      # The runner has no FUSE: the AppImage extracts itself and runs, which
+      # goes through the same AppRun.
+      - name: Run it
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          said=$("./${{ steps.name.outputs.file }}" --cli --version)
+          echo "$said"
+          test "$said" = "omnifrog ${{ needs.version.outputs.version }}"
+          "./${{ steps.name.outputs.file }}" --cli config
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: appimage
+          path: ${{ steps.name.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    name: Attach to a draft release
+    if: github.ref_type == 'tag'
+    needs: [version, windows-pack, windows-test, appimage]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-installer
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: appimage
+
+      # A draft: nothing is announced until someone publishes it.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --draft
+          --title "Omnifrog ${{ needs.version.outputs.version }}"
+          --notes "The Windows installer is not signed: Windows asks before running it. The AppImage runs on any x86-64 distribution from glibc 2.35 on; \`--cli\` as its first argument gives the command line."
+          "${{ needs.windows-pack.outputs.file }}"
+          "${{ needs.appimage.outputs.file }}"
