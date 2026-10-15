@@ -36,12 +36,12 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// is a library, an archive or a program built for another system.
 pub fn start_error(e: &std::io::Error) -> String {
     let what = match e.raw_os_error() {
-        // ERROR_BAD_EXE_FORMAT
-        Some(193) if cfg!(windows) => {
-            "not a Windows program — a library, an archive, or a program for another system"
+        // ERROR_BAD_EXE_FORMAT, or ERROR_EXE_MACHINE_TYPE_MISMATCH, which
+        // Windows also answers for a file that is not a program at all.
+        Some(193 | 216) if cfg!(windows) => {
+            "not a Windows program for this machine — a library, an archive, or a program for \
+             another system or processor"
         }
-        // ERROR_EXE_MACHINE_TYPE_MISMATCH
-        Some(216) if cfg!(windows) => "a program for another processor",
         // ENOEXEC
         Some(8) if cfg!(unix) => "not a program for this system",
         _ if e.kind() == std::io::ErrorKind::PermissionDenied => {

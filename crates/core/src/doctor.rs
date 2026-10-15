@@ -352,7 +352,8 @@ mod tests {
         #[cfg(windows)]
         assert!(
             found.detail.contains("not a Windows program")
-                && found.detail.contains("(os error 193)"),
+                && (found.detail.contains("(os error 193)")
+                    || found.detail.contains("(os error 216)")),
             "{}",
             found.detail
         );
