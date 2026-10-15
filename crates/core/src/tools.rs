@@ -8,6 +8,7 @@
 use crate::config::{Config, expand};
 use crate::{Error, Result, run};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
@@ -66,6 +67,19 @@ impl Tool {
             }
             Tool::Dee => "an encoder you supply (encoder: dee)",
             Tool::Wine => "runs dee.exe on Linux",
+        }
+    }
+
+    /// Which file to choose, for a tool whose release ships other files
+    /// beside it that are easy to take for it.
+    pub fn which_file(self) -> Option<String> {
+        match self {
+            Tool::Harletty => Some(format!(
+                "harletty{} is in the harletty-cli archive of a harletty-bridge release; the \
+                 harletty-bridge archive holds only libraries",
+                std::env::consts::EXE_SUFFIX
+            )),
+            _ => None,
         }
     }
 
@@ -138,27 +152,65 @@ pub fn on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The names `base` may have on disk. On Windows only those with a program's
+/// extension: a file without one there is most likely the Linux build of
+/// the tool, unpacked from the wrong archive, which Windows cannot start.
 fn with_extensions(base: &Path) -> Vec<PathBuf> {
     if cfg!(windows) {
-        let mut v = vec![
+        vec![
             base.with_extension("exe"),
             base.with_extension("cmd"),
             base.with_extension("bat"),
-        ];
-        v.push(base.to_path_buf());
-        v
+        ]
     } else {
         vec![base.to_path_buf()]
     }
 }
 
-/// The first line the program prints for its version, if it prints one.
-pub fn version(path: &Path, tool: Tool) -> Option<String> {
-    let flag = tool.version_flag()?;
+/// Why a file is plainly not a program, from its name alone: a library or
+/// an archive, which a file picker lets anyone choose.
+pub fn not_a_program(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "dll" | "so" | "dylib" => Some("a library, not a program"),
+        "zip" | "7z" | "rar" | "tar" | "gz" | "tgz" | "xz" | "bz2" | "zst" => {
+            Some("an archive, not a program: unpack it and choose the program inside")
+        }
+        _ => None,
+    }
+}
+
+/// What starting a program to ask its version found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Version {
+    /// It started: the first line it printed, empty when it printed none or
+    /// failed.
+    Started(String),
+    /// It has no version flag, so it was not started.
+    NotAsked,
+    /// It could not be started at all, and why.
+    CannotStart(String),
+}
+
+/// Start the program to ask its version.
+pub fn version(path: &Path, tool: Tool) -> Version {
+    let Some(flag) = tool.version_flag() else {
+        return Version::NotAsked;
+    };
     let mut command = run::command(path);
-    command.arg(flag);
-    let text = run::output(command).ok()?;
-    text.lines().next().map(|l| l.trim().to_string())
+    command.arg(flag).stdin(Stdio::null());
+    match command.output() {
+        Err(e) => Version::CannotStart(run::start_error(&e)),
+        Ok(out) if out.status.success() => Version::Started(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Ok(_) => Version::Started(String::new()),
+    }
 }
 
 /// Whether a Dee path is a Windows executable, which Linux runs through Wine.

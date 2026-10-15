@@ -51,6 +51,8 @@ pub struct App {
     pub device: Option<(Device, Recommendation)>,
     pub checks: Option<Vec<Check>>,
     pub checking: bool,
+    /// Why the last file chosen for a tool was refused.
+    pub tool_refused: Option<String>,
 
     pub source: Option<PathBuf>,
     pub media: Option<Result<Media, String>>,
@@ -91,6 +93,7 @@ impl App {
             device: None,
             checks: None,
             checking: false,
+            tool_refused: None,
             source: None,
             media: None,
             probing: false,

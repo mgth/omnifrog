@@ -7,7 +7,7 @@ use omnifrog_core::config::{Config, Engine};
 use omnifrog_core::doctor::Status;
 use omnifrog_core::models::Role;
 use omnifrog_core::setup::Gpu;
-use omnifrog_core::tools::Tool;
+use omnifrog_core::tools::{self, Tool};
 use std::path::PathBuf;
 
 const GREEN: Color32 = Color32::from_rgb(90, 190, 110);
@@ -202,10 +202,29 @@ fn checks(app: &mut App, ui: &mut Ui) {
         });
     }
     if let Some(tool) = browse
-        && let Some(path) = rfd::FileDialog::new().pick_file()
+        && let Some(path) = pick_program(tool)
     {
-        *tool_slot(&mut app.config, tool) = Some(path);
-        app.save_config();
+        match tools::not_a_program(&path) {
+            Some(why) => {
+                let hint = tool
+                    .which_file()
+                    .map(|hint| format!(" — {hint}"))
+                    .unwrap_or_default();
+                app.tool_refused = Some(format!(
+                    "Not used for {}: {} is {why}{hint}.",
+                    tool.name(),
+                    path.display()
+                ));
+            }
+            None => {
+                app.tool_refused = None;
+                *tool_slot(&mut app.config, tool) = Some(path);
+                app.save_config();
+            }
+        }
+    }
+    if let Some(refused) = &app.tool_refused {
+        ui.colored_label(RED, refused);
     }
     if let Some(keys) = fetch
         && !keys.is_empty()
@@ -371,6 +390,18 @@ fn folders(app: &mut App, ui: &mut Ui) {
     if changed {
         app.save_config();
     }
+}
+
+/// Ask where a tool is. On Windows the dialog shows programs first, so a
+/// library or an archive from the same release is not one click away.
+fn pick_program(tool: Tool) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title(format!("Where {} is", tool.name()));
+    if cfg!(windows) {
+        dialog = dialog
+            .add_filter("Programs", &["exe", "cmd", "bat"])
+            .add_filter("All files", &["*"]);
+    }
+    dialog.pick_file()
 }
 
 fn tool_slot(config: &mut Config, tool: Tool) -> &mut Option<PathBuf> {
