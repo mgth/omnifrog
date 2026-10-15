@@ -29,6 +29,32 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Why a program could not be started, in words for the person who chose
+/// the file, with the system's own code.
+///
+/// Windows says only "%1 is not a valid Win32 application" when the file
+/// is a library, an archive or a program built for another system.
+pub fn start_error(e: &std::io::Error) -> String {
+    let what = match e.raw_os_error() {
+        // ERROR_BAD_EXE_FORMAT
+        Some(193) if cfg!(windows) => {
+            "not a Windows program — a library, an archive, or a program for another system"
+        }
+        // ERROR_EXE_MACHINE_TYPE_MISMATCH
+        Some(216) if cfg!(windows) => "a program for another processor",
+        // ENOEXEC
+        Some(8) if cfg!(unix) => "not a program for this system",
+        _ if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            "not allowed to run it — is it a program, and executable?"
+        }
+        _ => return e.to_string(),
+    };
+    match e.raw_os_error() {
+        Some(code) => format!("{what} (os error {code})"),
+        None => what.to_string(),
+    }
+}
+
 /// How many trailing lines an error report keeps.
 const TAIL: usize = 40;
 
@@ -105,7 +131,7 @@ fn drive(mut command: Command, mut on_line: impl FnMut(Stream, &str) -> bool) ->
     let mut child = command.spawn().map_err(|e| Error::Command {
         program: program.clone(),
         status: "could not start".into(),
-        detail: e.to_string(),
+        detail: start_error(&e),
     })?;
     let (tx, rx) = mpsc::channel::<(Stream, String)>();
     let mut pumps = Vec::new();
@@ -157,7 +183,7 @@ pub fn output(mut command: Command) -> Result<String> {
         .map_err(|e| Error::Command {
             program: program.clone(),
             status: "could not start".into(),
-            detail: e.to_string(),
+            detail: start_error(&e),
         })?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())

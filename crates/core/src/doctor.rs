@@ -92,45 +92,14 @@ pub fn run(config: &Config) -> Vec<Check> {
             }
             _ => true,
         };
-        match tools::find(config, tool) {
-            Some(found) => {
-                // Asking costs a start of the program: 15 s for Wine, which
-                // boots its prefix — not worth it for a tool nothing uses.
-                let version = if needed {
-                    tools::version(&found, tool).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                checks.push(check(
-                    tool.name(),
-                    Status::Ok,
-                    if version.is_empty() {
-                        found.display().to_string()
-                    } else {
-                        format!("{version} — {}", found.display())
-                    },
-                ));
-                if tool == tools::Tool::Harlettizer {
-                    checks.push(iamf(config, &found));
-                }
-            }
-            None => checks.push(check(
-                tool.name(),
-                if needed {
-                    Status::Missing
-                } else {
-                    Status::Warning
-                },
-                format!(
-                    "not found ({}){}",
-                    tool.purpose(),
-                    if needed {
-                        ""
-                    } else {
-                        " — not needed by the configured encoder"
-                    }
-                ),
-            )),
+        let found = tool_check(config, tool, needed);
+        let usable = found.status == Status::Ok;
+        checks.push(found);
+        if tool == tools::Tool::Harlettizer
+            && usable
+            && let Some(harlettizer) = tools::find(config, tool)
+        {
+            checks.push(iamf(config, &harlettizer));
         }
     }
 
@@ -217,6 +186,59 @@ pub fn run(config: &Config) -> Vec<Check> {
     checks
 }
 
+/// Where an external program is, and whether it starts: a file found is not
+/// yet a program — a library or an archive chosen by mistake, or a build
+/// for another system, is there and cannot run.
+fn tool_check(config: &Config, tool: tools::Tool, needed: bool) -> Check {
+    let missing = if needed {
+        Status::Missing
+    } else {
+        Status::Warning
+    };
+    let not_needed = if needed {
+        ""
+    } else {
+        " — not needed by the configured encoder"
+    };
+    let Some(found) = tools::find(config, tool) else {
+        return check(
+            tool.name(),
+            missing,
+            format!("not found ({}){not_needed}", tool.purpose()),
+        );
+    };
+    let broken = |why: String| {
+        let hint = tool
+            .which_file()
+            .map(|hint| format!(" — {hint}"))
+            .unwrap_or_default();
+        check(
+            tool.name(),
+            missing.clone(),
+            format!("{} — {why}{hint}{not_needed}", found.display()),
+        )
+    };
+    if let Some(why) = tools::not_a_program(&found) {
+        return broken(why.to_string());
+    }
+    // Asking costs a start of the program: 15 s for Wine, which boots its
+    // prefix — not worth it for a tool nothing uses.
+    if !needed {
+        return check(tool.name(), Status::Ok, found.display().to_string());
+    }
+    match tools::version(&found, tool) {
+        tools::Version::CannotStart(why) => broken(format!("cannot start: {why}")),
+        tools::Version::Started(version) if !version.is_empty() => check(
+            tool.name(),
+            Status::Ok,
+            format!("{version} — {}", found.display()),
+        ),
+        tools::Version::Started(_) | tools::Version::NotAsked => {
+            check(tool.name(), Status::Ok, found.display().to_string())
+        }
+    }
+}
+
 /// Whether the harlettizer found writes IAMF into an `.mka`, and in which
 /// of the two modes: missing when the configured encoder needs what it
 /// lacks, a note otherwise.
@@ -296,4 +318,81 @@ fn torch_report(python: &Path, msst: &Path) -> Result<String, String> {
             .to_string(),
         other => other.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::Tool;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("omnifrog-doctor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn harletty_at(path: PathBuf) -> Config {
+        let mut config = Config::default();
+        config.tools.harletty = Some(path);
+        config
+    }
+
+    #[test]
+    fn a_file_that_cannot_start_is_missing_not_ok() {
+        let dir = scratch("start");
+        // Text, and on Unix not executable: neither system can start it.
+        let path = dir.join(format!("harletty{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&path, "not a program\n").unwrap();
+        let found = tool_check(&harletty_at(path.clone()), Tool::Harletty, true);
+        assert_eq!(found.status, Status::Missing, "{}", found.detail);
+        assert!(found.detail.contains("cannot start"), "{}", found.detail);
+        #[cfg(windows)]
+        assert!(
+            found.detail.contains("not a Windows program")
+                && found.detail.contains("(os error 193)"),
+            "{}",
+            found.detail
+        );
+        assert!(
+            found.detail.contains(&path.display().to_string()),
+            "{}",
+            found.detail
+        );
+        assert!(found.detail.contains("harletty-cli"), "{}", found.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_library_is_refused_without_starting_it() {
+        let dir = scratch("library");
+        let path = dir.join("harletty_bridge.dll");
+        std::fs::write(&path, "").unwrap();
+        let config = harletty_at(path);
+        let needed = tool_check(&config, Tool::Harletty, true);
+        assert_eq!(needed.status, Status::Missing);
+        assert!(needed.detail.contains("a library"), "{}", needed.detail);
+        let unused = tool_check(&config, Tool::Harletty, false);
+        assert_eq!(unused.status, Status::Warning);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_that_starts_is_ok_even_when_it_prints_nothing() {
+        // This test binary starts, rejects the version flag and prints
+        // nothing on its standard output.
+        let config = harletty_at(std::env::current_exe().unwrap());
+        let found = tool_check(&config, Tool::Harletty, true);
+        assert_eq!(found.status, Status::Ok, "{}", found.detail);
+    }
+
+    #[test]
+    fn a_configured_path_that_is_not_there_is_missing() {
+        let config = harletty_at(scratch("absent").join("harletty"));
+        let found = tool_check(&config, Tool::Harletty, true);
+        assert_eq!(found.status, Status::Missing);
+        assert!(found.detail.starts_with("not found"), "{}", found.detail);
+    }
 }
