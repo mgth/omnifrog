@@ -31,6 +31,7 @@ pub mod probe;
 pub mod progress;
 pub mod remote;
 pub mod remux;
+pub mod rocm;
 pub mod run;
 pub mod runlog;
 pub mod separate;

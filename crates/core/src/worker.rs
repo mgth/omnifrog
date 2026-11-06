@@ -43,7 +43,9 @@
 //!
 //! One worker runs at a time on this machine: [`Lock`] is taken in the
 //! working directory before the first one starts. Two separations sharing a
-//! GPU is how a driver panic is arranged.
+//! GPU is how a driver panic is arranged. Nor does one start under a ROCm
+//! override the card cannot run (see [`crate::rocm`] and [`command`]),
+//! which is how a GPU reset is.
 //!
 //! A worker can also run on another machine, through `ssh` and that
 //! machine's omnifrog ([`Worker::start_remote`], [`crate::remote`]): the
@@ -250,6 +252,11 @@ pub enum Started {
 /// With `idle_below_gib` (a remote's worker), the worker first reads how much
 /// of its device's memory other programs hold, and answers `BUSY <why>` and
 /// exits, having loaded nothing, when that is as much or more.
+///
+/// Refused under a ROCm override the card cannot run, the first copy to
+/// which resets the GPU and the desktop with it: here, so that a run on
+/// this machine and another machine's pass ([`crate::remote::serve`]) are
+/// both refused before Python starts.
 pub fn command(
     config: &Config,
     model: &Model,
@@ -257,6 +264,9 @@ pub fn command(
     inference: Inference,
     idle_below_gib: Option<f64>,
 ) -> Result<Command> {
+    if let Some(why) = crate::rocm::check().and_then(|report| report.broken) {
+        return Err(Error::msg(format!("the inference is not started: {why}")));
+    }
     let script = ensure()?;
     let python = config.python();
     if !python.is_file() {
@@ -338,6 +348,13 @@ impl Worker {
         progress: Progress,
         stop: Option<Stop>,
     ) -> Result<Self> {
+        // What is off without endangering the card; an override it cannot
+        // run is refused by `command`.
+        if let Some(report) = crate::rocm::check() {
+            for warning in report.warnings {
+                progress(Event::message(format!("warning: {warning}")));
+            }
+        }
         let lock = Lock::take(&config.work_dir())?;
         let command = command(config, model, local, config.inference, None)?;
         progress(Event::message(format!(
