@@ -27,16 +27,22 @@
 //! One worker runs at a time on this machine: [`Lock`] is taken in the
 //! working directory before the first one starts. Two separations sharing a
 //! GPU is how a driver panic is arranged.
+//!
+//! A worker can also run on another machine, through `ssh` and that
+//! machine's omnifrog ([`Worker::start_remote`], [`crate::remote`]): the
+//! same words, two more before `PRET` (`BUSY`, `DIR`), and the files carried
+//! there and back around each request.
 
-use crate::config::{Config, Engine};
+use crate::config::{Config, Engine, Inference, Remote};
 use crate::models::{Local, Model};
 use crate::progress::{Event, Progress};
+use crate::remote::{self, Ssh};
 use crate::{Error, Result};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -87,8 +93,13 @@ enum Word {
     /// The request failed, with the reason; the worker is still alive.
     Failed(String),
     /// A line of standard error worth the log: an element pymss ran out of
-    /// device memory on, separated through MSST instead.
+    /// device memory on, separated through MSST instead, or what a remote's
+    /// omnifrog said (a model it fetched).
     Note(String),
+    /// A remote's GPU is someone else's for now; nothing was loaded.
+    Busy(String),
+    /// Where a remote wants the inputs, and leaves the stems.
+    Dir(String),
     /// Anything else the worker or MSST printed.
     Other(String),
 }
@@ -105,8 +116,92 @@ pub struct Worker {
     /// What standard error said during the requests that is worth the log,
     /// until [`Worker::take_notes`].
     notes: Vec<String>,
-    /// Held for as long as the worker is: one separation at a time.
-    _lock: Lock,
+    /// Held for as long as the worker is: one separation at a time. A
+    /// remote's is taken on its own machine.
+    _lock: Option<Lock>,
+    /// What the messages call the process.
+    program: String,
+    /// Set for a worker on another machine.
+    remote: Option<Far>,
+}
+
+/// A worker on another machine: how to reach it, and the directory there
+/// the inputs go to and the stems come out of.
+struct Far {
+    ssh: Ssh,
+    host: String,
+    dir: Option<String>,
+}
+
+/// How a worker on another machine started.
+pub enum Started {
+    Ready(Box<Worker>),
+    /// Its GPU is someone else's for now, or another run's: the reason.
+    Busy(String),
+}
+
+/// The command that starts the worker on `model`, in its persistent mode,
+/// with `inference`'s settings; its streams are the caller's to set.
+pub fn command(
+    config: &Config,
+    model: &Model,
+    local: &Local,
+    inference: Inference,
+) -> Result<Command> {
+    let script = ensure()?;
+    let python = config.python();
+    if !python.is_file() {
+        return Err(Error::msg(format!(
+            "{}: no Python for the inference; run `omnifrog setup`",
+            python.display()
+        )));
+    }
+    let msst = config.msst_dir();
+    if !msst.join("inference.py").is_file() {
+        return Err(Error::msg(format!(
+            "{}: no MSST checkout; run `omnifrog setup`",
+            msst.display()
+        )));
+    }
+    let mut command = crate::run::command(&python);
+    command
+        .arg(&script)
+        .arg(&msst)
+        .arg(&local.config)
+        .arg(&local.checkpoint)
+        .arg(&model.model_type)
+        .arg(model.bigshifts.to_string())
+        .arg(if model.tta { "1" } else { "0" })
+        .arg(match &local.module {
+            Some(module) => module.as_os_str(),
+            None => "-".as_ref(),
+        });
+    if model.overlap > 0 {
+        // Optional, between the module and the mode: the worker applies
+        // it as it loads the config, which stays as downloaded.
+        command.arg(format!("overlap={}", model.overlap));
+    }
+    if inference.engine == Engine::Pymss {
+        // pymss on the same files, the windows overlapping by this share;
+        // the worker falls back to MSST when it cannot.
+        command.arg(format!("pymss={}", inference.overlap.min(90)));
+        command.arg(format!("bloc={}", inference.block_seconds.max(1)));
+    }
+    // The configuration's batch, else the catalogue's, else the author's.
+    let batch = match inference.batch_size {
+        0 => model.batch,
+        asked => asked,
+    };
+    if batch > 0 {
+        command.arg(format!("batch={batch}"));
+    }
+    command
+        .arg("--serveur")
+        // Python decodes a pipe in the code page on Windows, which
+        // would mangle any path with an accent in it.
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONUNBUFFERED", "1");
+    Ok(command)
 }
 
 impl Worker {
@@ -120,68 +215,72 @@ impl Worker {
         progress: Progress,
     ) -> Result<Self> {
         let lock = Lock::take(&config.work_dir())?;
-        let script = ensure()?;
-        let python = config.python();
-        if !python.is_file() {
-            return Err(Error::msg(format!(
-                "{}: no Python for the inference; run `omnifrog setup`",
-                python.display()
-            )));
-        }
-        let msst = config.msst_dir();
-        if !msst.join("inference.py").is_file() {
-            return Err(Error::msg(format!(
-                "{}: no MSST checkout; run `omnifrog setup`",
-                msst.display()
-            )));
-        }
+        let command = command(config, model, local, config.inference)?;
         progress(Event::message(format!(
             "loading {} on the inference device",
             model.name
         )));
-        let mut command = crate::run::command(&python);
-        command
-            .arg(&script)
-            .arg(&msst)
-            .arg(&local.config)
-            .arg(&local.checkpoint)
-            .arg(&model.model_type)
-            .arg(model.bigshifts.to_string())
-            .arg(if model.tta { "1" } else { "0" })
-            .arg(match &local.module {
-                Some(module) => module.as_os_str(),
-                None => "-".as_ref(),
-            });
-        if model.overlap > 0 {
-            // Optional, between the module and the mode: the worker applies
-            // it as it loads the config, which stays as downloaded.
-            command.arg(format!("overlap={}", model.overlap));
+        let program = config.python().display().to_string();
+        let mut worker = Self::spawn(command, program, Some(lock), None)?;
+        match worker.wait_ready(progress)? {
+            None => Ok(worker),
+            Some(why) => Err(Error::msg(why)),
         }
-        if config.inference.engine == Engine::Pymss {
-            // pymss on the same files, the windows overlapping by this share;
-            // the worker falls back to MSST when it cannot.
-            command.arg(format!("pymss={}", config.inference.overlap.min(90)));
-            command.arg(format!("bloc={}", config.inference.block_seconds.max(1)));
-        }
-        // The configuration's batch, else the catalogue's, else the author's.
-        let batch = match config.inference.batch_size {
-            0 => model.batch,
-            asked => asked,
+    }
+
+    /// Start a worker on `model` on another machine, with this machine's
+    /// `inference` settings, so that a stem comes out the same wherever it
+    /// was made. The model is fetched there if it has to be.
+    pub fn start_remote(
+        remote: &Remote,
+        ssh: &Ssh,
+        model: &Model,
+        inference: Inference,
+        progress: Progress,
+    ) -> Result<Started> {
+        let json = |value: std::result::Result<String, serde_json::Error>| {
+            value.map_err(|e| Error::msg(format!("the request for {}: {e}", remote.host)))
         };
-        if batch > 0 {
-            command.arg(format!("batch={batch}"));
+        let line = format!(
+            "{} remote-worker {} {} {}",
+            remote.command,
+            remote::quote(&json(serde_json::to_string(model))?),
+            remote::quote(&json(serde_json::to_string(&inference))?),
+            remote.idle_below_gib
+        );
+        progress(Event::message(format!(
+            "loading {} on {}",
+            model.name, remote.host
+        )));
+        let far = Far {
+            ssh: ssh.clone(),
+            host: remote.host.clone(),
+            dir: None,
+        };
+        let program = format!("omnifrog on {}", remote.host);
+        let mut worker = Self::spawn(ssh.command(&line), program, None, Some(far))?;
+        match worker.wait_ready(progress)? {
+            Some(why) => Ok(Started::Busy(why)),
+            None if worker.remote.as_ref().is_some_and(|far| far.dir.is_some()) => {
+                Ok(Started::Ready(Box::new(worker)))
+            }
+            None => Err(worker.died("the remote did not say where its files go")),
         }
+    }
+
+    /// The process, its streams read by two threads; not ready yet.
+    fn spawn(
+        mut command: Command,
+        program: String,
+        lock: Option<Lock>,
+        remote: Option<Far>,
+    ) -> Result<Self> {
         command
-            .arg("--serveur")
-            // Python decodes a pipe in the code page on Windows, which
-            // would mangle any path with an accent in it.
-            .env("PYTHONUTF8", "1")
-            .env("PYTHONUNBUFFERED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().map_err(|e| Error::Command {
-            program: python.display().to_string(),
+            program: program.clone(),
             status: "could not start".into(),
             detail: e.to_string(),
         })?;
@@ -213,6 +312,8 @@ impl Worker {
                 }
                 if line.starts_with(FALLBACK) {
                     let _ = notes.send(Word::Note(line.clone()));
+                } else if let Some(said) = line.strip_prefix(remote::SAYS) {
+                    let _ = notes.send(Word::Note(said.trim().to_string()));
                 }
                 let mut tail = tail.lock().expect("the tail is never poisoned");
                 if tail.len() == TAIL {
@@ -222,7 +323,7 @@ impl Worker {
             }
         }));
         let stdin = child.stdin.take();
-        let mut worker = Self {
+        Ok(Self {
             child,
             stdin,
             words,
@@ -231,15 +332,24 @@ impl Worker {
             peak: None,
             notes: Vec::new(),
             _lock: lock,
-        };
-        worker.wait_ready(progress)?;
-        Ok(worker)
+            program,
+            remote,
+        })
     }
 
-    fn wait_ready(&mut self, progress: Progress) -> Result<()> {
+    /// Until the checkpoint is on the device; `Some` is a remote that
+    /// declined, with its reason.
+    fn wait_ready(&mut self, progress: Progress) -> Result<Option<String>> {
         loop {
             match self.words.recv_timeout(READY_TIMEOUT) {
-                Ok(Word::Ready) => return Ok(()),
+                Ok(Word::Ready) => return Ok(None),
+                Ok(Word::Busy(why)) => return Ok(Some(why)),
+                Ok(Word::Dir(dir)) => {
+                    if let Some(far) = &mut self.remote {
+                        far.dir = Some(dir);
+                    }
+                }
+                Ok(Word::Note(said)) => progress(Event::message(format!("  {said}"))),
                 // MSST prints the device it settled on, which is the one
                 // thing worth seeing before an hour of inference.
                 Ok(Word::Other(line)) => {
@@ -278,11 +388,36 @@ impl Worker {
         mut fraction: impl FnMut(f64),
     ) -> Result<Vec<Stems>> {
         fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
+        // Here, the paths as they are; there, each input is carried to the
+        // remote's directory first.
+        let (request_dir, request_inputs) = match &self.remote {
+            None => (
+                out_dir.to_string_lossy().into_owned(),
+                inputs
+                    .iter()
+                    .map(|input| input.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            Some(far) => {
+                let dir = far.dir.as_deref().unwrap_or_default();
+                let mut sent = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let name = input
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let to = format!("{dir}/in/{name}");
+                    far.ssh.upload(input, &to)?;
+                    sent.push(to);
+                }
+                (format!("{dir}/out"), sent)
+            }
+        };
         let mut request = String::from("SEP\t");
-        request.push_str(&out_dir.to_string_lossy());
-        for input in inputs {
+        request.push_str(&request_dir);
+        for input in &request_inputs {
             request.push('\t');
-            request.push_str(&input.to_string_lossy());
+            request.push_str(input);
         }
         request.push('\n');
         let stdin = self
@@ -317,13 +452,34 @@ impl Worker {
                 }
             }
         }
-        inputs
+        let bases: Vec<String> = inputs
             .iter()
             .map(|input| {
-                let base = input
+                input
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+            })
+            .collect();
+        if let Some(far) = &self.remote {
+            // The stems come back, then everything of the request goes
+            // from the remote's disk: the next one starts on an empty one.
+            let dir = far.dir.as_deref().unwrap_or_default();
+            let mut gone = request_inputs.clone();
+            for base in &bases {
+                for suffix in [VOICE_SUFFIX, REST_SUFFIX] {
+                    let there = format!("{dir}/out/{base}{suffix}");
+                    far.ssh
+                        .download(&there, &out_dir.join(format!("{base}{suffix}")))?;
+                    gone.push(there);
+                }
+            }
+            let quoted: Vec<String> = gone.iter().map(|path| remote::quote(path)).collect();
+            far.ssh.run(&format!("rm -f -- {}", quoted.join(" ")))?;
+        }
+        bases
+            .iter()
+            .map(|base| {
                 let stems = Stems {
                     voice: out_dir.join(format!("{base}{VOICE_SUFFIX}")),
                     rest: out_dir.join(format!("{base}{REST_SUFFIX}")),
@@ -358,6 +514,11 @@ impl Worker {
         self.peak
     }
 
+    /// The machine a remote worker runs on; `None` here.
+    pub fn host(&self) -> Option<&str> {
+        self.remote.as_ref().map(|far| far.host.as_str())
+    }
+
     /// The error a dead worker leaves, with the last it said.
     fn died(&mut self, what: &str) -> Error {
         let _ = self.child.kill();
@@ -374,7 +535,7 @@ impl Worker {
             .collect::<Vec<_>>()
             .join("\n");
         Error::Command {
-            program: "separer_msst.py".into(),
+            program: self.program.clone(),
             status: status
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "no status".into()),
@@ -431,6 +592,10 @@ fn word(line: &str) -> Word {
         Word::Finished
     } else if let Some(why) = line.strip_prefix("ERR ") {
         Word::Failed(why.to_string())
+    } else if let Some(why) = line.strip_prefix("BUSY ") {
+        Word::Busy(why.to_string())
+    } else if let Some(dir) = line.strip_prefix("DIR ") {
+        Word::Dir(dir.to_string())
     } else if line.starts_with("OK ") {
         Word::Done
     } else if let Some(value) = line.strip_prefix("GLOB ") {
