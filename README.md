@@ -356,6 +356,23 @@ chmod +x omnifrog-0.1.0-x86_64.AppImage
 
 Neither ships the tools a run drives, nor Python: see [Requirements](#requirements).
 
+**From a checkout.** `scripts/install-local.sh` builds `main` in release and installs
+`omnifrog`, `omnifrog-gui`, the menu entry and its icon under `~/.local` (`PREFIX=…` for
+elsewhere). It refuses another branch, or uncommitted changes, unless given `--any-branch`. Each
+program is copied beside the one it replaces and renamed over it, so an open window keeps running
+and its worker is still its own build. Run it again after a merge you want to use day to day.
+
+```
+scripts/install-local.sh                  main, built and installed
+scripts/install-local.sh --any-branch     the current branch, as it is
+```
+
+`target/` is a build cache, and cleaning it takes away what was built there: what starts Omnifrog
+every day — the menu entry, a setting of another program — names the installed copy,
+`~/.local/bin/omnifrog-gui`, and a build under `target/` stays a dev copy. The menu entry the script
+writes names it by its full path, since `~/.local/bin` can come after `/usr/bin` on `PATH`, where
+the AUR's `omnifrog` goes; the script says when `PATH` finds another one first.
+
 ## Windows
 
 `omnifrog.exe` is one file: it needs nothing beside it but the system's own libraries.
