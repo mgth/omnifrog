@@ -49,15 +49,30 @@ fi
 version="$(git describe --always --dirty)"
 
 # The programs are where Cargo says it put them: a target-dir or a build target
-# in a Cargo configuration moves them out of target/release.
+# in a Cargo configuration moves them out of target/release. Its messages are
+# JSON, read by a JSON parser, since that directory may be named with any
+# character a file name can hold.
+command -v python3 >/dev/null || {
+  echo "python3 is needed to read Cargo's build messages" >&2
+  exit 1
+}
 messages="$(cargo build --release --locked -p omnifrog-cli -p omnifrog-gui \
   --message-format=json-render-diagnostics)"
-built() { # name → the executable Cargo reported for it in this build
-  printf '%s\n' "$messages" | grep '"reason":"compiler-artifact"' |
-    sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep "/$1\$" | tail -n 1 || true
-}
-cli_built="$(built omnifrog)"
-gui_built="$(built omnifrog-gui)"
+cli_built="" gui_built=""
+{ IFS= read -r -d '' cli_built; IFS= read -r -d '' gui_built; } < <(
+  printf '%s\n' "$messages" | python3 -I -c '
+import json, sys
+built = {}
+for line in sys.stdin:
+    if not line.startswith("{"):
+        continue
+    m = json.loads(line)
+    if m.get("reason") == "compiler-artifact" and m.get("executable") \
+            and "bin" in m["target"]["kind"]:
+        built[m["target"]["name"]] = m["executable"]
+for name in ("omnifrog", "omnifrog-gui"):
+    sys.stdout.write(built.get(name, "") + "\0")
+') || true
 for path in "$cli_built" "$gui_built"; do
   if [ -z "$path" ] || [ ! -f "$path" ]; then
     echo "cargo did not report both omnifrog and omnifrog-gui; nothing installed" >&2

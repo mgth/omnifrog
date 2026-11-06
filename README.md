@@ -358,9 +358,10 @@ Neither ships the tools a run drives, nor Python: see [Requirements](#requiremen
 
 **From a checkout.** `scripts/install-local.sh` builds `main` in release and installs
 `omnifrog`, `omnifrog-gui`, the menu entry and its icon under `~/.local` (`PREFIX=…` for
-elsewhere). It refuses another branch, or uncommitted changes, unless given `--any-branch`. Each
-program is copied beside the one it replaces and renamed over it, so an open window keeps running
-and its worker is still its own build. Run it again after a merge you want to use day to day.
+elsewhere), and reads Cargo's build messages with `python3`. It refuses another branch, or
+uncommitted changes, unless given `--any-branch`. Each program is copied beside the one it
+replaces and renamed over it, so an open window keeps running and its worker is still its own
+build. Run it again after a merge you want to use day to day.
 
 ```
 scripts/install-local.sh                  main, built and installed
