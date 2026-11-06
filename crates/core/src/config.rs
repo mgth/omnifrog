@@ -116,13 +116,13 @@ impl Default for Config {
 /// Another machine that takes separation passes, over SSH: omnifrog
 /// installed and set up there, and a key that lets `ssh` in without asking.
 ///
-/// In the file, a bare host is enough (`remotes: [root@192.168.4.40]`);
+/// In the file, a bare host is enough (`remotes: [user@gpu-box]`);
 /// the full form names the other two:
 ///
 /// ```yaml
 /// remotes:
-///   - host: root@192.168.4.40
-///     command: OMNIFROG_DATA=/srv/omnifrog /srv/omnifrog/omnifrog
+///   - host: user@gpu-box
+///     command: OMNIFROG_DATA=/srv/omnifrog /opt/omnifrog/omnifrog
 ///     idle_below_gib: 1.0
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -809,10 +809,10 @@ mod tests {
     #[test]
     fn a_remote_is_a_bare_host_or_the_full_form() {
         let config: Config = serde_yaml_ng::from_str(
-            "remotes:\n  - root@192.168.4.40\n  - host: gpu-box\n    command: OMNIFROG_DATA=/srv/o /srv/o/omnifrog\n    idle_below_gib: 0\n",
+            "remotes:\n  - user@gpu-box\n  - host: gpu-box\n    command: OMNIFROG_DATA=/srv/o /srv/o/omnifrog\n    idle_below_gib: 0\n",
         )
         .unwrap();
-        assert_eq!(config.remotes[0], Remote::new("root@192.168.4.40"));
+        assert_eq!(config.remotes[0], Remote::new("user@gpu-box"));
         assert_eq!(config.remotes[0].command, "omnifrog");
         assert_eq!(config.remotes[0].idle_below_gib, 1.0);
         assert_eq!(config.remotes[1].host, "gpu-box");
