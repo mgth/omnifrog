@@ -17,6 +17,12 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
+# A relative PREFIX is read from where the script was started; the menu entry
+# runs from anywhere, so it has to name an absolute path.
+case "$PREFIX" in
+  /*) ;;
+  *) PREFIX="$PWD/$PREFIX" ;;
+esac
 
 any_branch=0
 case "${1:-}" in
@@ -42,14 +48,29 @@ if [ "$any_branch" = 0 ]; then
 fi
 version="$(git describe --always --dirty)"
 
-cargo build --release --locked -p omnifrog-cli -p omnifrog-gui
-built="${CARGO_TARGET_DIR:-$REPO/target}/release"
+# The programs are where Cargo says it put them: a target-dir or a build target
+# in a Cargo configuration moves them out of target/release.
+messages="$(cargo build --release --locked -p omnifrog-cli -p omnifrog-gui \
+  --message-format=json-render-diagnostics)"
+built() { # name → the executable Cargo reported for it in this build
+  printf '%s\n' "$messages" | grep '"reason":"compiler-artifact"' |
+    sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep "/$1\$" | tail -n 1 || true
+}
+cli_built="$(built omnifrog)"
+gui_built="$(built omnifrog-gui)"
+for path in "$cli_built" "$gui_built"; do
+  if [ -z "$path" ] || [ ! -f "$path" ]; then
+    echo "cargo did not report both omnifrog and omnifrog-gui; nothing installed" >&2
+    exit 1
+  fi
+done
 
 install -d "$PREFIX/bin"
-for name in omnifrog omnifrog-gui; do
+for pair in "omnifrog:$cli_built" "omnifrog-gui:$gui_built"; do
+  name="${pair%%:*}"
   # Copied beside the old one and renamed over it: an open window keeps its
   # file, and its worker (started through /proc/self/exe) is still its own.
-  install -m 755 "$built/$name" "$PREFIX/bin/$name.new"
+  install -m 755 "${pair#*:}" "$PREFIX/bin/$name.new"
   mv -f "$PREFIX/bin/$name.new" "$PREFIX/bin/$name"
 done
 gui="$PREFIX/bin/omnifrog-gui"
@@ -80,7 +101,8 @@ command -v update-desktop-database >/dev/null &&
   update-desktop-database -q "$PREFIX/share/applications" || true
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
 
-echo "installed omnifrog $version ($branch) as $PREFIX/bin/omnifrog and $gui"
+echo "installed omnifrog $version ($branch) as $PREFIX/bin/omnifrog and $gui," \
+  "built in $(dirname "$gui_built")"
 for name in omnifrog omnifrog-gui; do
   found="$(command -v "$name" || true)"
   if [ "$found" != "$PREFIX/bin/$name" ]; then
