@@ -294,8 +294,16 @@ pub fn check(config: &Config) -> Vec<String> {
         let probe = crate::run::command(&python)
             .args([
                 "-c",
-                "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() \
-                 else 'cpu')",
+                // The name alone can be a generic « AMD Radeon Graphics »
+                // (no amdgpu.ids where the ROCm wheel looks): the
+                // architecture says which card it is.
+                "import torch\n\
+                 if torch.cuda.is_available():\n\
+                 \x20   arch = getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '')\n\
+                 \x20   name = torch.cuda.get_device_name(0)\n\
+                 \x20   print(f'{name} ({arch.split(\":\")[0]})' if arch else name)\n\
+                 else:\n\
+                 \x20   print('cpu')",
             ])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
