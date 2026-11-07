@@ -244,9 +244,12 @@ pub fn media(config: &Config, path: &Path, progress: Progress) -> Result<Media> 
         )));
         match report(&ffmpeg, &decoder, path, track) {
             Ok(report) => {
-                if let Some(channels) = report.channels {
-                    track.channels = channels;
+                let (channels, disagreement) =
+                    channels_to_keep(track.channels, report.channels, report.spatial.is_some());
+                if let Some(why) = disagreement {
+                    progress(Event::message(format!("  track {}: {why}", track.index)));
                 }
+                track.channels = channels;
                 if let Some(rate) = report.sample_rate {
                     track.sample_rate = rate;
                 }
@@ -270,6 +273,32 @@ pub fn media(config: &Config, path: &Path, progress: Progress) -> Result<Media> 
         }
     }
     Ok(media)
+}
+
+/// The channel count a track is taken at, from what its container states
+/// and what the decoder read, with a line for the log when they disagree.
+///
+/// The decoder's count is the one for a track it finds a spatial layer in:
+/// the container states the bed, the decoder knows the scene. On a plain
+/// track a decoder that reads fewer channels than the container states is
+/// not believed: a harletty older than harletty-bridge#167 read every
+/// legacy AC-3 frame as mono, so a Blu-ray 7.1 E-AC-3 dub (a 5.1 AC-3 core
+/// and a dependent) came out as 1.0, and ffmpeg was asked to split a mono
+/// layout: the 7.1 was mixed down to one channel before its dialogue was
+/// separated.
+fn channels_to_keep(container: u32, decoder: Option<u32>, spatial: bool) -> (u32, Option<String>) {
+    match decoder {
+        Some(read) if spatial || read >= container => (read, None),
+        Some(read) => (
+            container,
+            Some(format!(
+                "the decoder reads {read} channel{} where the container states {container}; \
+                 the container's count is kept (update harletty)",
+                if read == 1 { "" } else { "s" }
+            )),
+        ),
+        None => (container, None),
+    }
 }
 
 /// `ffprobe` alone: the streams as the container states them.
@@ -585,6 +614,23 @@ impl Disposition {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plain_track_keeps_the_channels_its_container_states() {
+        // The Blu-ray 7.1 E-AC-3 an older harletty read as 1.0.
+        let (kept, said) = super::channels_to_keep(8, Some(1), false);
+        assert_eq!(kept, 8);
+        assert!(
+            said.unwrap()
+                .contains("reads 1 channel where the container states 8")
+        );
+        // Agreeing, or reading more: the decoder's.
+        assert_eq!(super::channels_to_keep(8, Some(8), false), (8, None));
+        // A spatial track: the decoder knows the scene, whatever the bed.
+        assert_eq!(super::channels_to_keep(8, Some(6), true), (6, None));
+        // Nothing read: the container's.
+        assert_eq!(super::channels_to_keep(6, None, false), (6, None));
+    }
+
     use super::*;
 
     #[test]
