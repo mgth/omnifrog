@@ -7,7 +7,7 @@ use omnifrog_core::config::{Config, Inference};
 use omnifrog_core::doctor::{self, Check, Status};
 use omnifrog_core::models::Catalogue;
 use omnifrog_core::probe::{self, Media};
-use omnifrog_core::remote::Verdict;
+use omnifrog_core::remote::{self, Agent, Verdict};
 use omnifrog_core::setup::{self, Device, Recommendation};
 use omnifrog_core::{pipeline, progress};
 use std::path::PathBuf;
@@ -23,8 +23,9 @@ pub enum Tab {
 pub enum Loaded {
     Device(Device, Recommendation),
     Checks(Vec<Check>),
-    /// Each remote of the configuration, by host, as it answered.
-    Remotes(Vec<(String, Verdict)>),
+    /// Each remote of the configuration, by host, as it answered, and
+    /// where ssh found the agent for them.
+    Remotes(Vec<(String, Verdict)>, Agent),
     Probe {
         path: PathBuf,
         result: Result<Media, String>,
@@ -56,6 +57,9 @@ pub struct App {
     pub checking: bool,
     /// The other machines' GPUs, by host; `None` until they first answered.
     pub remotes: Option<Vec<(String, Verdict)>>,
+    /// Where the agent was when the remotes were last asked: looking for
+    /// it touches sockets, which is not done while drawing.
+    pub agent: Option<Agent>,
     pub asking_remotes: bool,
     /// Why the last file chosen for a tool was refused.
     pub tool_refused: Option<String>,
@@ -100,6 +104,7 @@ impl App {
             checks: None,
             checking: false,
             remotes: None,
+            agent: None,
             asking_remotes: false,
             tool_refused: None,
             source: None,
@@ -177,7 +182,7 @@ impl App {
                     })
                     .collect()
             });
-            Loaded::Remotes(verdicts)
+            Loaded::Remotes(verdicts, remote::agent())
         });
     }
 
@@ -317,8 +322,9 @@ impl App {
         while let Ok(loaded) = self.loaded_rx.try_recv() {
             match loaded {
                 Loaded::Device(device, advice) => self.device = Some((device, advice)),
-                Loaded::Remotes(remotes) => {
+                Loaded::Remotes(remotes, agent) => {
                     self.remotes = Some(remotes);
+                    self.agent = Some(agent);
                     self.asking_remotes = false;
                 }
                 Loaded::Checks(checks) => {

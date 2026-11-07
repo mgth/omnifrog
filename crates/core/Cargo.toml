@@ -19,6 +19,10 @@ ureq.workspace = true
 rayon.workspace = true
 realfft.workspace = true
 
+# A connection to an ssh agent's socket that cannot wait (remote::agent).
+[target.'cfg(unix)'.dependencies]
+socket2.workspace = true
+
 # The separation lock, on one byte of the lock file rather than on all of
 # it, so the id in the file stays readable to the run that is refused.
 [target.'cfg(windows)'.dependencies]

@@ -363,12 +363,24 @@ fn agent_among(set: Option<std::ffi::OsString>, runtime: Option<PathBuf>) -> Age
         .map_or(Agent::None, Agent::Found)
 }
 
-/// Something listens at `socket`. An agent that died leaves its socket
-/// behind, and a connection to it is refused: the next one is tried. A
-/// socket systemd holds for an agent not started yet starts it.
+/// Something listens at `socket` and takes a connection at once. An agent
+/// that died leaves its socket behind, and a connection to it is refused;
+/// one whose queue is full would make a plain connection wait for as long
+/// as it stays full. The connection is made without waiting, so neither
+/// holds anything up: the next socket is tried. A socket systemd holds for
+/// an agent not started yet starts it.
 #[cfg(unix)]
 fn answers(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let Ok(address) = SockAddr::unix(socket) else {
+        return false;
+    };
+    Socket::new(Domain::UNIX, Type::STREAM, None)
+        .and_then(|stream| {
+            stream.set_nonblocking(true)?;
+            stream.connect(&address)
+        })
+        .is_ok()
 }
 
 #[cfg(not(unix))]
@@ -840,6 +852,25 @@ mod tests {
         fs::remove_file(&first).unwrap();
         fs::write(&first, b"").unwrap();
         assert_eq!(among(None), Agent::Found(second.clone()));
+        // One whose queue is full is passed over at once, not waited on.
+        fs::remove_file(&first).unwrap();
+        {
+            use socket2::{Domain, SockAddr, Socket, Type};
+            let full = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            full.bind(&SockAddr::unix(&first).unwrap()).unwrap();
+            full.listen(1).unwrap();
+            let mut waiting = Vec::new();
+            while answers(&first) {
+                let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+                client.set_nonblocking(true).unwrap();
+                client.connect(&SockAddr::unix(&first).unwrap()).unwrap();
+                waiting.push(client);
+                assert!(waiting.len() < 64, "the queue never filled");
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(among(None), Agent::Found(second.clone()));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
         // OpenSSH's own unit first, when it answers.
         fs::remove_file(&first).unwrap();
         let _openssh = UnixListener::bind(&first).unwrap();
