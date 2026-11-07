@@ -188,6 +188,7 @@ fn run_logged(
             "job {} — every step is done with these parameters",
             job.dir.display()
         )));
+        tell_earlier(&job.manifest, None, progress);
         return Ok(outcome);
     };
     progress(Event::message(format!(
@@ -197,6 +198,7 @@ fn run_logged(
         Step::ALL.len(),
         from.label()
     )));
+    tell_earlier(&job.manifest, Some(from), progress);
     for step in Step::ALL {
         if step < from {
             continue;
@@ -430,7 +432,9 @@ fn run_logged(
                 job.manifest.output = Some(output);
             }
         }
-        job.finished(step, started.elapsed().as_secs_f64())?;
+        let seconds = started.elapsed().as_secs_f64();
+        job.finished(step, seconds)?;
+        progress(took(step, seconds, false));
         // Known once the master set is on disk, and hours of separation
         // before the encoder would have said it. Checked after the step is
         // recorded, so a run with another encoder carries on from here.
@@ -616,6 +620,31 @@ fn announce(step: Step, progress: Progress) {
     });
 }
 
+/// That `step` took `seconds`.
+fn took(step: Step, seconds: f64, earlier: bool) -> Event {
+    Event::Took {
+        number: step.number(),
+        total: Step::ALL.len() as u32,
+        label: step.label().to_string(),
+        seconds,
+        earlier,
+    }
+}
+
+/// How long each step an earlier run did took — the ones before `from`, or
+/// every one when the job is done — as the manifest recorded it. A resumed
+/// run's account then holds the job's whole time, not only its own part.
+fn tell_earlier(manifest: &Manifest, from: Option<Step>, progress: Progress) {
+    for step in Step::ALL {
+        if from.is_some_and(|from| step >= from) {
+            break;
+        }
+        if let Some(seconds) = manifest.durations.get(&step.number().to_string()) {
+            progress(took(step, *seconds, true));
+        }
+    }
+}
+
 /// The two tracks a run works on: the ones asked for, or the ones the
 /// ranking picks.
 pub fn choose<'a>(media: &'a Media, options: &Options) -> Result<(&'a AudioTrack, &'a AudioTrack)> {
@@ -730,5 +759,38 @@ mod tests {
         assert!(job.join(FILE_NAME).is_file());
         assert!(output.with_extension("log").is_file());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resumed run first says how long each step an earlier run did
+    /// took, from the manifest, so that its account holds the whole job;
+    /// a step with no time recorded is left out rather than given nought.
+    #[test]
+    fn a_resumed_run_tells_what_the_earlier_steps_took() {
+        let mut manifest = crate::job::tests::manifest();
+        manifest.durations = [("1", 893.4), ("2", 773.6), ("4", 38.7)]
+            .into_iter()
+            .map(|(step, seconds)| (step.to_string(), seconds))
+            .collect();
+        let told = |from: Option<Step>| {
+            let events = std::sync::Mutex::new(Vec::new());
+            tell_earlier(&manifest, from, &|event| events.lock().unwrap().push(event));
+            events.into_inner().unwrap()
+        };
+
+        let before_the_dub = told(Some(Step::SeparateDub));
+        assert_eq!(
+            before_the_dub,
+            [
+                took(Step::Extract, 893.4, true),
+                took(Step::SeparateOriginal, 773.6, true)
+            ]
+        );
+        assert_eq!(
+            before_the_dub[1].took_line().unwrap(),
+            "2/6 dialogue out of the original took 12:53, in an earlier run"
+        );
+        // From the first step, nothing was done before; done, every step.
+        assert!(told(Some(Step::Extract)).is_empty());
+        assert_eq!(told(None).len(), 3);
     }
 }
