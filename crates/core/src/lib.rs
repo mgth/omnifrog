@@ -32,6 +32,7 @@ pub mod progress;
 pub mod remote;
 pub mod remux;
 pub mod run;
+pub mod runlog;
 pub mod separate;
 pub mod setup;
 pub mod tags;

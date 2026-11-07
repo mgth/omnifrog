@@ -550,6 +550,11 @@ impl Job {
         self.dir.join("manifest.json")
     }
 
+    /// The runs' log ([`crate::runlog`]), while the job is kept.
+    pub fn log_path(&self) -> PathBuf {
+        self.dir.join(crate::runlog::FILE_NAME)
+    }
+
     /// The film's name, which every output is named after.
     pub fn stem(&self) -> String {
         self.manifest
@@ -615,6 +620,8 @@ impl Job {
                 fs::remove_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
             }
         }
+        // The log is not one of them: `pipeline::run` takes it away once it
+        // is beside the track, and leaves it here when it could not be.
         for file in [
             self.manifest_path(),
             self.manifest_path().with_extension("json.tmp"),

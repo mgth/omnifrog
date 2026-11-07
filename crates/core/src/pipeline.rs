@@ -11,6 +11,7 @@ use crate::master::{MasterSet, Revoiced};
 use crate::models::Catalogue;
 use crate::probe::{AudioTrack, Media};
 use crate::progress::{Event, Progress};
+use crate::runlog::RunLog;
 use crate::{Error, Result, encode, extract, master, probe, remux, separate, tracks, voices, wav};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -62,8 +63,28 @@ pub struct Outcome {
     pub resumed_at: Option<Step>,
 }
 
-/// Re-voice a film.
+/// Re-voice a film. Everything the run reports is also kept in its log
+/// ([`crate::runlog`]): in the job's directory while it goes, beside the
+/// track once it is written.
 pub fn run(config: &Config, options: &Options, progress: Progress) -> Result<Outcome> {
+    let log = RunLog::new();
+    let logged = |event: Event| {
+        log.record(&event);
+        progress(event);
+    };
+    let result = run_logged(config, options, &logged, &log);
+    if let Err(why) = &result {
+        log.note(&format!("failed: {why}"));
+    }
+    result
+}
+
+fn run_logged(
+    config: &Config,
+    options: &Options,
+    progress: Progress,
+    log: &RunLog,
+) -> Result<Outcome> {
     if options.mkv && options.seconds.is_some() {
         // A trial is a track to listen to; a film whose new track stops
         // after a minute, around a picture that goes on for two hours, is
@@ -156,6 +177,7 @@ pub fn run(config: &Config, options: &Options, progress: Progress) -> Result<Out
         encode::require_iamf(config, job.manifest.encoder)?;
     }
     job.save()?;
+    log.open(&job.log_path());
     let outcome = Outcome {
         dir: job.dir.clone(),
         output: job.output(),
@@ -419,7 +441,27 @@ pub fn run(config: &Config, options: &Options, progress: Progress) -> Result<Out
             encode::overlay_fits(extracted.elements.len())?;
         }
     }
+    // The log beside the track, named like it. The job's own goes with the
+    // temporaries, unless it could not be copied.
+    let mut log_beside = false;
+    if let Some(path) = log.path() {
+        let beside = outcome.output.with_extension("log");
+        progress(Event::message(format!(
+            "the run's log: {}",
+            beside.display()
+        )));
+        match std::fs::copy(&path, &beside) {
+            Ok(_) => log_beside = true,
+            Err(e) => progress(Event::message(format!(
+                "the log could not be copied there ({e}); it stays in {}",
+                path.display()
+            ))),
+        }
+    }
     if !config.keep_work {
+        if log_beside {
+            let _ = std::fs::remove_file(job.log_path());
+        }
         // Tens of gigabytes a film, and nothing in them the track needs.
         job.clean()?;
         progress(Event::message(format!(
