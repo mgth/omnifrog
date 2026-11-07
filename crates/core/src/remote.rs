@@ -358,9 +358,22 @@ fn agent_among(set: Option<std::ffi::OsString>, runtime: Option<PathBuf>) -> Age
             AGENT_SOCKETS
                 .iter()
                 .map(|socket| dir.join(socket))
-                .find(|socket| socket.exists())
+                .find(|socket| answers(socket))
         })
         .map_or(Agent::None, Agent::Found)
+}
+
+/// Something listens at `socket`. An agent that died leaves its socket
+/// behind, and a connection to it is refused: the next one is tried. A
+/// socket systemd holds for an agent not started yet starts it.
+#[cfg(unix)]
+fn answers(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+#[cfg(not(unix))]
+fn answers(_: &Path) -> bool {
+    false
 }
 
 /// What a remote said about itself.
@@ -808,19 +821,32 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn without_ssh_auth_sock_the_usual_agent_socket_is_found() {
+        use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!("omnifrog-agent-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("gcr")).unwrap();
         let among = |set: Option<&str>| agent_among(set.map(Into::into), Some(dir.clone()));
+        let first = dir.join("ssh-agent.socket");
+        let second = dir.join("gcr/ssh");
         assert_eq!(among(None), Agent::None);
-        fs::write(dir.join("gcr/ssh"), b"").unwrap();
-        assert_eq!(among(None), Agent::Found(dir.join("gcr/ssh")));
-        // OpenSSH's own unit first.
-        fs::write(dir.join("ssh-agent.socket"), b"").unwrap();
-        assert_eq!(among(None), Agent::Found(dir.join("ssh-agent.socket")));
+        let _gcr = UnixListener::bind(&second).unwrap();
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // An agent that died left its socket: nobody answers there, the
+        // next one is taken.
+        drop(UnixListener::bind(&first).unwrap());
+        assert!(first.exists());
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // A file of that name is no agent either.
+        fs::remove_file(&first).unwrap();
+        fs::write(&first, b"").unwrap();
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // OpenSSH's own unit first, when it answers.
+        fs::remove_file(&first).unwrap();
+        let _openssh = UnixListener::bind(&first).unwrap();
+        assert_eq!(among(None), Agent::Found(first.clone()));
         // Whatever the environment says is what ssh uses.
         assert_eq!(among(Some("/elsewhere/agent")), Agent::Known);
-        assert_eq!(among(Some("")), Agent::Found(dir.join("ssh-agent.socket")));
+        assert_eq!(among(Some("")), Agent::Found(first.clone()));
         assert_eq!(agent_among(None, None), Agent::None);
         fs::remove_dir_all(&dir).unwrap();
     }
