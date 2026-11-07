@@ -337,8 +337,9 @@ A separation step can share its passes with the GPUs of other machines on the ne
 goes to whichever device is free, this machine's included, so a second card of similar speed
 takes about half of them (a little less: its files travel). A remote needs omnifrog there, of the same version, set up with
 `omnifrog setup` (its own venv, MSST and models directory; it fetches the models it is asked for),
-and an `ssh` key that lets this machine in without a question. Then, in this machine's
-configuration:
+and an `ssh` key that lets this machine in without a question — a key with a passphrase through
+the agent (`ssh-add`). The window, started from a menu, finds the agent at its usual socket even
+when only a shell's startup file sets `SSH_AUTH_SOCK`. Then, in this machine's configuration:
 
 ```yaml
 remotes:

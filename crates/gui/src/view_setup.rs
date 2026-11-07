@@ -6,7 +6,7 @@ use egui::{Color32, RichText, Ui};
 use omnifrog_core::config::{Config, Engine};
 use omnifrog_core::doctor::Status;
 use omnifrog_core::models::Role;
-use omnifrog_core::remote::Verdict;
+use omnifrog_core::remote::{self, Agent, Verdict};
 use omnifrog_core::setup::Gpu;
 use omnifrog_core::tools::{self, Tool};
 use std::path::PathBuf;
@@ -160,13 +160,19 @@ fn other_machines(app: &mut App, ui: &mut Ui) {
         .iter()
         .any(|(_, verdict)| matches!(verdict, Verdict::Unreachable(_)))
     {
-        ui.small(
-            RichText::new(
-                "ssh has to get in with a key and no question: is the machine on? After a \
-                 restart, a key with a passphrase needs `ssh-add` first.",
-            )
-            .weak(),
-        );
+        let hint = match remote::agent() {
+            Agent::None => {
+                "This window sees no ssh agent: SSH_AUTH_SOCK is not set where it was started, \
+                 and no agent socket is under $XDG_RUNTIME_DIR. A key with a passphrase cannot \
+                 be used without one."
+            }
+            Agent::Known | Agent::Found(_) => {
+                "ssh has to get in with a key and no question: is the machine on, and is the key \
+                 in the agent (`ssh-add -l`; a key with a passphrase is added once a session \
+                 with `ssh-add`)?"
+            }
+        };
+        ui.small(RichText::new(hint).weak());
     }
 }
 
