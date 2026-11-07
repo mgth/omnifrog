@@ -353,12 +353,21 @@ remotes:
 its memory is in use.
 
 **Whatever else runs on a remote comes first.** A remote takes a pass only while the other
-programs there hold less than `idle_below_gib` of its GPU's memory (`0`: whatever is on it), and it
-gives the device back after every pass: the model is loaded again for the next one, so a program
-that wants the card between two passes finds it free. Nothing there is ever stopped or unloaded. A
-busy remote is asked again every minute; one that fails twice in a row is left out for the rest of
-the step, and what it did not make is made here. A machine whose torch sees no GPU, or whose
-omnifrog is another version, is left out from the start, and the progress says why.
+programs there hold less than `idle_below_gib` of the memory of the GPU its torch computes on —
+the first one `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES` leaves it, read from that card's own
+counters (`0`: whatever is on it). It gives the device back after every pass: the model is loaded
+again for the next one, so a program that wants the card between two passes finds it free.
+Nothing there is ever stopped or unloaded. A busy remote is asked again every minute; one that
+fails twice in a row is left out for the rest of the step, and what it did not make is made here.
+A machine whose torch sees no GPU, or whose omnifrog is another version, is left out from the
+start, and the progress says why.
+
+**A remote never holds the step up.** Once nothing is left in line, this machine makes again,
+itself, the pass a remote is still on; whichever finishes first keeps it, and the other is
+stopped. A remote that does not answer what it is within two minutes is left out, a transfer that
+moves no byte for a minute fails, and when the step ends or fails everything still running over
+SSH is stopped. Over there, a worker whose connection went is stopped within ten seconds, so the
+card and the lock are free again.
 
 The inputs go there and the stems come back over SSH, through the connection the first command
 opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 GB back. Every

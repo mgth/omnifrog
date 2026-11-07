@@ -37,6 +37,7 @@ use crate::config::{Config, Engine, Inference, Remote};
 use crate::models::{Local, Model};
 use crate::progress::{Event, Progress};
 use crate::remote::{self, Ssh};
+use crate::run::Stop;
 use crate::{Error, Result};
 use std::collections::VecDeque;
 use std::fs;
@@ -62,6 +63,11 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// How long `QUIT` is given before the process is killed.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a worker that can be stopped looks at its [`Stop`] while it
+/// waits for a word.
+const TICK: Duration = Duration::from_millis(100);
+/// What a worker told to stop says it was.
+const STOPPED: &str = "stopped: the pass was made elsewhere first, or the step is over";
 /// Lines of standard error kept for a failure report.
 const TAIL: usize = 60;
 /// How the worker's standard error starts the line saying an element ran
@@ -123,6 +129,23 @@ pub struct Worker {
     program: String,
     /// Set for a worker on another machine.
     remote: Option<Far>,
+    /// Raised, the worker is killed wherever it is: another device made its
+    /// pass first, or the step is over.
+    stop: Option<Stop>,
+    /// The process was killed rather than left to end. Its streams may then
+    /// stay open for a while — held by what it started, or by ssh's master
+    /// connection — so the threads reading them are not waited for.
+    killed: bool,
+}
+
+/// Why no word came.
+enum Silence {
+    /// Nothing for the time allowed.
+    Quiet,
+    /// The worker's output closed: it is gone.
+    Gone,
+    /// Its [`Stop`] was raised.
+    Stopped,
 }
 
 /// A worker on another machine: how to reach it, and the directory there
@@ -142,11 +165,16 @@ pub enum Started {
 
 /// The command that starts the worker on `model`, in its persistent mode,
 /// with `inference`'s settings; its streams are the caller's to set.
+///
+/// With `idle_below_gib` (a remote's pass), the worker first reads how much
+/// of its device's memory other programs hold, and answers `BUSY <why>` and
+/// exits, having loaded nothing, when that is as much or more.
 pub fn command(
     config: &Config,
     model: &Model,
     local: &Local,
     inference: Inference,
+    idle_below_gib: Option<f64>,
 ) -> Result<Command> {
     let script = ensure()?;
     let python = config.python();
@@ -195,6 +223,9 @@ pub fn command(
     if batch > 0 {
         command.arg(format!("batch={batch}"));
     }
+    if let Some(idle) = idle_below_gib.filter(|&idle| idle > 0.0) {
+        command.arg(format!("idle={idle}"));
+    }
     command
         .arg("--serveur")
         // Python decodes a pipe in the code page on Windows, which
@@ -214,14 +245,26 @@ impl Worker {
         local: &Local,
         progress: Progress,
     ) -> Result<Self> {
+        Self::start_under(config, model, local, progress, None)
+    }
+
+    /// [`Worker::start`], the worker killed whenever `stop` is raised —
+    /// while it loads, or under a request.
+    pub fn start_under(
+        config: &Config,
+        model: &Model,
+        local: &Local,
+        progress: Progress,
+        stop: Option<Stop>,
+    ) -> Result<Self> {
         let lock = Lock::take(&config.work_dir())?;
-        let command = command(config, model, local, config.inference)?;
+        let command = command(config, model, local, config.inference, None)?;
         progress(Event::message(format!(
             "loading {} on the inference device",
             model.name
         )));
         let program = config.python().display().to_string();
-        let mut worker = Self::spawn(command, program, Some(lock), None)?;
+        let mut worker = Self::spawn(command, program, Some(lock), None, stop)?;
         match worker.wait_ready(progress)? {
             None => Ok(worker),
             Some(why) => Err(Error::msg(why)),
@@ -230,7 +273,8 @@ impl Worker {
 
     /// Start a worker on `model` on another machine, with this machine's
     /// `inference` settings, so that a stem comes out the same wherever it
-    /// was made. The model is fetched there if it has to be.
+    /// was made. The model is fetched there if it has to be. The worker is
+    /// stopped by `ssh`'s [`Stop`], as its transfers are.
     pub fn start_remote(
         remote: &Remote,
         ssh: &Ssh,
@@ -258,7 +302,8 @@ impl Worker {
             dir: None,
         };
         let program = format!("omnifrog on {}", remote.host);
-        let mut worker = Self::spawn(ssh.command(&line), program, None, Some(far))?;
+        let stop = Some(ssh.stop().clone());
+        let mut worker = Self::spawn(ssh.command(&line), program, None, Some(far), stop)?;
         match worker.wait_ready(progress)? {
             Some(why) => Ok(Started::Busy(why)),
             None if worker.remote.as_ref().is_some_and(|far| far.dir.is_some()) => {
@@ -274,6 +319,7 @@ impl Worker {
         program: String,
         lock: Option<Lock>,
         remote: Option<Far>,
+        stop: Option<Stop>,
     ) -> Result<Self> {
         command
             .stdin(Stdio::piped())
@@ -334,14 +380,47 @@ impl Worker {
             _lock: lock,
             program,
             remote,
+            stop,
+            killed: false,
         })
+    }
+
+    /// Whether this worker was told to stop.
+    pub fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(Stop::raised)
+    }
+
+    /// The next word, waiting up to `limit` for it, and no longer than the
+    /// next look at the stop.
+    fn next(&self, limit: Duration) -> std::result::Result<Word, Silence> {
+        let Some(stop) = &self.stop else {
+            return self.words.recv_timeout(limit).map_err(|e| match e {
+                RecvTimeoutError::Timeout => Silence::Quiet,
+                RecvTimeoutError::Disconnected => Silence::Gone,
+            });
+        };
+        let start = std::time::Instant::now();
+        loop {
+            if stop.raised() {
+                return Err(Silence::Stopped);
+            }
+            let left = limit.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(Silence::Quiet);
+            }
+            match self.words.recv_timeout(left.min(TICK)) {
+                Ok(word) => return Ok(word),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Err(Silence::Gone),
+            }
+        }
     }
 
     /// Until the checkpoint is on the device; `Some` is a remote that
     /// declined, with its reason.
     fn wait_ready(&mut self, progress: Progress) -> Result<Option<String>> {
         loop {
-            match self.words.recv_timeout(READY_TIMEOUT) {
+            match self.next(READY_TIMEOUT) {
                 Ok(Word::Ready) => return Ok(None),
                 Ok(Word::Busy(why)) => return Ok(Some(why)),
                 Ok(Word::Dir(dir)) => {
@@ -368,12 +447,13 @@ impl Worker {
                     }
                 }
                 Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
+                Err(Silence::Quiet) => {
                     return Err(self.died("the model did not load within twenty minutes"));
                 }
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(Silence::Gone) => {
                     return Err(self.died("the worker stopped before the model was loaded"));
                 }
+                Err(Silence::Stopped) => return Err(self.died(STOPPED)),
             }
         }
     }
@@ -387,6 +467,11 @@ impl Worker {
         out_dir: &Path,
         mut fraction: impl FnMut(f64),
     ) -> Result<Vec<Stems>> {
+        // Told to stop before it began: nothing to kill, the worker can
+        // serve the next request.
+        if self.stopped() {
+            return Err(Error::msg(STOPPED));
+        }
         fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
         // Here, the paths as they are; there, each input is carried to the
         // remote's directory first.
@@ -428,7 +513,7 @@ impl Worker {
             return Err(self.died("the worker stopped before the request was sent"));
         }
         loop {
-            match self.words.recv_timeout(QUIET_TIMEOUT) {
+            match self.next(QUIET_TIMEOUT) {
                 Ok(Word::Fraction(f)) => fraction(f.clamp(0.0, 1.0)),
                 Ok(Word::Finished) => break,
                 Ok(Word::Other(line)) => {
@@ -444,12 +529,13 @@ impl Worker {
                     return Err(Error::msg(format!("the separation failed: {why}")));
                 }
                 Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
+                Err(Silence::Quiet) => {
                     return Err(self.died("the worker went an hour without a word"));
                 }
-                Err(RecvTimeoutError::Disconnected) => {
+                Err(Silence::Gone) => {
                     return Err(self.died("the worker stopped during the separation"));
                 }
+                Err(Silence::Stopped) => return Err(self.died(STOPPED)),
             }
         }
         let bases: Vec<String> = inputs
@@ -475,7 +561,10 @@ impl Worker {
                 }
             }
             let quoted: Vec<String> = gone.iter().map(|path| remote::quote(path)).collect();
-            far.ssh.run(&format!("rm -f -- {}", quoted.join(" ")))?;
+            far.ssh.run(
+                &format!("rm -f -- {}", quoted.join(" ")),
+                remote::QUICK_TIMEOUT,
+            )?;
         }
         bases
             .iter()
@@ -521,7 +610,11 @@ impl Worker {
 
     /// The error a dead worker leaves, with the last it said.
     fn died(&mut self, what: &str) -> Error {
+        // The input closed too: over there, the end of it is what tells
+        // the remote's omnifrog to let its worker go.
+        self.stdin = None;
         let _ = self.child.kill();
+        self.killed = true;
         let status = self.child.wait().ok();
         let tail = self
             .errors
@@ -565,12 +658,17 @@ impl Drop for Worker {
                 _ => {
                     let _ = self.child.kill();
                     let _ = self.child.wait();
+                    self.killed = true;
                     break;
                 }
             }
         }
-        for pump in self.pumps.drain(..) {
-            let _ = pump.join();
+        // Killed, the streams close when whatever still holds them lets
+        // go; the threads end then, on their own.
+        if !self.killed {
+            for pump in self.pumps.drain(..) {
+                let _ = pump.join();
+            }
         }
     }
 }

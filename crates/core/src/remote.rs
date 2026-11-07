@@ -6,8 +6,9 @@
 //! all this side runs there, both hidden from its help:
 //!
 //! - `remote-check`, once a step: its version, the device torch would run
-//!   on, and how much of its GPU's memory is in use ([`probe`]). A remote of
-//!   another version, or without a GPU torch can use, is left out.
+//!   on, and how much of that device's memory is in use ([`probe`]). A
+//!   remote of another version, or without a GPU torch can use, is left
+//!   out.
 //! - `remote-worker '<model>' '<inference>' <idle below GiB>`, once a pass
 //!   ([`serve`]): the worker of [`crate::worker`], its protocol untouched,
 //!   with two words of its own before `PRET`:
@@ -24,22 +25,36 @@
 //!
 //! **Whatever else runs on that machine comes first.** Its GPU is taken
 //! only while the other programs there hold less than `idle_below_gib` of
-//! its memory, and it is given back after every pass — the model is loaded
-//! again for the next one — so a program that wants it between two passes
-//! finds it free. Nothing there is ever unloaded or stopped. A remote that
-//! is busy is asked again a minute later; one that fails twice in a row is
-//! left out for the rest of the step. This machine's GPU does whatever the
-//! remotes do not, so a step never waits on one.
+//! the memory of the device torch computes on — that card's own counters,
+//! read by the worker before it loads anything — and it is given back
+//! after every pass: the model is loaded again for the next one, so a
+//! program that wants it between two passes finds it free. Nothing there is
+//! ever unloaded or stopped. A remote that is busy is asked again a minute
+//! later; one that fails twice in a row is left out for the rest of the
+//! step. This machine's GPU does whatever the remotes do not, so a step
+//! never waits on one.
+//!
+//! **Nothing here waits on a remote without a limit.** `remote-check` has
+//! two minutes; a transfer is cut when no byte moved for one; every command
+//! under way is killed when the step ends or fails, or when this machine
+//! made the pass first (see `separate`). Over there, a worker whose
+//! connection went is killed ten seconds later, so the lock and the GPU are
+//! free again.
 
 use crate::config::{Config, Inference};
 use crate::models::{self, Model};
 use crate::progress::Event;
+use crate::run::Stop;
 use crate::worker::{self, Lock};
 use crate::{Error, Result};
 use std::fs;
-use std::io::Write;
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// How a line of a remote's standard error starts when it is meant for the
 /// log rather than for an error report.
@@ -69,6 +84,21 @@ pub fn protocol() -> String {
     format!("{hash:016x}")
 }
 
+/// How long `remote-check` may take over there: torch imported cold, from a
+/// slow disk. Its own Python is given less ([`CHECK_PYTHON`]), so that the
+/// remote can still say what hung.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the Python of `remote-check` may take to name its device.
+const CHECK_PYTHON: Duration = Duration::from_secs(90);
+/// How long a small command there (`rm`) may take.
+pub const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a transfer may go without a byte moving before it is called
+/// stalled. ssh's own keepalives only notice a link that died.
+const STALL: Duration = Duration::from_secs(60);
+/// How long the worker over there is given to follow `QUIT`, or to notice
+/// it is alone, once this machine has stopped talking to it.
+const QUIT_GRACE: Duration = Duration::from_secs(10);
+
 /// The way to one machine: `ssh` with the options every call needs.
 #[derive(Debug, Clone)]
 pub struct Ssh {
@@ -76,6 +106,9 @@ pub struct Ssh {
     /// On Unix, the socket the first connection leaves open for the next
     /// ones (`ControlMaster`), so a transfer does not pay a handshake.
     control: Option<PathBuf>,
+    /// Raised, every command under way through this one is killed: the step
+    /// is over, or another device made the pass first.
+    stop: Stop,
 }
 
 impl Ssh {
@@ -88,7 +121,18 @@ impl Ssh {
         Self {
             host: host.to_string(),
             control,
+            stop: Stop::new(),
         }
+    }
+
+    /// The same, its commands killed when `stop` is raised.
+    pub fn stopped_by(mut self, stop: Stop) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    pub fn stop(&self) -> &Stop {
+        &self.stop
     }
 
     /// `ssh` running `line` in the remote's shell; the streams are the
@@ -120,40 +164,59 @@ impl Ssh {
         command
     }
 
-    /// Run `line` there and return what it printed.
-    pub fn run(&self, line: &str) -> Result<String> {
-        let output = self
+    /// Run `line` there, for at most `within`, and return what it printed.
+    pub fn run(&self, line: &str, within: Duration) -> Result<String> {
+        let mut child = self
             .command(line)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| self.failed("could not start", e.to_string()))?;
-        if !output.status.success() {
-            return Err(self.failed(
-                &output.status.to_string(),
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+        let out = read_all(child.stdout.take());
+        let err = read_all(child.stderr.take());
+        // Killed, its streams may stay open a while longer (held by ssh's
+        // master connection): what it said is not waited for.
+        let status = self
+            .watch(&mut child, Some(within), None)
+            .map_err(|cut| self.failed(cut, String::new()))?;
+        let (out, err) = (joined(out), joined(err));
+        if !status.success() {
+            return Err(self.failed(&status.to_string(), err.trim().to_string()));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(out)
     }
 
     /// Copy `from` to the path `to` on that machine.
     pub fn upload(&self, from: &Path, to: &str) -> Result<()> {
-        let file = fs::File::open(from).map_err(|e| Error::io(from, e))?;
-        let output = self
+        let mut file = fs::File::open(from).map_err(|e| Error::io(from, e))?;
+        let mut child = self
             .command(&format!("cat > {}", quote(to)))
-            .stdin(file)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .output()
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| self.failed("could not start", e.to_string()))?;
-        if !output.status.success() {
-            return Err(self.failed(
-                &output.status.to_string(),
-                format!(
-                    "sending {}: {}",
-                    from.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
+        let err = read_all(child.stderr.take());
+        let sent = Arc::new(AtomicU64::new(0));
+        let feed = child.stdin.take().map(|mut stdin| {
+            let sent = Arc::clone(&sent);
+            // The pipe closes when the copy ends, which is the end of the
+            // file for `cat` over there; a killed ssh ends the copy too.
+            std::thread::spawn(move || copy_counting(&mut file, &mut stdin, &sent))
+        });
+        let moved = || sent.load(Ordering::Relaxed);
+        let what = |detail: &str| format!("sending {}: {}", from.display(), detail.trim());
+        // Killed, nothing more is waited for (see `run`).
+        let status = self
+            .watch(&mut child, None, Some(&moved))
+            .map_err(|cut| self.failed(cut, what("")))?;
+        if let Some(feed) = feed {
+            let _ = feed.join();
+        }
+        let err = joined(err);
+        if !status.success() {
+            return Err(self.failed(&status.to_string(), what(&err)));
         }
         Ok(())
     }
@@ -162,24 +225,62 @@ impl Ssh {
     /// renamed: a file under its real name is always whole.
     pub fn download(&self, from: &str, to: &Path) -> Result<()> {
         let part = to.with_extension("wav.part");
-        let file = fs::File::create(&part).map_err(|e| Error::io(&part, e))?;
-        let output = self
+        let mut file = fs::File::create(&part).map_err(|e| Error::io(&part, e))?;
+        let mut child = self
             .command(&format!("cat {}", quote(from)))
             .stdin(Stdio::null())
-            .stdout(file)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| self.failed("could not start", e.to_string()))?;
-        if !output.status.success() {
+        let err = read_all(child.stderr.take());
+        let got = Arc::new(AtomicU64::new(0));
+        let drain = child.stdout.take().map(|mut stdout| {
+            let got = Arc::clone(&got);
+            std::thread::spawn(move || copy_counting(&mut stdout, &mut file, &got))
+        });
+        let moved = || got.load(Ordering::Relaxed);
+        let what = |detail: &str| format!("fetching {from}: {}", detail.trim());
+        let outcome = match self.watch(&mut child, None, Some(&moved)) {
+            // Killed, nothing more is waited for (see `run`).
+            Err(cut) => Err(self.failed(cut, what(""))),
+            Ok(status) => {
+                let copied = drain.map(|drain| drain.join());
+                let err = joined(err);
+                if !status.success() {
+                    Err(self.failed(&status.to_string(), what(&err)))
+                } else {
+                    match copied {
+                        Some(Ok(Err(e))) => Err(Error::io(&part, e)),
+                        _ => Ok(()),
+                    }
+                }
+            }
+        };
+        if let Err(e) = outcome {
             let _ = fs::remove_file(&part);
-            return Err(self.failed(
-                &output.status.to_string(),
-                format!(
-                    "fetching {from}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            ));
+            return Err(e);
         }
         fs::rename(&part, to).map_err(|e| Error::io(to, e))
+    }
+
+    /// [`crate::run::watch`] under this connection's stop: the error is the
+    /// reason it was killed.
+    fn watch(
+        &self,
+        child: &mut Child,
+        within: Option<Duration>,
+        moved: Option<&dyn Fn() -> u64>,
+    ) -> std::result::Result<ExitStatus, &'static str> {
+        match crate::run::watch(child, Some(&self.stop), within, moved.map(|m| (m, STALL))) {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(cut)) => Err(cut.describe()),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err("could not wait")
+            }
+        }
     }
 
     fn failed(&self, status: &str, detail: String) -> Error {
@@ -273,7 +374,7 @@ impl Probe {
 
 /// Ask `remote` what it is: `remote-check` over SSH.
 pub fn probe(remote: &crate::config::Remote, ssh: &Ssh) -> Result<Probe> {
-    let text = ssh.run(&format!("{} remote-check", remote.command))?;
+    let text = ssh.run(&format!("{} remote-check", remote.command), CHECK_TIMEOUT)?;
     Ok(Probe::parse(&text))
 }
 
@@ -291,30 +392,12 @@ pub fn check(config: &Config) -> Vec<String> {
             python.display()
         ));
     } else {
-        let probe = crate::run::command(&python)
-            .args([
-                "-c",
-                // The name alone can be a generic « AMD Radeon Graphics »
-                // (no amdgpu.ids where the ROCm wheel looks): the
-                // architecture says which card it is.
-                "import torch\n\
-                 if torch.cuda.is_available():\n\
-                 \x20   arch = getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '')\n\
-                 \x20   name = torch.cuda.get_device_name(0)\n\
-                 \x20   print(f'{name} ({arch.split(\":\")[0]})' if arch else name)\n\
-                 else:\n\
-                 \x20   print('cpu')",
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
-        match probe {
-            Ok(output) if output.status.success() => {
-                let device = String::from_utf8_lossy(&output.stdout);
-                lines.push(format!("DEVICE {}", device.trim()));
-            }
-            _ => lines.push(format!(
-                "MISSING torch does not load in {}: run `omnifrog setup` there",
+        // The worker names the device it would run on, and reads that very
+        // card's memory (`DEVICE`, `VRAM`): what a pass would find.
+        match device_lines(&python) {
+            Ok(said) => lines.extend(said),
+            Err(why) => lines.push(format!(
+                "MISSING the worker does not start in {} ({why}): run `omnifrog setup` there",
                 python.display()
             )),
         }
@@ -325,15 +408,44 @@ pub fn check(config: &Config) -> Vec<String> {
             config.msst_dir().display()
         ));
     }
-    if let Some((used, total)) = vram() {
-        lines.push(format!("VRAM {used:.2} {total:.2}"));
-    }
     lines
 }
 
-/// The remote's side of a pass: decline if the GPU is someone else's, else
+/// What `separer_msst.py --device` prints: its `DEVICE` and `VRAM` lines.
+fn device_lines(python: &Path) -> std::result::Result<Vec<String>, String> {
+    let script = worker::ensure().map_err(|e| e.to_string())?;
+    let mut child = crate::run::command(python)
+        .arg(&script)
+        .arg("--device")
+        .env("PYTHONUTF8", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| crate::run::start_error(&e))?;
+    let out = read_all(child.stdout.take());
+    let ended = crate::run::watch(&mut child, None, Some(CHECK_PYTHON), None);
+    let out = joined(out);
+    match ended {
+        Ok(Ok(status)) if status.success() => Ok(out
+            .lines()
+            .filter(|line| line.starts_with("DEVICE ") || line.starts_with("VRAM "))
+            .map(str::to_string)
+            .collect()),
+        Ok(Ok(status)) => Err(status.to_string()),
+        Ok(Err(_)) => Err(format!(
+            "torch named no device within {} s",
+            CHECK_PYTHON.as_secs()
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The remote's side of a pass: decline if another run has the GPU, else
 /// fetch the model, say where the files go and become the worker, on this
-/// process's own standard streams. Returns the worker's exit code.
+/// process's own standard streams. The worker itself declines when other
+/// programs hold its device (`idle=`, see [`worker::command`]). Returns the
+/// worker's exit code.
 pub fn serve(
     config: &Config,
     model: &Model,
@@ -345,10 +457,6 @@ pub fn serve(
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
     };
-    if let Some(why) = busy(idle_below_gib) {
-        say(&format!("BUSY {why}"));
-        return Ok(0);
-    }
     // A run on this machine, or another machine's pass, has the GPU.
     let lock = match Lock::take(&config.work_dir()) {
         Ok(lock) => lock,
@@ -372,103 +480,108 @@ pub fn serve(
         let path = dir.join(sub);
         fs::create_dir_all(&path).map_err(|e| Error::io(&path, e))?;
     }
-    let mut command = worker::command(config, model, &local, inference)?;
+    let mut command = worker::command(config, model, &local, inference, Some(idle_below_gib))?;
     say(&format!("DIR {}", dir.display()));
-    let status = command
-        .stdin(Stdio::inherit())
+    let mut child = command
+        .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
+        .spawn()
         .map_err(|e| Error::Command {
             program: config.python().display().to_string(),
             status: "could not start".into(),
             detail: e.to_string(),
         })?;
+    let status = forward_until_alone(&mut child);
     let _ = fs::remove_dir_all(&dir);
     drop(lock);
-    Ok(status.code().unwrap_or(1))
+    Ok(status.and_then(|status| status.code()).unwrap_or(1))
 }
 
-/// Why the GPU here is someone else's now; `None` = it is free, or there is
-/// no telling.
-pub fn busy(idle_below_gib: f64) -> Option<String> {
-    if idle_below_gib <= 0.0 {
-        return None;
+/// Pass this process's standard input on to the worker's, line by line,
+/// and wait for the worker. When the input ends — `QUIT` was sent and the
+/// other machine went, or the other machine stopped this pass, or the link
+/// died — the worker has [`QUIT_GRACE`] to end on its own before it is
+/// killed: a pass nobody waits for any more must not keep the GPU, or the
+/// lock that turns every next pass away.
+fn forward_until_alone(child: &mut Child) -> Option<ExitStatus> {
+    let alone = Stop::new();
+    if let Some(mut to) = child.stdin.take() {
+        let alone = alone.clone();
+        // Not joined: it may sit on a read of a terminal that never ends,
+        // and the process exits right after this.
+        std::thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match input.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if to.write_all(&line).is_err() || to.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(to);
+            alone.raise();
+        });
     }
-    let (used, total) = vram()?;
-    (used >= idle_below_gib).then(|| {
-        format!(
-            "another program holds {used:.1} of its GPU's {total:.0} GiB (it is taken below \
-             {idle_below_gib} GiB)"
-        )
+    let mut since: Option<std::time::Instant> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if alone.raised() {
+            let since = *since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= QUIT_GRACE {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    child.wait().ok()
+}
+
+/// A stream read to its end on a thread of its own: a pipe nobody reads
+/// fills up and blocks the program writing to it.
+fn read_all(stream: Option<impl Read + Send + 'static>) -> Option<JoinHandle<String>> {
+    stream.map(|mut stream| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
     })
 }
 
-/// Memory in use and in all on this machine's largest GPU, in GiB: the
-/// kernel's own counters for an AMD card, `nvidia-smi` for an NVIDIA one.
-pub fn vram() -> Option<(f64, f64)> {
-    amd_vram(Path::new("/sys/class/drm")).or_else(nvidia_vram)
+fn joined(reader: Option<JoinHandle<String>>) -> String {
+    reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default()
 }
 
-const GIB: f64 = (1u64 << 30) as f64;
-
-/// The largest card under `drm` (`/sys/class/drm`): an integrated GPU's
-/// few hundred MB are not where the separation runs.
-fn amd_vram(drm: &Path) -> Option<(f64, f64)> {
-    let mut best: Option<(f64, f64)> = None;
-    for entry in fs::read_dir(drm).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // card0, not card0-DP-1.
-        if !name.starts_with("card") || name.contains('-') {
-            continue;
-        }
-        let device = entry.path().join("device");
-        let read = |file: &str| -> Option<u64> {
-            fs::read_to_string(device.join(file))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
+/// `io::copy`, keeping `count` up to date as it goes.
+fn copy_counting(from: &mut impl Read, to: &mut impl Write, count: &AtomicU64) -> io::Result<u64> {
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut total = 0;
+    loop {
+        let n = match from.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         };
-        if let (Some(used), Some(total)) = (read("mem_info_vram_used"), read("mem_info_vram_total"))
-        {
-            let (used, total) = (used as f64 / GIB, total as f64 / GIB);
-            if total >= 2.0 && best.is_none_or(|(_, t)| total > t) {
-                best = Some((used, total));
-            }
-        }
+        to.write_all(&buffer[..n])?;
+        total += n as u64;
+        count.store(total, Ordering::Relaxed);
     }
-    best
-}
-
-fn nvidia_vram() -> Option<(f64, f64)> {
-    let output = crate::run::command("nvidia-smi")
-        .args([
-            "--query-gpu=memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_nvidia(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// `nvidia-smi`'s lines, in MiB: the card with the most memory.
-fn parse_nvidia(text: &str) -> Option<(f64, f64)> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split(',').map(|f| f.trim().parse::<f64>());
-            match (fields.next(), fields.next()) {
-                (Some(Ok(used)), Some(Ok(total))) => Some((used / 1024.0, total / 1024.0)),
-                _ => None,
-            }
-        })
-        .max_by(|a, b| a.1.total_cmp(&b.1))
+    to.flush()?;
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -520,27 +633,26 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_amd_card_is_the_one_counted() {
-        let root = std::env::temp_dir().join(format!("omnifrog-drm-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let card = |name: &str, used: u64, total: u64| {
-            let device = root.join(name).join("device");
-            fs::create_dir_all(&device).unwrap();
-            fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
-            fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
-        };
-        let gib = 1u64 << 30;
-        card("card0", 16 << 20, 512 << 20);
-        card("card1", 2 * gib, 24 * gib);
-        fs::create_dir_all(root.join("card1-DP-1")).unwrap();
-        assert_eq!(amd_vram(&root), Some((2.0, 24.0)));
-        fs::remove_dir_all(&root).unwrap();
-        assert_eq!(amd_vram(&root), None);
+    fn a_copy_counts_what_it_moved_as_it_goes() {
+        let data = vec![7u8; (1 << 20) * 3 + 5];
+        let count = AtomicU64::new(0);
+        let mut out = Vec::new();
+        let copied = copy_counting(&mut data.as_slice(), &mut out, &count).unwrap();
+        assert_eq!(copied, data.len() as u64);
+        assert_eq!(count.load(Ordering::Relaxed), data.len() as u64);
+        assert_eq!(out, data);
     }
 
     #[test]
-    fn nvidia_smi_is_read_in_mib() {
-        assert_eq!(parse_nvidia("1024, 8192\n512, 24576\n"), Some((0.5, 24.0)));
-        assert_eq!(parse_nvidia("[N/A], [N/A]\n"), None);
+    fn the_worker_reads_the_memory_of_the_card_it_computes_on() {
+        // Found by its device's PCI address, not as the largest card: an
+        // 8 GiB card in use beside an idle 24 GiB one is busy.
+        assert!(worker::SOURCE.contains("pci_bus_id"));
+        assert!(worker::SOURCE.contains("--device"));
+        assert!(worker::SOURCE.contains("\"idle=\""));
+        assert!(
+            worker::SOURCE.contains("BUSY another program holds"),
+            "the worker no longer says BUSY the way this side reads it"
+        );
     }
 }

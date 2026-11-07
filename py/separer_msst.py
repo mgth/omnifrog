@@ -20,7 +20,11 @@
             its memory grows with. The element is cut into equal blocks of at most S seconds (at least four windows) plus one window, the fade, the last one never longer.
             Outside the fades between blocks the output does not depend on it, to rounding (cf. BLOC_PYMSS_S).
    batch=B (optional) = replaces inference.batch_size of the published config: windows computed at once, memory ~ xB, and on a large card faster.
+   idle=G (optional, another machine's pass) = before anything is loaded, read how much of the device's memory other programs hold (cf. occupation) ;
+            G GiB or more -> "BUSY <why>" on stdout and exit 0, nothing loaded : whatever else runs on that machine comes first.
    After each request, "VRAM <GiB>" = the peak device memory torch reserved during it (nothing on a CPU).
+   python separer_msst.py --device = "DEVICE <name (arch)>" (or "DEVICE cpu") and "VRAM <used> <total>" in GiB, of the device a pass would run on: what
+            `omnifrog remote-check` reports.
 
 Charge le modèle UNE seule fois (inference.proc_folder de MSST traite tout un dossier en 1 chargement),
 sépare chaque wav, et écrit le MEME contrat 2 stems que separer.py :
@@ -40,7 +44,7 @@ Si le modèle ne sort qu'UN seul stem (cible unique), l'autre est dérivé par S
 sinon MSST/librosa resamplerait. Les stems sont relus + réétiquetés 48k par l'appelant. Sorties en float (WAV).
 Code de sortie 0 = OK, !=0 = erreur (message sur stderr).
 """
-import sys, os, glob, shutil, soundfile as sf, numpy as np
+import sys, os, glob, shutil, subprocess, soundfile as sf, numpy as np
 
 # Sous-chaines (minuscule) identifiant le stem VOIX dans le nom d'instrument MSST.
 VOIX = ("speech", "vocal", "voice", "voix")
@@ -377,6 +381,54 @@ def pic_vram():
    except Exception:
       pass
 
+# The memory in use on the device torch computes on (cuda:0, after HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES) as (used, total) in GiB, or None
+# without a GPU. Read from that card's own counters, found by its PCI address — the largest card is not always the one torch uses — and before
+# anything is put on it, so what is counted is what the other programs hold. Asking torch for the device's properties allocates nothing on it.
+def occupation():
+   import torch
+   if not torch.cuda.is_available():
+      return None
+   p = torch.cuda.get_device_properties(0)
+   domaine, bus, fente = (getattr(p, a, None) for a in ("pci_domain_id", "pci_bus_id", "pci_device_id"))
+   if None not in (domaine, bus, fente):
+      if torch.version.hip:                                                     # amdgpu: /sys/class/drm/card1/device -> …/0000:03:00.0
+         adresse = f"{domaine:04x}:{bus:02x}:{fente:02x}."
+         for carte in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+            if "-" in os.path.basename(carte):                                  # card1-DP-1 : a connector, not a card
+               continue
+            dev = os.path.join(carte, "device")
+            if os.path.basename(os.path.realpath(dev)).lower().startswith(adresse):
+               try:
+                  lit = lambda f: int(open(os.path.join(dev, f)).read())
+                  return lit("mem_info_vram_used") / 2**30, lit("mem_info_vram_total") / 2**30
+               except (OSError, ValueError):
+                  break
+      else:                                                                     # NVIDIA: nvidia-smi, that card alone
+         try:
+            r = subprocess.run(["nvidia-smi", f"--id={domaine:08x}:{bus:02x}:{fente:02x}.0", "--query-gpu=memory.used,memory.total",
+                                "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+               used, total = (float(v) for v in r.stdout.strip().split(",")[:2])
+               return used / 1024, total / 1024
+         except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+   free, total = torch.cuda.mem_get_info(0)                                     # Last resort: counts this process's own context too
+   return (total - free) / 2**30, total / 2**30
+
+# --device: what `omnifrog remote-check` prints about the device. The name alone can be a generic « AMD Radeon Graphics » (no amdgpu.ids where the
+# ROCm wheel looks): the architecture says which card it is.
+def appareil():
+   import torch
+   if not torch.cuda.is_available():
+      print("DEVICE cpu", flush=True); return 0
+   arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+   nom = torch.cuda.get_device_name(0)
+   print(f"DEVICE {nom} ({arch.split(':')[0]})" if arch else f"DEVICE {nom}", flush=True)
+   occ = occupation()
+   if occ:
+      print(f"VRAM {occ[0]:.2f} {occ[1]:.2f}", flush=True)
+   return 0
+
 # Mode serveur : une requête par ligne sur stdin (cf. docstring). Une erreur de lot est signalée ("ERR ...") sans tuer le worker : l'appelant décide.
 def serveur(separe_lot):
    import traceback
@@ -400,6 +452,8 @@ def serveur(separe_lot):
    return 0
 
 def main():
+   if sys.argv[1:] == ["--device"]:
+      return appareil()
    if len(sys.argv) < 9:
       sys.stderr.write("Usage : separer_msst.py <msst_dir> <config> <checkpoint> <model_type> <bigshifts> <use_tta> <module> [overlap=N] [pymss=P] [bloc=S] [batch=B] <dossier_sortie> <wav1> [wav2 ...]\n"
                        "        separer_msst.py <msst_dir> <config> <checkpoint> <model_type> <bigshifts> <use_tta> <module> [overlap=N] [pymss=P] [bloc=S] [batch=B] --serveur\n"); return 2
@@ -408,17 +462,23 @@ def main():
       module, dossier_sortie = sys.argv[7:9]; entrees = sys.argv[9:]
    else:                                                                        # forme historique SANS <module> (exe plus ancien que ce worker) : reste acceptée
       module, dossier_sortie = "-", sys.argv[7]; entrees = sys.argv[8:]
-   overlap, pct, bloc_s, batch = 0, None, 0, 0
-   while dossier_sortie.startswith(("overlap=", "pymss=", "bloc=", "batch=")):  # [overlap=N] [pymss=P] [bloc=S] [batch=B] optionnels entre <module> et la suite
+   overlap, pct, bloc_s, batch, idle = 0, None, 0, 0, 0.0
+   while dossier_sortie.startswith(("overlap=", "pymss=", "bloc=", "batch=", "idle=")):  # [overlap=N] [pymss=P] [bloc=S] [batch=B] [idle=G] optionnels entre <module> et la suite
       cle, val = dossier_sortie.split("=", 1)
       if cle == "overlap": overlap = int(val)
       elif cle == "pymss": pct     = int(val)
       elif cle == "bloc":  bloc_s  = int(val)
+      elif cle == "idle":  idle    = float(val)
       else:                batch   = int(val)
       dossier_sortie, entrees = entrees[0] if entrees else "", entrees[1:]
    persistant = dossier_sortie == "--serveur"
    if not persistant and not entrees:
       sys.stderr.write("separer_msst.py : aucun wav en entree\n"); return 2
+   if idle > 0:                                                                 # Another machine's pass: whatever else runs here comes first
+      occ = occupation()
+      if occ and occ[0] >= idle:
+         print(f"BUSY another program holds {occ[0]:.1f} of its GPU's {occ[1]:.0f} GiB (it is taken below {idle:g} GiB)", flush=True)
+         return 0
 
    moteur = charge_pymss(config, checkpoint, model_type, bigshifts, use_tta, overlap, pct, bloc_s, batch) if pct is not None else None
    if moteur is not None:
