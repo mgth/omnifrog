@@ -72,6 +72,7 @@ impl RunLog {
                 label,
             } => format!("── {number}/{total} {label}"),
             Event::Message { text } => text.clone(),
+            Event::Took { .. } => format!("   {}", event.took_line().unwrap_or_default()),
             Event::Fraction { .. } => return,
         };
         self.note(&text);
@@ -200,14 +201,26 @@ mod tests {
             total: 6,
             label: "extraction".into(),
         });
+        log.record(&Event::Took {
+            number: 1,
+            total: 6,
+            label: "extraction".into(),
+            seconds: 893.4,
+            earlier: false,
+        });
         log.note("failed: the disk is full");
         let text = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert!(lines[0].starts_with("run started ") && lines[0].ends_with(" UTC"));
         assert!(lines[1].ends_with("] probing the film"));
         assert!(lines[2].ends_with("] ── 1/6 extraction"));
-        assert!(lines[3].ends_with("] failed: the disk is full"));
-        assert_eq!(lines.len(), 4, "a fraction leaves no line");
+        assert!(
+            lines[3].ends_with("]    1/6 extraction took 14:53"),
+            "{}",
+            lines[3]
+        );
+        assert!(lines[4].ends_with("] failed: the disk is full"));
+        assert_eq!(lines.len(), 5, "a fraction leaves no line");
         assert_eq!(log.path(), Some(path.clone()));
 
         // A second run on the same job adds to it.

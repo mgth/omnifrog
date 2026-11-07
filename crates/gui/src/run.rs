@@ -1,11 +1,11 @@
 //! A task the window follows: its steps, where the current one is, what
 //! it said, and how it ended.
 
-use crate::child::Running;
+use crate::child::{Heard, Running};
 use crate::task::{Reply, Request};
 use egui::{Color32, RichText, Ui};
 use omnifrog_core::job::Step;
-use omnifrog_core::progress::{Event, Unit};
+use omnifrog_core::progress::{self, Event, Unit};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -42,6 +42,14 @@ struct Fraction {
     from: f64,
 }
 
+/// How long a step took, as the worker measured it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StepTime {
+    took: Duration,
+    /// Done by an earlier run of the job: the time is the one it recorded.
+    earlier: bool,
+}
+
 pub struct Run {
     pub kind: Kind,
     pub title: String,
@@ -54,6 +62,8 @@ pub struct Run {
     step: Option<usize>,
     first_step: Option<usize>,
     step_started: Instant,
+    /// What each step took, by index into [`Step::ALL`], once it is done.
+    took: Vec<Option<StepTime>>,
     /// The most of the current step any fraction has shown, so the overall
     /// bar never goes back when a step moves to its next sub-task.
     step_best: f64,
@@ -72,7 +82,10 @@ impl Run {
         let ctx = ctx.clone();
         match Running::start(request, move || ctx.request_repaint()) {
             Ok(worker) => run.worker = Some(worker),
-            Err(e) => run.finish(Ending::Failed(format!("could not start the worker: {e}"))),
+            Err(e) => run.finish(
+                Ending::Failed(format!("could not start the worker: {e}")),
+                Instant::now(),
+            ),
         }
         run
     }
@@ -88,6 +101,7 @@ impl Run {
             step: None,
             first_step: None,
             step_started: Instant::now(),
+            took: vec![None; Step::ALL.len()],
             step_best: 0.0,
             fraction: None,
             log: VecDeque::new(),
@@ -113,11 +127,11 @@ impl Run {
         };
         let replies = worker.poll();
         let mut ended = false;
-        for reply in replies {
+        for Heard { at, reply } in replies {
             match reply {
-                Reply::Progress { event } => self.event(event),
+                Reply::Progress { event } => self.heard(event, at),
                 Reply::Done { output } => {
-                    self.finish(Ending::Done(output));
+                    self.finish(Ending::Done(output), at);
                     ended = true;
                 }
                 Reply::Failed { error } => {
@@ -127,7 +141,7 @@ impl Run {
                         self.push_log(format!("error: {error}"));
                         Ending::Failed(error)
                     };
-                    self.finish(ending);
+                    self.finish(ending, at);
                     ended = true;
                 }
             }
@@ -138,8 +152,10 @@ impl Run {
         ended
     }
 
-    fn finish(&mut self, ending: Ending) {
-        self.ending = Some((ending, self.started.elapsed()));
+    /// The task ended `at`, which is when the worker said so: not when the
+    /// window read it.
+    fn finish(&mut self, ending: Ending, at: Instant) {
+        self.ending = Some((ending, at.saturating_duration_since(self.started)));
         self.worker = None;
         self.fraction = None;
     }
@@ -151,7 +167,14 @@ impl Run {
         self.log.push_back(line);
     }
 
+    #[cfg(test)]
     fn event(&mut self, event: Event) {
+        self.heard(event, Instant::now());
+    }
+
+    /// Take in `event`, which the worker said `at`.
+    fn heard(&mut self, event: Event, at: Instant) {
+        let took_line = event.took_line();
         match event {
             Event::Step {
                 number,
@@ -161,7 +184,7 @@ impl Run {
                 let index = (number as usize).saturating_sub(1).min(Step::ALL.len() - 1);
                 self.first_step.get_or_insert(index);
                 self.step = Some(index);
-                self.step_started = Instant::now();
+                self.step_started = at;
                 self.step_best = 0.0;
                 self.fraction = None;
                 self.push_log(format!("── {number}/{total} {label}"));
@@ -195,10 +218,27 @@ impl Run {
                             what,
                             value,
                             text,
-                            since: Instant::now(),
+                            since: at,
                             from: value.unwrap_or(0.0),
                         })
                     }
+                }
+            }
+            Event::Took {
+                number,
+                seconds,
+                earlier,
+                ..
+            } => {
+                if let Some(line) = took_line {
+                    self.push_log(line);
+                }
+                let index = (number as usize).saturating_sub(1);
+                if let Some(slot) = self.took.get_mut(index) {
+                    *slot = Some(StepTime {
+                        took: Duration::from_secs_f64(seconds.max(0.0)),
+                        earlier,
+                    });
                 }
             }
         }
@@ -327,7 +367,10 @@ impl Run {
                     (Some(now), _) if i == now => ("✖", Color32::from_rgb(230, 90, 80)),
                     _ => ("○", ui.visuals().weak_text_color()),
                 };
-                let text = format!("{mark} {}. {}", i + 1, step.label());
+                let mut text = format!("{mark} {}. {}", i + 1, step.label());
+                if let Some(took) = self.time_of(i) {
+                    text.push_str(&format!(" · {}", clock(took)));
+                }
                 let label = if Some(i) == self.step && self.active() {
                     RichText::new(text).color(color).strong()
                 } else {
@@ -340,13 +383,37 @@ impl Run {
                         clock(self.step_started.elapsed())
                     ));
                 } else if self.first_step.is_some_and(|first| i < first) {
-                    response.on_hover_text("done by an earlier run of this job");
+                    response.on_hover_text(match self.took[i] {
+                        Some(time) => {
+                            format!(
+                                "done by an earlier run of this job, in {}",
+                                clock(time.took)
+                            )
+                        }
+                        None => "done by an earlier run of this job".to_string(),
+                    });
                 }
                 if i + 1 < Step::ALL.len() {
                     ui.weak("›");
                 }
             }
         });
+    }
+}
+
+impl Run {
+    /// How long step `i` took: what the worker said once it was done, or,
+    /// for the step a run ended in, from its start to the end.
+    fn time_of(&self, i: usize) -> Option<Duration> {
+        if let Some(time) = self.took.get(i).copied().flatten() {
+            return Some(time.took);
+        }
+        match &self.ending {
+            Some((_, took)) if self.step == Some(i) => {
+                Some((self.started + *took).saturating_duration_since(self.step_started))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -362,12 +429,7 @@ fn time_left(f: &Fraction, now: f64) -> Option<Duration> {
 
 /// « 1:02:03 », « 4:05 ».
 pub fn clock(d: Duration) -> String {
-    let s = d.as_secs();
-    if s >= 3600 {
-        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
-    } else {
-        format!("{}:{:02}", s / 60, s % 60)
-    }
+    progress::clock(d.as_secs())
 }
 
 /// Show a file in the platform's file manager.
@@ -434,18 +496,58 @@ mod tests {
         assert!(run.fraction.is_none());
     }
 
+    fn took(number: u32, seconds: f64, earlier: bool) -> Event {
+        Event::Took {
+            number,
+            total: 6,
+            label: Step::ALL[number as usize - 1].label().into(),
+            seconds,
+            earlier,
+        }
+    }
+
+    /// A run's times are when its replies came in, not when the window read
+    /// them: a window that is not on screen reads a run's end hours late,
+    /// and the run still took what it took. Here it ended at 38:24, and
+    /// the window reads it now, before that.
+    #[test]
+    fn a_run_s_times_are_when_its_replies_came_in() {
+        let mut run = Run::new(Kind::Dub, "film");
+        let start = run.started;
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        run.heard(took(1, 893.4, true), at(0));
+        run.heard(step(4), at(2094));
+        run.heard(took(4, 38.7, false), at(2133));
+        run.heard(step(5), at(2133));
+        run.finish(Ending::Failed("refused".into()), at(2304));
+
+        assert_eq!(run.ending.as_ref().unwrap().1, Duration::from_secs(2304));
+        assert_eq!(clock(run.time_of(0).unwrap()), "14:53");
+        assert_eq!(run.time_of(1), None, "no time was ever said for it");
+        assert_eq!(clock(run.time_of(3).unwrap()), "0:38");
+        // The step it ended in: from its start to the end.
+        assert_eq!(run.time_of(4), Some(Duration::from_secs(171)));
+        assert_eq!(run.time_of(5), None);
+        assert!(
+            run.log.iter().any(|line| line == "4/6 master took 0:38"),
+            "{:?}",
+            run.log
+        );
+    }
+
     #[test]
     fn the_panel_draws_in_every_state() {
         let ctx = egui::Context::default();
         let mut runs = vec![Run::new(Kind::Dub, "film"), Run::new(Kind::Setup, "setup")];
+        runs[0].event(took(1, 893.4, true));
         runs[0].event(step(2));
         runs[0].event(Event::bytes("decoding", 3 << 20, None));
         runs[1].event(Event::bytes("gfu3", 10 << 20, Some(100 << 20)));
         let mut done = Run::new(Kind::Dub, "film");
-        done.finish(Ending::Done(Some("/x/film.mka".into())));
+        done.finish(Ending::Done(Some("/x/film.mka".into())), Instant::now());
         runs.push(done);
         let mut failed = Run::new(Kind::Fetch, "fetch");
-        failed.finish(Ending::Failed("no network".into()));
+        failed.finish(Ending::Failed("no network".into()), Instant::now());
         runs.push(failed);
         for run in &mut runs {
             let mut output = ctx.run_ui(Default::default(), |ui| run.ui(ui));

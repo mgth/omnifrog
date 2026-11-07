@@ -8,6 +8,30 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Instant;
+
+/// A reply, and when it came in.
+///
+/// What the window shows of a run's times is read off this, not off when
+/// it got round to reading the reply. A window that is not on screen is not
+/// drawn, and does not read its replies until it is again: a run that ended
+/// after 38 minutes while nobody was looking was shown as having taken all
+/// the hours until someone did.
+pub struct Heard {
+    pub at: Instant,
+    pub reply: Reply,
+}
+
+impl Heard {
+    /// `reply`, come in now: called by the threads that read the worker,
+    /// which read as it writes whatever the window is doing.
+    fn now(reply: Reply) -> Self {
+        Self {
+            at: Instant::now(),
+            reply,
+        }
+    }
+}
 
 /// A worker at work.
 pub struct Running {
@@ -16,7 +40,7 @@ pub struct Running {
     child: Option<Child>,
     /// Held open: the worker takes its closing for the window's death.
     stdin: ChildStdin,
-    replies: Receiver<Reply>,
+    replies: Receiver<Heard>,
     /// Set once the worker has said how the work ended: it is then exiting
     /// on its own, and is only waited on.
     ended: Arc<AtomicBool>,
@@ -93,7 +117,7 @@ impl Running {
     }
 
     /// Every reply that came in since the last call.
-    pub fn poll(&self) -> Vec<Reply> {
+    pub fn poll(&self) -> Vec<Heard> {
         self.replies.try_iter().collect()
     }
 
@@ -191,7 +215,7 @@ fn could_not_start(exe: Option<&Path>, e: std::io::Error) -> std::io::Error {
 /// reply is passed on, when the worker says how the work ended.
 fn read_replies(
     stdout: impl std::io::Read,
-    tx: Sender<Reply>,
+    tx: Sender<Heard>,
     wake: impl Fn(),
     ended: &AtomicBool,
 ) {
@@ -203,31 +227,31 @@ fn read_replies(
         if !matches!(reply, Reply::Progress { .. }) {
             ended.store(true, Ordering::Release);
         }
-        if tx.send(reply).is_err() {
+        if tx.send(Heard::now(reply)).is_err() {
             return;
         }
         wake();
     }
     if !ended.load(Ordering::Relaxed) {
-        let _ = tx.send(Reply::Failed {
+        let _ = tx.send(Heard::now(Reply::Failed {
             error: "the worker stopped without saying how the work ended".into(),
-        });
+        }));
         wake();
     }
 }
 
 /// What the worker prints outside its replies: a panic's message, a
 /// library's warning. Shown in the log as it is.
-fn read_stderr(stderr: impl std::io::Read, tx: Sender<Reply>, wake: impl Fn()) {
+fn read_stderr(stderr: impl std::io::Read, tx: Sender<Heard>, wake: impl Fn()) {
     for line in BufReader::new(stderr).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
         if tx
-            .send(Reply::Progress {
+            .send(Heard::now(Reply::Progress {
                 event: Event::message(line),
-            })
+            }))
             .is_err()
         {
             break;
@@ -380,7 +404,7 @@ mod tests {
             soon(|| running
                 .poll()
                 .iter()
-                .any(|reply| matches!(reply, Reply::Failed { .. }))),
+                .any(|heard| matches!(heard.reply, Reply::Failed { .. }))),
             "the worker's output did not end"
         );
         // Ended, or about to: the window lets it go the moment it reads
@@ -409,7 +433,7 @@ mod tests {
             soon(|| running
                 .poll()
                 .iter()
-                .any(|reply| matches!(reply, Reply::Done { .. }))),
+                .any(|heard| matches!(heard.reply, Reply::Done { .. }))),
             "the worker did not say it was done"
         );
         drop(running);

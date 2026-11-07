@@ -59,9 +59,11 @@ would rather not type it:
   — the voices panned onto the objects or on the bed — with its options; kept in the configuration,
   as `encoder` and `iamf_opts`), the voices' offset,
   the duplicates, where the track goes, start over. `omnifrog-gui FILM.mkv` opens with it.
-- **Progress.** The six steps (those an earlier run did are marked as such), the current step's
-  bar with an estimate of the time left, the whole run's bar weighted by what each step costs, the
-  elapsed time and the log. *Stop* ends the run with everything it started; the next run of the
+- **Progress.** The six steps, each with the time it took once it is done (those an earlier run
+  did are marked as such, with the time that run recorded), the current step's bar with an estimate
+  of the time left, the whole run's bar weighted by what each step costs, the elapsed time and the
+  log. The times are the worker's: a window that was not on screen when the run ended still shows
+  how long the run took, not how long it was left unwatched. *Stop* ends the run with everything it started; the next run of the
   same film picks up at the step it was in.
 
 The long work — the setup, the downloads, a run — is done by a second copy of the program
@@ -176,7 +178,8 @@ A run is a job: one directory per film under the working directory, `<film>.omni
   static object per voice), `voice_<id>.wav` (each voice at its level, its duplicates cancelled), the stream `vf.thd`
   (`vf.mka` for IAMF, `vf-bed.mka` with the voices on the bed), and the encoder's log with the exact command at its head;
 - `manifest.json`, and `omnifrog.log`: every line the runs reported, each timed from the run's
-  start, a resumed run added to the same file.
+  start, with a line for each step's time once it ends (`2/6 dialogue out of the original took
+  12:53`); a resumed run is added to the same file, and starts with what the steps before it took.
 
 Once the track is written its log is copied beside it, under the same name with `.log` (who made
 each pass, how long each step took, what the decoder read), and the job's directory is removed — it

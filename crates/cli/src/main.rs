@@ -296,10 +296,13 @@ impl Reporter {
                 total,
                 label,
             } => Event::message(format!("{number}/{total} {label}")),
+            Event::Took { .. } => {
+                Event::message(format!("  {}", event.took_line().unwrap_or_default()))
+            }
             other => other,
         };
         match event {
-            Event::Step { .. } => unreachable!("worded as a message above"),
+            Event::Step { .. } | Event::Took { .. } => unreachable!("worded as a message above"),
             Event::Message { text } => {
                 if self.tty && !state.0.is_empty() {
                     let _ = writeln!(err);
