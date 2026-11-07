@@ -379,6 +379,59 @@ pub fn probe(remote: &crate::config::Remote, ssh: &Ssh) -> Result<Probe> {
     Ok(Probe::parse(&text))
 }
 
+/// What can be said of a remote before a step: `omnifrog remotes`, and the
+/// window's setup tab.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    /// ssh got no answer: the machine is off, or the key is not loaded.
+    Unreachable(String),
+    /// It answered, and cannot take passes: why.
+    LeftOut(String),
+    /// It can take passes. `busy`: other programs hold its GPU now, so its
+    /// worker would wait for them.
+    Ready { probe: Probe, busy: bool },
+}
+
+impl Verdict {
+    /// Ask `remote`, over SSH: up to two minutes for one that hangs.
+    pub fn of(remote: &crate::config::Remote) -> Self {
+        Self::judge(remote, probe(remote, &Ssh::new(&remote.host)))
+    }
+
+    fn judge(remote: &crate::config::Remote, probed: Result<Probe>) -> Self {
+        match probed {
+            Err(why) => Verdict::Unreachable(why.to_string()),
+            Ok(probe) => match probe.unfit() {
+                Some(why) => Verdict::LeftOut(why),
+                None => {
+                    let busy = probe.vram.is_some_and(|(used, _)| {
+                        remote.idle_below_gib > 0.0 && used >= remote.idle_below_gib
+                    });
+                    Verdict::Ready { probe, busy }
+                }
+            },
+        }
+    }
+
+    /// One line, after the host.
+    pub fn describe(&self) -> String {
+        match self {
+            Verdict::Unreachable(why) => format!("unreachable: {why}"),
+            Verdict::LeftOut(why) => format!("left out: {why}"),
+            Verdict::Ready { probe, busy } => format!(
+                "ready: {} (omnifrog {}){}",
+                probe.describe(),
+                probe.version,
+                if *busy {
+                    " — busy now: its worker waits for the other programs there"
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+}
+
 /// The remote's side of [`probe`]: what `remote-check` prints.
 pub fn check(config: &Config) -> Vec<String> {
     let mut lines = vec![format!(
@@ -631,6 +684,39 @@ mod tests {
         assert_eq!(missing.unfit().unwrap(), "no MSST checkout");
         let nothing = Probe::parse("bash: omnifrog: command not found\n");
         assert!(nothing.unfit().unwrap().contains("no omnifrog answered"));
+    }
+
+    #[test]
+    fn a_verdict_says_why_a_remote_cannot_take_passes_or_how_busy_it_is() {
+        let remote = crate::config::Remote::new("user@gpu-box");
+        let ready = |vram: &str| {
+            Verdict::judge(
+                &remote,
+                Ok(Probe::parse(&format!(
+                    "OMNIFROG 0.1.0 {}\nDEVICE AMD Radeon RX 7900 XTX\n{vram}",
+                    protocol()
+                ))),
+            )
+        };
+        assert!(matches!(
+            ready("VRAM 0.03 23.98\n"),
+            Verdict::Ready { busy: false, .. }
+        ));
+        let busy = ready("VRAM 20.40 23.98\n");
+        assert!(matches!(busy, Verdict::Ready { busy: true, .. }));
+        assert!(busy.describe().contains("busy now"));
+        // Nothing read: not called busy.
+        assert!(matches!(ready(""), Verdict::Ready { busy: false, .. }));
+        let cpu = Verdict::judge(
+            &remote,
+            Ok(Probe::parse(&format!(
+                "OMNIFROG 0.1.0 {}\nDEVICE cpu\n",
+                protocol()
+            ))),
+        );
+        assert!(cpu.describe().starts_with("left out: torch sees no GPU"));
+        let off = Verdict::judge(&remote, Err(Error::msg("connection timed out")));
+        assert_eq!(off.describe(), "unreachable: connection timed out");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use omnifrog_core::config::{Config, Inference};
 use omnifrog_core::doctor::{self, Check, Status};
 use omnifrog_core::models::Catalogue;
 use omnifrog_core::probe::{self, Media};
+use omnifrog_core::remote::Verdict;
 use omnifrog_core::setup::{self, Device, Recommendation};
 use omnifrog_core::{pipeline, progress};
 use std::path::PathBuf;
@@ -22,6 +23,8 @@ pub enum Tab {
 pub enum Loaded {
     Device(Device, Recommendation),
     Checks(Vec<Check>),
+    /// Each remote of the configuration, by host, as it answered.
+    Remotes(Vec<(String, Verdict)>),
     Probe {
         path: PathBuf,
         result: Result<Media, String>,
@@ -51,6 +54,9 @@ pub struct App {
     pub device: Option<(Device, Recommendation)>,
     pub checks: Option<Vec<Check>>,
     pub checking: bool,
+    /// The other machines' GPUs, by host; `None` until they first answered.
+    pub remotes: Option<Vec<(String, Verdict)>>,
+    pub asking_remotes: bool,
     /// Why the last file chosen for a tool was refused.
     pub tool_refused: Option<String>,
 
@@ -93,6 +99,8 @@ impl App {
             device: None,
             checks: None,
             checking: false,
+            remotes: None,
+            asking_remotes: false,
             tool_refused: None,
             source: None,
             media: None,
@@ -107,6 +115,7 @@ impl App {
         };
         app.detect_device();
         app.recheck();
+        app.check_remotes();
         if let Some(film) = film {
             app.open(film);
         }
@@ -140,6 +149,46 @@ impl App {
         self.checking = true;
         let config = self.config.clone();
         self.background(move || Loaded::Checks(doctor::run(&config)));
+    }
+
+    /// Ask every remote of the configuration what it is, all at once: a
+    /// second each over SSH, ten for one that is off, two minutes at most
+    /// for one that hangs.
+    pub fn check_remotes(&mut self) {
+        if self.asking_remotes || self.config.remotes.is_empty() {
+            return;
+        }
+        self.asking_remotes = true;
+        let remotes = self.config.remotes.clone();
+        self.background(move || {
+            let verdicts = std::thread::scope(|scope| {
+                let asked: Vec<_> = remotes
+                    .iter()
+                    .map(|remote| scope.spawn(move || Verdict::of(remote)))
+                    .collect();
+                remotes
+                    .iter()
+                    .zip(asked)
+                    .map(|(remote, asked)| {
+                        let verdict = asked.join().unwrap_or_else(|_| {
+                            Verdict::Unreachable("the question could not be asked".into())
+                        });
+                        (remote.host.clone(), verdict)
+                    })
+                    .collect()
+            });
+            Loaded::Remotes(verdicts)
+        });
+    }
+
+    /// The remotes that answered they can take passes.
+    pub fn remotes_ready(&self) -> Vec<(&str, &Verdict)> {
+        self.remotes
+            .iter()
+            .flatten()
+            .filter(|(_, verdict)| matches!(verdict, Verdict::Ready { .. }))
+            .map(|(host, verdict)| (host.as_str(), verdict))
+            .collect()
     }
 
     /// Read the film's tracks, and which two a run would take.
@@ -268,6 +317,10 @@ impl App {
         while let Ok(loaded) = self.loaded_rx.try_recv() {
             match loaded {
                 Loaded::Device(device, advice) => self.device = Some((device, advice)),
+                Loaded::Remotes(remotes) => {
+                    self.remotes = Some(remotes);
+                    self.asking_remotes = false;
+                }
                 Loaded::Checks(checks) => {
                     // A first launch on a machine not set up opens where
                     // that is done, unless a film was asked for.
@@ -321,6 +374,20 @@ impl App {
             };
             ui.selectable_value(&mut self.tab, Tab::Setup, setup_label);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right to left: the other machines come after this one.
+                let ready = self.remotes_ready();
+                if !ready.is_empty() {
+                    let hover = ready
+                        .iter()
+                        .map(|(host, verdict)| format!("{host}: {}", verdict.describe()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let label = match ready.len() {
+                        1 => "+ 1 other machine".to_string(),
+                        n => format!("+ {n} other machines"),
+                    };
+                    ui.weak(label).on_hover_text(hover);
+                }
                 if let Some((device, _)) = &self.device {
                     ui.weak(device.describe());
                 } else {
