@@ -175,11 +175,13 @@ A run is a job: one directory per film under the working directory, `<film>.omni
 - `3.master/` — the re-voiced master set `vf.atmos` and its metadata (the original's, with one
   static object per voice), `voice_<id>.wav` (each voice at its level, its duplicates cancelled), the stream `vf.thd`
   (`vf.mka` for IAMF, `vf-bed.mka` with the voices on the bed), and the encoder's log with the exact command at its head;
-- `manifest.json`.
+- `manifest.json`, and `omnifrog.log`: every line the runs reported, each timed from the run's
+  start, a resumed run added to the same file.
 
-Once the track is written the job's directory is removed — it is tens of gigabytes a film — unless
-`keep_work: true`, which keeps it for another encoder or another container without separating
-again.
+Once the track is written its log is copied beside it, under the same name with `.log` (who made
+each pass, how long each step took, what the decoder read), and the job's directory is removed — it
+is tens of gigabytes a film — unless `keep_work: true`, which keeps it for another encoder or
+another container without separating again. A run that stops leaves its log in the job's directory.
 
 Running the same film again picks up where the last one stopped, and a parameter that changed sends
 it back to the earliest step that parameter decides — another model does not re-extract the film,
