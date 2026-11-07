@@ -6,6 +6,7 @@ use egui::{Color32, RichText, Ui};
 use omnifrog_core::config::{Config, Engine};
 use omnifrog_core::doctor::Status;
 use omnifrog_core::models::Role;
+use omnifrog_core::remote::Verdict;
 use omnifrog_core::setup::Gpu;
 use omnifrog_core::tools::{self, Tool};
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         ui.colored_label(RED, format!("Configuration: {error}"));
     }
     device(app, ui);
+    other_machines(app, ui);
     ui.add_space(10.0);
     automatic(app, ui);
     ui.add_space(12.0);
@@ -90,6 +92,80 @@ fn device(app: &mut App, ui: &mut Ui) {
     if app.config.inference.engine == Engine::Msst {
         ui.small(
             RichText::new("MSST: the least memory, about three times slower than pymss.").weak(),
+        );
+    }
+}
+
+/// The configuration's `remotes`: each one's GPU, or why it cannot take
+/// passes. Nothing when there are none.
+fn other_machines(app: &mut App, ui: &mut Ui) {
+    if app.config.remotes.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.heading("Other machines");
+        if app.asking_remotes {
+            ui.spinner();
+        } else if ui
+            .small_button("Check again")
+            .on_hover_text("ask each one over SSH what it is")
+            .clicked()
+        {
+            app.check_remotes();
+        }
+    });
+    let Some(remotes) = app.remotes.clone() else {
+        ui.label("Asking them over SSH…");
+        return;
+    };
+    // Rows rather than a grid, as for the checks: a wrapped column of a
+    // grid gets the width of its narrowest cell.
+    for (host, verdict) in &remotes {
+        let (mark, color, detail) = match verdict {
+            Verdict::Ready { probe, busy: false } => (
+                "✔",
+                GREEN,
+                format!("{} · omnifrog {}", probe.describe(), probe.version),
+            ),
+            Verdict::Ready { probe, busy: true } => (
+                "?",
+                AMBER,
+                format!(
+                    "{} · busy now: its worker waits for the other programs there",
+                    probe.describe()
+                ),
+            ),
+            Verdict::LeftOut(why) => ("✖", RED, format!("left out: {why}")),
+            Verdict::Unreachable(why) => ("✖", RED, format!("unreachable: {why}")),
+        };
+        ui.horizontal_top(|ui| {
+            let row = ui.spacing().interact_size.y;
+            ui.add_sized(
+                [16.0, row],
+                egui::Label::new(RichText::new(mark).color(color)),
+            );
+            ui.label(RichText::new(host).strong());
+            ui.add(egui::Label::new(detail).wrap());
+        });
+    }
+    ui.small(
+        RichText::new(
+            "They take passes beside this machine, each keeping its GPU until the step ends \
+             (`remotes` in the configuration file).",
+        )
+        .weak(),
+    );
+    if remotes
+        .iter()
+        .any(|(_, verdict)| matches!(verdict, Verdict::Unreachable(_)))
+    {
+        ui.small(
+            RichText::new(
+                "ssh has to get in with a key and no question: is the machine on? After a \
+                 restart, a key with a passphrase needs `ssh-add` first.",
+            )
+            .weak(),
         );
     }
 }

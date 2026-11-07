@@ -614,7 +614,7 @@ fn cmd_doctor() -> Result<()> {
 }
 
 fn cmd_remotes() -> Result<()> {
-    use omnifrog_core::remote::{self, Ssh};
+    use omnifrog_core::remote::Verdict;
     let config = Config::load()?;
     if config.remotes.is_empty() {
         println!(
@@ -624,28 +624,7 @@ fn cmd_remotes() -> Result<()> {
         return Ok(());
     }
     for entry in &config.remotes {
-        let ssh = Ssh::new(&entry.host);
-        let verdict = match remote::probe(entry, &ssh) {
-            Err(why) => format!("unreachable: {why}"),
-            Ok(probe) => match probe.unfit() {
-                Some(why) => format!("left out: {why}"),
-                None => {
-                    let busy = probe
-                        .vram
-                        .filter(|&(used, _)| {
-                            entry.idle_below_gib > 0.0 && used >= entry.idle_below_gib
-                        })
-                        .map(|_| " — busy now: its passes wait for the other programs there")
-                        .unwrap_or_default();
-                    format!(
-                        "ready: {} (omnifrog {}){busy}",
-                        probe.describe(),
-                        probe.version
-                    )
-                }
-            },
-        };
-        println!("{}: {verdict}", entry.host);
+        println!("{}: {}", entry.host, Verdict::of(entry).describe());
     }
     Ok(())
 }
