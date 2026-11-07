@@ -790,6 +790,13 @@ impl Shared {
             return false;
         }
         queue.claimed[run.pass] = Some(device);
+        // Back in line meanwhile — given back by a device whose claim
+        // failed, while this one was being stopped — it is made now.
+        let before = queue.todo.len();
+        queue.todo.retain(|&pass| pass != run.pass);
+        if queue.todo.len() < before {
+            queue.taken += 1;
+        }
         for (d, other) in queue.running.iter().enumerate() {
             if d != device && other.is_some_and(|other| other.pass == run.pass) {
                 self.stops[d].raise();
@@ -812,16 +819,10 @@ impl Shared {
         self.changed.notify_all();
     }
 
-    /// `device` is off its pass without having made it: another device
-    /// made it first, or it was stopped.
-    fn lost(&self, device: usize) {
-        let mut queue = self.queue();
-        queue.running[device] = None;
-        self.changed.notify_all();
-    }
-
-    /// `device` did not make its pass: unless another device is on it, it
-    /// goes first in line for another.
+    /// `device` is off its pass without having made it — busy, failed,
+    /// beaten to it, or stopped — and gives back its claim if it had one.
+    /// Unless another device made the pass or is still really on it (not
+    /// already told to stop), it goes first in line for another.
     fn give_back(&self, device: usize) {
         let mut queue = self.queue();
         let Some(run) = queue.running[device].take() else {
@@ -830,12 +831,13 @@ impl Shared {
         if queue.claimed[run.pass] == Some(device) {
             queue.claimed[run.pass] = None;
         }
+        // A device the claim just given back had stopped is no fallback:
+        // it will give the pass back in turn, and find it in line.
         let elsewhere = queue.claimed[run.pass].is_some()
-            || queue
-                .running
-                .iter()
-                .flatten()
-                .any(|other| other.pass == run.pass);
+            || queue.todo.contains(&run.pass)
+            || queue.running.iter().enumerate().any(|(d, other)| {
+                other.is_some_and(|other| other.pass == run.pass) && !self.stops[d].raised()
+            });
         if !elsewhere {
             queue.taken -= 1;
             queue.todo.push_front(run.pass);
@@ -1183,12 +1185,12 @@ fn run(
                         Ok(true) => shared.done(0),
                         Ok(false) => {
                             dropped(0, pass);
-                            shared.lost(0);
+                            shared.give_back(0);
                         }
                         // Stopped while it loaded the model.
                         Err(_) if stop.raised() && worker.is_none() => {
                             dropped(0, pass);
-                            shared.lost(0);
+                            shared.give_back(0);
                         }
                         Err(why) => {
                             shared.fail(0, why);
@@ -1303,11 +1305,11 @@ fn run(
                         }
                         Ok(Made::Lost) => {
                             dropped(device, pass);
-                            shared.lost(device);
+                            shared.give_back(device);
                         }
                         Err(_) if stop.raised() => {
                             dropped(device, pass);
-                            shared.lost(device);
+                            shared.give_back(device);
                         }
                         Ok(Made::Busy(why)) => {
                             shared.give_back(device);
@@ -1595,7 +1597,7 @@ mod tests {
         assert!(shared.claim(0));
         assert!(remote.raised());
         assert!(!shared.claim(1));
-        shared.lost(1);
+        shared.give_back(1);
         shared.done(0);
         // Every pass made: whatever still runs is stopped, nobody gets more.
         assert!(shared.stop(0).raised());
@@ -1612,7 +1614,7 @@ mod tests {
         assert!(shared.claim(1));
         assert!(shared.stop(0).raised());
         assert!(!shared.claim(0));
-        shared.lost(0);
+        shared.give_back(0);
         // The remote writes the outputs; a pass being written is not made
         // again, so this machine waits, and the step is over when it ends.
         std::thread::scope(|scope| {
@@ -1651,6 +1653,53 @@ mod tests {
         shared.give_back(1);
         assert_eq!(shared.take(0, true), next(0, 1));
         assert!(shared.claim(0));
+    }
+
+    #[test]
+    fn a_claim_given_back_after_it_stopped_the_other_copy_is_made_again() {
+        // The remote wins, then its stems make no outputs; this machine's
+        // copy was already told to stop. The pass must not be lost between
+        // the two.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(1));
+        assert!(shared.stop(0).raised());
+        shared.give_back(1);
+        // This machine's stopped copy gives it back in turn: once in line.
+        shared.give_back(0);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert_eq!(shared.take(1, false), None);
+        assert!(!shared.stop(0).raised());
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), None);
+        assert!(shared.into_failure().is_none());
+
+        // Or the stopped copy finishes before it is killed: its claim
+        // takes the pass out of line again.
+        let shared = Shared::new([0, 1].into(), 2, 2);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert_eq!(shared.take(1, false), next(1, 2));
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), again(1, 2, 1));
+        assert!(shared.claim(1));
+        shared.give_back(1);
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(1, false), None);
+        assert_eq!(shared.take(0, true), None);
+
+        // The same, this machine's copy giving it back first.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(1));
+        shared.give_back(0);
+        shared.give_back(1);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
     }
 
     #[test]
