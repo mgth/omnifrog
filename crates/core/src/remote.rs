@@ -110,19 +110,26 @@ pub struct Ssh {
     /// Raised, every command under way through this one is killed: the step
     /// is over, or another device made the pass first.
     stop: Stop,
+    /// The agent's socket, given to ssh when this process has no
+    /// `SSH_AUTH_SOCK` (see [`agent`]).
+    agent: Option<PathBuf>,
 }
 
 impl Ssh {
     pub fn new(host: &str) -> Self {
-        let control = cfg!(unix).then(|| {
-            dirs::runtime_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("omnifrog-ssh-%C")
-        });
+        let control = control_path([
+            dirs::runtime_dir(),
+            dirs::home_dir().map(|home| home.join(".ssh")),
+        ]);
+        let agent = match agent() {
+            Agent::Found(socket) => Some(socket),
+            Agent::Known | Agent::None => None,
+        };
         Self {
             host: host.to_string(),
             control,
             stop: Stop::new(),
+            agent,
         }
     }
 
@@ -160,6 +167,9 @@ impl Ssh {
                 .arg(format!("ControlPath={}", control.display()))
                 .arg("-o")
                 .arg("ControlPersist=120");
+        }
+        if let Some(agent) = &self.agent {
+            command.env("SSH_AUTH_SOCK", agent);
         }
         command.arg("--").arg(&self.host).arg(line);
         command
@@ -291,6 +301,91 @@ impl Ssh {
             detail,
         }
     }
+}
+
+/// The room a Unix socket's path has: 104 bytes on macOS, 108 on Linux.
+const SUN_PATH: usize = 104;
+
+/// Where the connection to a remote is kept open for the next commands, on
+/// Unix: the first of `dirs` that is there and short enough. `%C` becomes
+/// 40 characters, and ssh adds 17 more while it sets the socket up; a path
+/// past [`SUN_PATH`] fails every command (« ControlPath too long ») — the
+/// temporary directory of macOS is that long. None fits: no sharing, a
+/// handshake per command.
+fn control_path(dirs: [Option<PathBuf>; 2]) -> Option<PathBuf> {
+    if !cfg!(unix) {
+        return None;
+    }
+    dirs.into_iter()
+        .flatten()
+        .filter(|dir| dir.is_dir())
+        .map(|dir| dir.join("omnifrog-ssh-%C"))
+        .find(|path| path.as_os_str().len() - "%C".len() + 40 + 17 < SUN_PATH)
+}
+
+/// Where agents listen when nothing says so, under `$XDG_RUNTIME_DIR`:
+/// OpenSSH's systemd user unit (`ssh-agent.socket`), then GNOME's — gcr's,
+/// and the older gnome-keyring's.
+const AGENT_SOCKETS: [&str; 3] = ["ssh-agent.socket", "gcr/ssh", "keyring/ssh"];
+
+/// Where ssh will find the agent holding the keys, as this process sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Agent {
+    /// ssh knows: `SSH_AUTH_SOCK` is set, or, on Windows, the system's own
+    /// agent service is what ssh asks.
+    Known,
+    /// `SSH_AUTH_SOCK` is not set here, and this socket, where agents
+    /// usually listen, is there: it is given to ssh.
+    Found(PathBuf),
+    /// Neither: ssh can only use a key without a passphrase.
+    None,
+}
+
+/// Where the agent is. A program started from a desktop's menu has no
+/// `SSH_AUTH_SOCK` when only a shell's startup file exports it; ssh then
+/// cannot use a key with a passphrase, even one loaded in the agent, and
+/// every remote answers « Permission denied ».
+pub fn agent() -> Agent {
+    agent_among(std::env::var_os("SSH_AUTH_SOCK"), dirs::runtime_dir())
+}
+
+fn agent_among(set: Option<std::ffi::OsString>, runtime: Option<PathBuf>) -> Agent {
+    if set.is_some_and(|socket| !socket.is_empty()) || !cfg!(unix) {
+        return Agent::Known;
+    }
+    runtime
+        .and_then(|dir| {
+            AGENT_SOCKETS
+                .iter()
+                .map(|socket| dir.join(socket))
+                .find(|socket| answers(socket))
+        })
+        .map_or(Agent::None, Agent::Found)
+}
+
+/// Something listens at `socket` and takes a connection at once. An agent
+/// that died leaves its socket behind, and a connection to it is refused;
+/// one whose queue is full would make a plain connection wait for as long
+/// as it stays full. The connection is made without waiting, so neither
+/// holds anything up: the next socket is tried. A socket systemd holds for
+/// an agent not started yet starts it.
+#[cfg(unix)]
+fn answers(socket: &Path) -> bool {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let Ok(address) = SockAddr::unix(socket) else {
+        return false;
+    };
+    Socket::new(Domain::UNIX, Type::STREAM, None)
+        .and_then(|stream| {
+            stream.set_nonblocking(true)?;
+            stream.connect(&address)
+        })
+        .is_ok()
+}
+
+#[cfg(not(unix))]
+fn answers(_: &Path) -> bool {
+    false
 }
 
 /// What a remote said about itself.
@@ -717,6 +812,74 @@ mod tests {
         assert!(cpu.describe().starts_with("left out: torch sees no GPU"));
         let off = Verdict::judge(&remote, Err(Error::msg("connection timed out")));
         assert_eq!(off.describe(), "unreachable: connection timed out");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_connection_lives_where_its_path_fits_a_socket() {
+        let short = std::env::temp_dir().join(format!("of-{}", std::process::id()));
+        let long = short.join("a-directory-whose-name-makes-the-socket-path-too-long-for-ssh");
+        fs::create_dir_all(&long).unwrap();
+        let missing = short.join("missing");
+        assert_eq!(
+            control_path([Some(long.clone()), Some(short.clone())]),
+            Some(short.join("omnifrog-ssh-%C"))
+        );
+        assert_eq!(control_path([Some(missing), None]), None);
+        assert_eq!(control_path([Some(long), None]), None);
+        fs::remove_dir_all(&short).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_ssh_auth_sock_the_usual_agent_socket_is_found() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("omnifrog-agent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("gcr")).unwrap();
+        let among = |set: Option<&str>| agent_among(set.map(Into::into), Some(dir.clone()));
+        let first = dir.join("ssh-agent.socket");
+        let second = dir.join("gcr/ssh");
+        assert_eq!(among(None), Agent::None);
+        let _gcr = UnixListener::bind(&second).unwrap();
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // An agent that died left its socket: nobody answers there, the
+        // next one is taken.
+        drop(UnixListener::bind(&first).unwrap());
+        assert!(first.exists());
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // A file of that name is no agent either.
+        fs::remove_file(&first).unwrap();
+        fs::write(&first, b"").unwrap();
+        assert_eq!(among(None), Agent::Found(second.clone()));
+        // One whose queue is full is passed over at once, not waited on.
+        fs::remove_file(&first).unwrap();
+        {
+            use socket2::{Domain, SockAddr, Socket, Type};
+            let full = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            full.bind(&SockAddr::unix(&first).unwrap()).unwrap();
+            full.listen(1).unwrap();
+            let mut waiting = Vec::new();
+            while answers(&first) {
+                let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+                client.set_nonblocking(true).unwrap();
+                client.connect(&SockAddr::unix(&first).unwrap()).unwrap();
+                waiting.push(client);
+                assert!(waiting.len() < 64, "the queue never filled");
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(among(None), Agent::Found(second.clone()));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+        // OpenSSH's own unit first, when it answers.
+        fs::remove_file(&first).unwrap();
+        let _openssh = UnixListener::bind(&first).unwrap();
+        assert_eq!(among(None), Agent::Found(first.clone()));
+        // Whatever the environment says is what ssh uses.
+        assert_eq!(among(Some("/elsewhere/agent")), Agent::Known);
+        assert_eq!(among(Some("")), Agent::Found(first.clone()));
+        assert_eq!(agent_among(None, None), Agent::None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
