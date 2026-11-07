@@ -5,7 +5,8 @@
 //! lives in the job's directory while the run goes, so a run that stops
 //! halfway leaves it beside the steps it finished, and a resumed run adds
 //! to it; once the track is written, it is copied beside it under the same
-//! name (`….log`), and the job's copy goes with the temporaries.
+//! name (`….log`), after the temporaries are gone, and the job's copy
+//! goes last; a cleanup that fails leaves it, with why.
 //!
 //! Lines are kept in memory until the job's directory is known — the probe
 //! of the film comes first — then written as they come, so a crash loses

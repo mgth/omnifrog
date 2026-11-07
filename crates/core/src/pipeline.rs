@@ -13,7 +13,7 @@ use crate::probe::{AudioTrack, Media};
 use crate::progress::{Event, Progress};
 use crate::runlog::RunLog;
 use crate::{Error, Result, encode, extract, master, probe, remux, separate, tracks, voices, wav};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// What a run was asked for. Everything absent is the configuration's.
@@ -441,35 +441,59 @@ fn run_logged(
             encode::overlay_fits(extracted.elements.len())?;
         }
     }
-    // The log beside the track, named like it. The job's own goes with the
-    // temporaries, unless it could not be copied.
-    let mut log_beside = false;
-    if let Some(path) = log.path() {
-        let beside = outcome.output.with_extension("log");
-        progress(Event::message(format!(
-            "the run's log: {}",
-            beside.display()
-        )));
-        match std::fs::copy(&path, &beside) {
-            Ok(_) => log_beside = true,
-            Err(e) => progress(Event::message(format!(
-                "the log could not be copied there ({e}); it stays in {}",
-                path.display()
-            ))),
-        }
-    }
-    if !config.keep_work {
-        if log_beside {
-            let _ = std::fs::remove_file(job.log_path());
-        }
+    finish(
+        config.keep_work,
+        || job.clean(),
+        &job.dir,
+        &outcome.output,
+        log,
+        progress,
+    )?;
+    Ok(outcome)
+}
+
+/// The end of a run that wrote its track: the job's temporaries go, unless
+/// they are kept, and then the run's log is copied beside the track, under
+/// its name with `.log`. The job's own log goes last, once everything the
+/// run said is in the copy: until then it is the run's only record, and
+/// a cleanup that fails writes its failure there (see [`run`]).
+fn finish(
+    keep_work: bool,
+    clean: impl FnOnce() -> Result<()>,
+    job_dir: &Path,
+    output: &Path,
+    log: &RunLog,
+    progress: Progress,
+) -> Result<()> {
+    if !keep_work {
         // Tens of gigabytes a film, and nothing in them the track needs.
-        job.clean()?;
+        clean()?;
         progress(Event::message(format!(
             "removed the job's temporaries from {} (keep_work: true keeps them)",
-            job.dir.display()
+            job_dir.display()
         )));
     }
-    Ok(outcome)
+    let Some(path) = log.path() else {
+        return Ok(());
+    };
+    let beside = output.with_extension("log");
+    progress(Event::message(format!(
+        "the run's log: {}",
+        beside.display()
+    )));
+    match std::fs::copy(&path, &beside) {
+        Ok(_) if !keep_work => {
+            let _ = std::fs::remove_file(&path);
+            // All the job's directory held by now.
+            let _ = std::fs::remove_dir(job_dir);
+        }
+        Ok(_) => {}
+        Err(e) => progress(Event::message(format!(
+            "the log could not be copied there ({e}); it stays in {}",
+            path.display()
+        ))),
+    }
+    Ok(())
 }
 
 /// Make a separation's directory this run's before its first element.
@@ -631,4 +655,80 @@ pub fn choose<'a>(media: &'a Media, options: &Options) -> Result<(&'a AudioTrack
         )));
     }
     Ok((original, dub))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runlog::FILE_NAME;
+    use std::fs;
+
+    #[test]
+    fn the_log_is_copied_last_and_kept_when_the_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-finish-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let job = dir.join("job");
+        fs::create_dir_all(&job).unwrap();
+        fs::create_dir_all(dir.join("out")).unwrap();
+        let output = dir.join("out").join("film.Omnifrog.mka");
+        let beside = output.with_extension("log");
+        let log = RunLog::new();
+        log.open(&job.join(FILE_NAME));
+        log.note("separated");
+        let progress = |event: Event| log.record(&event);
+
+        // The cleanup fails: nothing is copied, and the job's log, still
+        // there, says why once `run` adds it.
+        let failed = finish(
+            false,
+            || Err(Error::msg("permission denied")),
+            &job,
+            &output,
+            &log,
+            &progress,
+        )
+        .unwrap_err();
+        log.note(&format!("failed: {failed}"));
+        let kept = fs::read_to_string(job.join(FILE_NAME)).unwrap();
+        assert!(kept.contains("failed: permission denied"), "{kept}");
+        assert!(!beside.exists());
+
+        // It succeeds: everything said is beside the track, the cleanup's
+        // line and the log's own included, and the job's directory is gone.
+        finish(false, || Ok(()), &job, &output, &log, &progress).unwrap();
+        let copied = fs::read_to_string(&beside).unwrap();
+        assert!(copied.contains("removed the job's temporaries"), "{copied}");
+        assert!(copied.contains("the run's log: "), "{copied}");
+        assert!(!job.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_job_keeps_its_log_and_gets_the_copy_too() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-keep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let job = dir.join("job");
+        fs::create_dir_all(&job).unwrap();
+        let output = dir.join("film.mka");
+        let log = RunLog::new();
+        log.open(&job.join(FILE_NAME));
+        let progress = |event: Event| log.record(&event);
+        let cleaned = std::cell::Cell::new(false);
+        finish(
+            true,
+            || {
+                cleaned.set(true);
+                Ok(())
+            },
+            &job,
+            &output,
+            &log,
+            &progress,
+        )
+        .unwrap();
+        assert!(!cleaned.get());
+        assert!(job.join(FILE_NAME).is_file());
+        assert!(output.with_extension("log").is_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
