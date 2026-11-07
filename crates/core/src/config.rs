@@ -133,9 +133,9 @@ pub struct Remote {
     /// The omnifrog there, as that machine's shell is given it: a path, or
     /// a command line with its environment in front.
     pub command: String,
-    /// Its GPU is taken only while the other programs there hold less than
-    /// this much of its memory, in GiB: whatever else runs on that machine
-    /// comes first. 0 = taken whatever is on it.
+    /// Its worker starts only while the other programs there hold less than
+    /// this much of its GPU's memory, in GiB, and then keeps the GPU for the
+    /// rest of the step. 0 = taken whatever is on it.
     pub idle_below_gib: f64,
 }
 

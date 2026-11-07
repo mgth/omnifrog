@@ -9,9 +9,10 @@
 //!   on, and how much of that device's memory is in use ([`probe`]). A
 //!   remote of another version, or without a GPU torch can use, is left
 //!   out.
-//! - `remote-worker '<model>' '<inference>' <idle below GiB>`, once a pass
-//!   ([`serve`]): the worker of [`crate::worker`], its protocol untouched,
-//!   with two words of its own before `PRET`:
+//! - `remote-worker '<model>' '<inference>' <idle below GiB>`, once a step
+//!   ([`serve`]): the worker of [`crate::worker`], its model loaded once
+//!   and fed one pass after another as this machine's is, its protocol
+//!   untouched, with two words of its own before `PRET`:
 //!
 //! ```text
 //! BUSY <why>     another program holds its GPU, or another run does: nothing was loaded
@@ -23,16 +24,16 @@
 //! two-hour film is about 1.5 GB out and 5 GB back, seconds on a 10 Gb/s
 //! link against minutes of inference.
 //!
-//! **Whatever else runs on that machine comes first.** Its GPU is taken
-//! only while the other programs there hold less than `idle_below_gib` of
-//! the memory of the device torch computes on — that card's own counters,
-//! read by the worker before it loads anything — and it is given back
-//! after every pass: the model is loaded again for the next one, so a
-//! program that wants it between two passes finds it free. Nothing there is
-//! ever unloaded or stopped. A remote that is busy is asked again a minute
-//! later; one that fails twice in a row is left out for the rest of the
-//! step. This machine's GPU does whatever the remotes do not, so a step
-//! never waits on one.
+//! **A GPU in use is left alone.** The worker starts only if the other
+//! programs there hold less than `idle_below_gib` of the memory of the
+//! device torch computes on — that card's own counters, read before it
+//! loads anything — and then keeps the card for the rest of the step,
+//! without loading the checkpoint again for every pass. A machine whose GPU
+//! serves other work is meant to be given to omnifrog alone while a step
+//! runs. Nothing there is ever unloaded or stopped. A
+//! remote that is busy is asked again a minute later; one that fails twice
+//! in a row is left out for the rest of the step. This machine's GPU does
+//! whatever the remotes do not, so a step never waits on one.
 //!
 //! **Nothing here waits on a remote without a limit.** `remote-check` has
 //! two minutes; a transfer is cut when no byte moved for one; every command

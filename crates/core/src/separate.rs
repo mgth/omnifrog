@@ -1208,10 +1208,10 @@ fn run(
                 drop(worker);
             };
 
-            // A remote: a worker for each pass, so its GPU is free between
-            // two of them for whatever else runs there (see `remote`). It
-            // never fails the step: what it does not make, this machine
-            // makes. Whatever it runs is killed when its stop is raised.
+            // A remote: one worker for the step too, its model loaded once
+            // (see `remote`). It never fails the step: what it does not
+            // make, this machine makes. Whatever it runs is killed when its
+            // stop is raised.
             let far = |device: usize, remote: &Remote| {
                 let who = &remote.host;
                 let ssh = Ssh::new(who).stopped_by(shared.stop(device));
@@ -1245,34 +1245,41 @@ fn run(
                 let mut failures = 0;
                 let mut said_busy = false;
                 let mut peak: Option<f64> = None;
+                let mut worker: Option<Box<Worker>> = None;
+                // The most a worker that is let go reserved on its device.
+                let mut keep_peak = |worker: &Worker| {
+                    if let Some(p) = worker.device_peak() {
+                        peak = Some(peak.map_or(p, |q: f64| q.max(p)));
+                    }
+                };
                 while let Some(took) = shared.take(device, false) {
                     let pass = took.pass;
                     let started = Instant::now();
                     let outcome = (|| -> Result<Made> {
-                        let mut worker = match Worker::start_remote(
-                            remote,
-                            &ssh,
-                            model,
-                            config.inference,
-                            progress,
-                        )? {
-                            Started::Busy(why) => return Ok(Made::Busy(why)),
-                            Started::Ready(worker) => worker,
+                        // Started at the first pass, and again only after
+                        // one that killed it.
+                        let running = match &mut worker {
+                            Some(worker) => worker,
+                            none => match Worker::start_remote(
+                                remote,
+                                &ssh,
+                                model,
+                                config.inference,
+                                progress,
+                            )? {
+                                Started::Busy(why) => return Ok(Made::Busy(why)),
+                                Started::Ready(worker) => none.insert(worker),
+                            },
                         };
                         announce(device, took);
                         let (input, out) = input_of(pass, device)?;
                         let separated =
-                            worker.separate(std::slice::from_ref(&input), &out, |f| {
+                            running.separate(std::slice::from_ref(&input), &out, |f| {
                                 fraction(device, f)
                             })?;
-                        for note in worker.take_notes() {
+                        for note in running.take_notes() {
                             progress(Event::message(format!("  {}{note}", prefix(device))));
                         }
-                        if let Some(p) = worker.device_peak() {
-                            peak = Some(peak.map_or(p, |q: f64| q.max(p)));
-                        }
-                        // Its GPU goes back before the outputs are written.
-                        drop(worker);
                         if !shared.claim(device) {
                             return Ok(Made::Lost);
                         }
@@ -1282,6 +1289,12 @@ fn run(
                         done_in(device, pass, started);
                         Ok(Made::Yes)
                     })();
+                    // A worker the pass killed — stopped under the request,
+                    // or dead — is started again for the next one; one that
+                    // lives on, after a transfer that failed, is kept.
+                    if let Some(dead) = worker.take_if(|worker| !worker.is_alive()) {
+                        keep_peak(&dead);
+                    }
                     match outcome {
                         Ok(Made::Yes) => {
                             shared.done(device);
@@ -1323,6 +1336,11 @@ fn run(
                         }
                     }
                 }
+                if let Some(worker) = &worker {
+                    keep_peak(worker);
+                }
+                // Its GPU goes back as the step ends.
+                drop(worker);
                 if let Some(peak) = peak {
                     progress(Event::message(format!(
                         "{}device memory: {peak:.1} GiB at most, as torch reserved it",

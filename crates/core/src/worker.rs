@@ -166,7 +166,7 @@ pub enum Started {
 /// The command that starts the worker on `model`, in its persistent mode,
 /// with `inference`'s settings; its streams are the caller's to set.
 ///
-/// With `idle_below_gib` (a remote's pass), the worker first reads how much
+/// With `idle_below_gib` (a remote's worker), the worker first reads how much
 /// of its device's memory other programs hold, and answers `BUSY <why>` and
 /// exits, having loaded nothing, when that is as much or more.
 pub fn command(

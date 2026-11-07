@@ -335,8 +335,7 @@ the stems moved from the default's.
 
 A separation step can share its passes with the GPUs of other machines on the network: each pass
 goes to whichever device is free, this machine's included, so a second card of similar speed
-takes about half of them (a little less: a remote loads the model again for each pass, and its
-files travel). A remote needs omnifrog there, of the same version, set up with
+takes about half of them (a little less: its files travel). A remote needs omnifrog there, of the same version, set up with
 `omnifrog setup` (its own venv, MSST and models directory; it fetches the models it is asked for),
 and an `ssh` key that lets this machine in without a question. Then, in this machine's
 configuration:
@@ -352,15 +351,15 @@ remotes:
 `omnifrog remotes` says, for each one, whether it answers, its version, its GPU and how much of
 its memory is in use.
 
-**Whatever else runs on a remote comes first.** A remote takes a pass only while the other
-programs there hold less than `idle_below_gib` of the memory of the GPU its torch computes on —
-the first one `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES` leaves it, read from that card's own
-counters (`0`: whatever is on it). It gives the device back after every pass: the model is loaded
-again for the next one, so a program that wants the card between two passes finds it free.
-Nothing there is ever stopped or unloaded. A busy remote is asked again every minute; one that
-fails twice in a row is left out for the rest of the step, and what it did not make is made here.
-A machine whose torch sees no GPU, or whose omnifrog is another version, is left out from the
-start, and the progress says why.
+**A remote loads the model once a step**, as this machine does, and keeps its GPU until the step
+ends: a machine whose card also serves other work is best given to omnifrog alone while it runs.
+Its worker starts only if the other programs there hold less than `idle_below_gib` of the memory
+of the GPU its torch computes on — the first one `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`
+leaves it, read from that card's own counters (`0`: whatever is on it). Nothing there is ever
+stopped or unloaded. A busy remote is asked again every minute; one that fails twice in a row is
+left out for the rest of the step, and what it did not make is made here. A machine whose torch
+sees no GPU, or whose omnifrog is another version, is left out from the start, and the progress
+says why.
 
 **A remote never holds the step up.** Once nothing is left in line, this machine makes again,
 itself, the pass a remote is still on; whichever finishes first keeps it, and the other is
