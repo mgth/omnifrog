@@ -142,6 +142,7 @@ omnifrog models add FILE.yaml         add or override catalogue entries
 omnifrog config                       the effective configuration and where it is
 omnifrog probe FILE                   the audio tracks, and which two a run would take
 omnifrog bench-vram ELEMENT.wav       device memory and time of the separation under several settings
+omnifrog remotes                      whether each machine of `remotes` can take separation passes
 omnifrog dub FILE [--vo N] [--vf N] [--mkv] [--encoder hz|dee|iamf|iamf-lit] [--seconds N]
                      [--gain-db X] [--hz-opts "…"] [--iamf-opts "…"] [--pairs LIST] [--no-cancel-duplicates]
                      [--out DIR] [--work DIR] [--restart] [--json]
@@ -229,6 +230,7 @@ remux, never a separation. See `crates/core/src/duplicates.rs`.
 
 The separation takes the GPU, and only one run may have it: a lock is taken in the working
 directory while a model is loaded, and a second run is told to wait rather than allowed to try.
+Other machines' GPUs can take passes beside it: see [Other machines](#other-machines).
 
 Progress goes to standard error, a line per percent; `--json` makes it one JSON object per line,
 which is what a front end reads.
@@ -264,6 +266,7 @@ iamf_opts: ""                    # `harlettizer iamf`'s options, either mode; em
 pairs: { original: false, dub: false, centre_twice: false }
 cancel_duplicates: true          # the dub's voices on the original's clock, the original's M&E taken out of them
 inference: { engine: pymss, overlap: 25, block_seconds: 300, batch_size: 0 }   # see below
+remotes: [user@gpu-box]          # other machines' GPUs, over SSH: see "Other machines"
 keep_work: false
 ```
 
@@ -327,6 +330,50 @@ omnifrog bench-vram <job>/1.extract/vo_12.wav [--models gfu3,kf2b] [--blocks 600
 
 separates 25 minutes of that element under each setting and prints the peak, the time and how far
 the stems moved from the default's.
+
+## Other machines
+
+A separation step can share its passes with the GPUs of other machines on the network: each pass
+goes to whichever device is free, this machine's included, so a second card of similar speed
+takes about half of them (a little less: its files travel). A remote needs omnifrog there, of the same version, set up with
+`omnifrog setup` (its own venv, MSST and models directory; it fetches the models it is asked for),
+and an `ssh` key that lets this machine in without a question. Then, in this machine's
+configuration:
+
+```yaml
+remotes:
+  - user@gpu-box                 # `omnifrog` on that machine's PATH
+  - host: other-box              # a Host of ~/.ssh/config works too
+    command: OMNIFROG_DATA=/srv/omnifrog /opt/omnifrog/omnifrog
+    idle_below_gib: 1.0          # the default
+```
+
+`omnifrog remotes` says, for each one, whether it answers, its version, its GPU and how much of
+its memory is in use.
+
+**A remote loads the model once a step**, as this machine does, and keeps its GPU until the step
+ends: a machine whose card also serves other work is best given to omnifrog alone while it runs.
+Its worker starts only if the other programs there hold less than `idle_below_gib` of the memory
+of the GPU its torch computes on — the first one `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`
+leaves it, read from that card's own counters (`0`: whatever is on it). Nothing there is ever
+stopped or unloaded. A busy remote is asked again every minute; one that fails twice in a row is
+left out for the rest of the step, and what it did not make is made here. A machine whose torch
+sees no GPU, or whose omnifrog is another version, is left out from the start, and the progress
+says why.
+
+**A remote never holds the step up.** Once nothing is left in line, this machine makes again,
+itself, the pass a remote is still on; whichever finishes first keeps it, and the other is
+stopped. A remote that does not answer what it is within two minutes is left out, a transfer that
+moves no byte for a minute fails, and when the step ends or fails everything still running over
+SSH is stopped. Over there, a worker whose connection went is stopped within ten seconds, so the
+card and the lock are free again.
+
+The inputs go there and the stems come back over SSH, through the connection the first command
+opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 GB back. Every
+setting of `inference` is this machine's, so a stem is the same wherever it was made; a remote's
+own configuration only says where its Python, MSST, models and work directory are. A remote also
+takes the lock of its own working directory, so its passes and a run on that machine never share
+its GPU.
 
 ## Requirements
 

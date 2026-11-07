@@ -119,6 +119,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ask each machine of `remotes` whether it can take separation passes: reachable, the same version, its GPU and how much of it is in use
+    Remotes,
+    /// Internal: what another machine's omnifrog asks of this one before it hands it passes
+    #[command(hide = true)]
+    RemoteCheck,
+    /// Internal: separate for another machine's omnifrog, the worker's protocol on standard input and output
+    #[command(hide = true)]
+    RemoteWorker {
+        /// The model, as JSON
+        model: String,
+        /// The inference settings, as JSON
+        inference: String,
+        /// Decline while other programs hold this much of the GPU's memory, in GiB; 0 = never
+        idle_below_gib: f64,
+    },
     /// Measure the separation's device memory under several settings, to choose inference.block_seconds and inference.batch_size for a smaller card
     BenchVram {
         /// A mono element, as a job's extraction writes them (1.extract/vo_<id>.wav)
@@ -369,6 +384,27 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Models { command } => cmd_models(command, &progress),
+        Command::Remotes => cmd_remotes(),
+        Command::RemoteCheck => {
+            let config = Config::load()?;
+            for line in omnifrog_core::remote::check(&config) {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Command::RemoteWorker {
+            model,
+            inference,
+            idle_below_gib,
+        } => {
+            let config = Config::load()?;
+            let model: models::Model =
+                serde_json::from_str(&model).context("the model the other machine sent")?;
+            let inference = serde_json::from_str(&inference)
+                .context("the inference settings the other machine sent")?;
+            let code = omnifrog_core::remote::serve(&config, &model, inference, idle_below_gib)?;
+            std::process::exit(code);
+        }
         Command::Config => cmd_config(),
         Command::Probe { file, vo, vf } => cmd_probe(file, vo, vf, &progress),
         Command::BenchVram {
@@ -573,6 +609,43 @@ fn cmd_doctor() -> Result<()> {
     }
     if missing > 0 {
         bail!("{missing} thing(s) missing");
+    }
+    Ok(())
+}
+
+fn cmd_remotes() -> Result<()> {
+    use omnifrog_core::remote::{self, Ssh};
+    let config = Config::load()?;
+    if config.remotes.is_empty() {
+        println!(
+            "no remotes: add `remotes: [user@host]` to {}",
+            Config::path().display()
+        );
+        return Ok(());
+    }
+    for entry in &config.remotes {
+        let ssh = Ssh::new(&entry.host);
+        let verdict = match remote::probe(entry, &ssh) {
+            Err(why) => format!("unreachable: {why}"),
+            Ok(probe) => match probe.unfit() {
+                Some(why) => format!("left out: {why}"),
+                None => {
+                    let busy = probe
+                        .vram
+                        .filter(|&(used, _)| {
+                            entry.idle_below_gib > 0.0 && used >= entry.idle_below_gib
+                        })
+                        .map(|_| " — busy now: its passes wait for the other programs there")
+                        .unwrap_or_default();
+                    format!(
+                        "ready: {} (omnifrog {}){busy}",
+                        probe.describe(),
+                        probe.version
+                    )
+                }
+            },
+        };
+        println!("{}: {verdict}", entry.host);
     }
     Ok(())
 }

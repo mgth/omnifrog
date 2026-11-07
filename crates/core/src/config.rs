@@ -80,6 +80,10 @@ pub struct Config {
     pub cancel_duplicates: bool,
     /// Keep the job directory after a successful run.
     pub keep_work: bool,
+    /// Other machines whose GPU separates beside this one's, over SSH; see
+    /// [`crate::remote`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<Remote>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
 }
@@ -103,7 +107,80 @@ impl Default for Config {
             iamf_bits: None,
             cancel_duplicates: true,
             keep_work: false,
+            remotes: Vec::new(),
             extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// Another machine that takes separation passes, over SSH: omnifrog
+/// installed and set up there, and a key that lets `ssh` in without asking.
+///
+/// In the file, a bare host is enough (`remotes: [user@gpu-box]`);
+/// the full form names the other two:
+///
+/// ```yaml
+/// remotes:
+///   - host: user@gpu-box
+///     command: OMNIFROG_DATA=/srv/omnifrog /opt/omnifrog/omnifrog
+///     idle_below_gib: 1.0
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "RemoteEntry")]
+pub struct Remote {
+    /// What `ssh` is given: `user@host`, or a `Host` of `~/.ssh/config`.
+    pub host: String,
+    /// The omnifrog there, as that machine's shell is given it: a path, or
+    /// a command line with its environment in front.
+    pub command: String,
+    /// Its worker starts only while the other programs there hold less than
+    /// this much of its GPU's memory, in GiB, and then keeps the GPU for the
+    /// rest of the step. 0 = taken whatever is on it.
+    pub idle_below_gib: f64,
+}
+
+impl Remote {
+    pub const DEFAULT_COMMAND: &str = "omnifrog";
+    pub const DEFAULT_IDLE_BELOW_GIB: f64 = 1.0;
+
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            command: Self::DEFAULT_COMMAND.to_string(),
+            idle_below_gib: Self::DEFAULT_IDLE_BELOW_GIB,
+        }
+    }
+}
+
+/// How a remote is written: a bare host, or the full form.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemoteEntry {
+    Host(String),
+    Full {
+        host: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        idle_below_gib: Option<f64>,
+    },
+}
+
+impl From<RemoteEntry> for Remote {
+    fn from(entry: RemoteEntry) -> Self {
+        match entry {
+            RemoteEntry::Host(host) => Remote::new(host),
+            RemoteEntry::Full {
+                host,
+                command,
+                idle_below_gib,
+            } => Remote {
+                command: command
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| Remote::DEFAULT_COMMAND.to_string()),
+                idle_below_gib: idle_below_gib.unwrap_or(Remote::DEFAULT_IDLE_BELOW_GIB),
+                host,
+            },
         }
     }
 }
@@ -727,6 +804,30 @@ mod tests {
         // The name it had before still reads.
         let old: Config = serde_yaml_ng::from_str("encoder: iamf-bed\n").unwrap();
         assert_eq!(old.encoder, Encoder::IamfBed);
+    }
+
+    #[test]
+    fn a_remote_is_a_bare_host_or_the_full_form() {
+        let config: Config = serde_yaml_ng::from_str(
+            "remotes:\n  - user@gpu-box\n  - host: gpu-box\n    command: OMNIFROG_DATA=/srv/o /srv/o/omnifrog\n    idle_below_gib: 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.remotes[0], Remote::new("user@gpu-box"));
+        assert_eq!(config.remotes[0].command, "omnifrog");
+        assert_eq!(config.remotes[0].idle_below_gib, 1.0);
+        assert_eq!(config.remotes[1].host, "gpu-box");
+        assert_eq!(
+            config.remotes[1].command,
+            "OMNIFROG_DATA=/srv/o /srv/o/omnifrog"
+        );
+        assert_eq!(config.remotes[1].idle_below_gib, 0.0);
+        // Written back in the full form, and read again the same.
+        let back = serde_yaml_ng::to_string(&config).unwrap();
+        let again: Config = serde_yaml_ng::from_str(&back).unwrap();
+        assert_eq!(again, config);
+        // None: nothing written.
+        let none = serde_yaml_ng::to_string(&Config::default()).unwrap();
+        assert!(!none.contains("remotes"), "{none}");
     }
 
     #[test]

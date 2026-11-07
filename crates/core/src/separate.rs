@@ -44,7 +44,7 @@
 //! `depth`). One an earlier version left at 24 bits is rounded where it is
 //! rather than separated again.
 
-use crate::config::{Config, Pairs};
+use crate::config::{Config, Pairs, Remote};
 use crate::depth;
 use crate::extract;
 use crate::job::Job;
@@ -52,13 +52,17 @@ use crate::loudness::{self, Voice};
 use crate::master::{Keyframe, MasterSet, Trajectories};
 use crate::models::{self, Model};
 use crate::progress::{Event, Progress};
+use crate::remote::{self, Ssh};
+use crate::run::Stop;
 use crate::wav;
-use crate::worker::Worker;
+use crate::worker::{Started, Stems, Worker};
 use crate::{Error, Result, voices};
+use std::collections::VecDeque;
 use std::f64::consts::TAU;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Everything the pipeline hands around is at this rate, whatever the
 /// model was fed.
@@ -610,7 +614,270 @@ pub fn mode_dub(pairs: Pairs) -> &'static str {
     }
 }
 
-/// Separate every unit that is not already done, one pass at a time.
+/// How long a busy remote waits before it is asked again.
+const BUSY_RETRY: Duration = Duration::from_secs(60);
+/// Failures in a row after which a remote is left out of the step.
+const REMOTE_FAILURES: u32 = 2;
+
+/// The passes still to make, shared by the devices that make them: this
+/// machine's (0) and the remotes'.
+///
+/// Once nothing is left in line, this machine does not wait for the
+/// remotes: it makes again, itself, the oldest pass one of them is on, so
+/// a remote that hangs or crawls costs the step nothing. Whichever of the
+/// two has its stems first *claims* the pass and writes its outputs; the
+/// other is stopped ([`Stop`]) and what it made is dropped.
+struct Shared {
+    queue: Mutex<Queue>,
+    changed: Condvar,
+    /// Per device: raised to stop whatever it is running — its pass was
+    /// made first elsewhere, or the step is over.
+    stops: Vec<Stop>,
+}
+
+struct Queue {
+    todo: VecDeque<usize>,
+    /// Per device: the pass it is on.
+    running: Vec<Option<Run>>,
+    /// Per pass of the plan: the device that has its stems and writes its
+    /// outputs.
+    claimed: Vec<Option<usize>>,
+    /// Per pass of the plan: its number in this run, once taken.
+    numbers: Vec<usize>,
+    /// Passes this run has to make.
+    total: usize,
+    /// Passes taken in this run, for « pair 3/12 ».
+    taken: usize,
+    /// Passes finished in this run.
+    finished: usize,
+    /// What stopped the step.
+    failed: Option<Error>,
+}
+
+/// A device on a pass.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    pass: usize,
+    /// How far into it the device is.
+    fraction: f64,
+    since: Instant,
+}
+
+/// A pass a device takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Took {
+    pass: usize,
+    /// Its number in this run.
+    number: usize,
+    /// The device this one makes the pass again beside; `None` for a pass
+    /// nobody is on.
+    beside: Option<usize>,
+}
+
+impl Shared {
+    /// `todo`, out of a plan of `passes`, for `devices` devices.
+    fn new(todo: VecDeque<usize>, passes: usize, devices: usize) -> Self {
+        Self {
+            queue: Mutex::new(Queue {
+                total: todo.len(),
+                todo,
+                running: vec![None; devices],
+                claimed: vec![None; passes],
+                numbers: vec![0; passes],
+                taken: 0,
+                finished: 0,
+                failed: None,
+            }),
+            changed: Condvar::new(),
+            stops: (0..devices).map(|_| Stop::new()).collect(),
+        }
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// What stops `device`'s programs.
+    fn stop(&self, device: usize) -> Stop {
+        self.stops[device].clone()
+    }
+
+    /// The next pass for `device`; `None` when the step is over or failed,
+    /// or, for a device that does not `wait`, when nothing is left in line.
+    /// One that waits makes again the oldest pass another device is on, and
+    /// waits only while every pass under way is being written.
+    fn take(&self, device: usize, waits: bool) -> Option<Took> {
+        let mut queue = self.queue();
+        loop {
+            if queue.failed.is_some() || queue.finished == queue.total {
+                return None;
+            }
+            if let Some(pass) = queue.todo.pop_front() {
+                queue.taken += 1;
+                queue.numbers[pass] = queue.taken;
+                return Some(self.start(&mut queue, device, pass, None));
+            }
+            if !waits {
+                return None;
+            }
+            let oldest = queue
+                .running
+                .iter()
+                .enumerate()
+                .filter_map(|(d, run)| run.map(|run| (d, run)))
+                .filter(|(d, run)| *d != device && queue.claimed[run.pass].is_none())
+                .min_by_key(|(_, run)| run.since);
+            if let Some((beside, run)) = oldest {
+                return Some(self.start(&mut queue, device, run.pass, Some(beside)));
+            }
+            if queue.running.iter().all(Option::is_none) {
+                return None;
+            }
+            queue = self
+                .changed
+                .wait(queue)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn start(&self, queue: &mut Queue, device: usize, pass: usize, beside: Option<usize>) -> Took {
+        queue.running[device] = Some(Run {
+            pass,
+            fraction: 0.0,
+            since: Instant::now(),
+        });
+        self.stops[device].lower();
+        Took {
+            pass,
+            number: queue.numbers[pass],
+            beside,
+        }
+    }
+
+    /// `device` is this far into its pass; returns the passes done in this
+    /// run, the ones under way counted by their fraction — a pass two
+    /// devices are on, once, as far as the further one.
+    fn at(&self, device: usize, fraction: f64) -> f64 {
+        let mut queue = self.queue();
+        if let Some(run) = &mut queue.running[device] {
+            run.fraction = fraction;
+        }
+        let runs: Vec<Run> = queue.running.iter().flatten().copied().collect();
+        let under_way: f64 = runs
+            .iter()
+            .enumerate()
+            .filter(|(i, run)| runs[..*i].iter().all(|other| other.pass != run.pass))
+            .map(|(_, run)| {
+                runs.iter()
+                    .filter(|other| other.pass == run.pass)
+                    .map(|other| other.fraction)
+                    .fold(0.0, f64::max)
+            })
+            .sum();
+        queue.finished as f64 + under_way
+    }
+
+    /// `device` has the stems of its pass. `true` if it is the first: it
+    /// writes the outputs, and the device making it beside it is stopped.
+    fn claim(&self, device: usize) -> bool {
+        let mut queue = self.queue();
+        let Some(run) = queue.running[device] else {
+            return false;
+        };
+        if queue.claimed[run.pass].is_some() {
+            return false;
+        }
+        queue.claimed[run.pass] = Some(device);
+        // Back in line meanwhile — given back by a device whose claim
+        // failed, while this one was being stopped — it is made now.
+        let before = queue.todo.len();
+        queue.todo.retain(|&pass| pass != run.pass);
+        if queue.todo.len() < before {
+            queue.taken += 1;
+        }
+        for (d, other) in queue.running.iter().enumerate() {
+            if d != device && other.is_some_and(|other| other.pass == run.pass) {
+                self.stops[d].raise();
+            }
+        }
+        self.changed.notify_all();
+        true
+    }
+
+    /// `device` wrote the outputs of the pass it claimed.
+    fn done(&self, device: usize) {
+        let mut queue = self.queue();
+        queue.running[device] = None;
+        queue.finished += 1;
+        if queue.finished == queue.total {
+            // Whatever is still under way — a remote being asked what it
+            // is, or waiting to be asked again — has nothing left to do.
+            self.stop_all();
+        }
+        self.changed.notify_all();
+    }
+
+    /// `device` is off its pass without having made it — busy, failed,
+    /// beaten to it, or stopped — and gives back its claim if it had one.
+    /// Unless another device made the pass or is still really on it (not
+    /// already told to stop), it goes first in line for another.
+    fn give_back(&self, device: usize) {
+        let mut queue = self.queue();
+        let Some(run) = queue.running[device].take() else {
+            return;
+        };
+        if queue.claimed[run.pass] == Some(device) {
+            queue.claimed[run.pass] = None;
+        }
+        // A device the claim just given back had stopped is no fallback:
+        // it will give the pass back in turn, and find it in line.
+        let elsewhere = queue.claimed[run.pass].is_some()
+            || queue.todo.contains(&run.pass)
+            || queue.running.iter().enumerate().any(|(d, other)| {
+                other.is_some_and(|other| other.pass == run.pass) && !self.stops[d].raised()
+            });
+        if !elsewhere {
+            queue.taken -= 1;
+            queue.todo.push_front(run.pass);
+        }
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, device: usize, why: Error) {
+        let mut queue = self.queue();
+        queue.running[device] = None;
+        queue.failed.get_or_insert(why);
+        self.stop_all();
+        self.changed.notify_all();
+    }
+
+    fn stop_all(&self) {
+        for stop in &self.stops {
+            stop.raise();
+        }
+    }
+
+    /// Up to `timeout`, or until there is nothing left to take.
+    fn pause(&self, timeout: Duration) {
+        let queue = self.queue();
+        let _ = self.changed.wait_timeout_while(queue, timeout, |queue| {
+            queue.failed.is_none() && !queue.todo.is_empty()
+        });
+    }
+
+    fn into_failure(self) -> Option<Error> {
+        self.queue
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failed
+    }
+}
+
+/// Separate every unit that is not already done: this machine's GPU one
+/// pass at a time, and each of the configuration's remotes beside it, the
+/// passes going to whichever is free (see [`crate::remote`]).
 ///
 /// Returns how many units were found already done. The worker is started at
 /// the first pass that actually needs separating and shut down on the way
@@ -716,30 +983,71 @@ fn run(
 
     let total = plan.passes.len();
     let behind = total - todo.len();
-    let mut worker: Option<Worker> = None;
     let result = (|| -> Result<()> {
         if !todo.is_empty() {
             // Fetched here rather than at the first request: the worker
             // loads the checkpoint as it starts, so it has to be on disk
             // before that.
             let local = models::fetch(model, config, progress)?;
-            for (index, &pass) in todo.iter().enumerate() {
-                let started = Instant::now();
-                let at = behind + index;
-                let step = plan.passes[pass];
+            let shared = Shared::new(
+                todo.iter().copied().collect(),
+                plan.passes.len(),
+                1 + config.remotes.len(),
+            );
+            // With remotes, every line says which machine it is about.
+            let named = !config.remotes.is_empty();
+            let prefix = |device: usize| -> String {
+                match device {
+                    _ if !named => String::new(),
+                    0 => "[local] ".to_string(),
+                    d => format!("[{}] ", config.remotes[d - 1].host),
+                }
+            };
+            let announce = |device: usize, took: Took| {
+                let step = plan.passes[took.pass];
+                let again = match took.beside {
+                    Some(beside) => format!(
+                        " again, beside {}: the first to finish keeps it",
+                        config.remotes[beside - 1].host
+                    ),
+                    None => String::new(),
+                };
                 progress(Event::message(format!(
-                    "{} {}/{total} ({})",
+                    "{}{} {}/{total} ({}){again}",
+                    prefix(device),
                     if step.right.is_some() { "pair" } else { kind },
-                    at + 1,
+                    behind + took.number,
+                    names[took.pass]
+                )));
+            };
+            let dropped = |device: usize, pass: usize| {
+                progress(Event::message(format!(
+                    "  {}{}: made first by another machine; this one's is dropped",
+                    prefix(device),
                     names[pass]
                 )));
-                empty(&prepared)?;
-                empty(&stems)?;
-
-                // The no-resample trick: the very same samples, under a
-                // header that says the rate the model was trained at — one
-                // element on its own, or two side by side.
-                let input = prepared.join(format!("{}.wav", names[pass]));
+            };
+            // One line for the whole step, moving through the passes: those
+            // behind it, those done in this run, and how far into theirs the
+            // devices are.
+            let fraction = |device: usize, fraction: f64| {
+                let done = shared.at(device, fraction);
+                progress(Event::ratio(
+                    stage.label(),
+                    (behind as f64 + done) / total as f64,
+                ));
+            };
+            // The no-resample trick: the very same samples, under a header
+            // that says the rate the model was trained at — one element on
+            // its own, or two side by side. Each device has its own
+            // directories.
+            let input_of = |pass: usize, device: usize| -> Result<(PathBuf, PathBuf)> {
+                let dir = prepared.join(device.to_string());
+                let out = stems.join(device.to_string());
+                empty(&dir)?;
+                empty(&out)?;
+                let step = plan.passes[pass];
+                let input = dir.join(format!("{}.wav", names[pass]));
                 match step.right {
                     None => wav::copy_rate(&units[step.left].source, &input, model.rate)?,
                     Some(right) => wav::pair(
@@ -749,52 +1057,16 @@ fn run(
                         model.rate,
                     )?,
                 };
-
-                // A worker that died under a request — a GPU reset takes the
-                // device's processes down, whoever hung it — is started
-                // again for that one pass, once. A request the worker
-                // refused, alive, is not retried: it would fail the same way.
-                let mut attempts = 0;
-                let separated = loop {
-                    attempts += 1;
-                    let running = match &mut worker {
-                        Some(worker) => worker,
-                        none => none.insert(Worker::start(config, model, &local, progress)?),
-                    };
-                    // One line for the whole step, moving through the
-                    // passes: `at` are behind it and `fraction` is how far
-                    // into this one.
-                    match running.separate(std::slice::from_ref(&input), &stems, |fraction| {
-                        progress(Event::ratio(
-                            stage.label(),
-                            (at as f64 + fraction) / total as f64,
-                        ));
-                    }) {
-                        Ok(separated) => {
-                            // An element pymss ran out of device memory on
-                            // went through MSST: the same stems, slower.
-                            for note in running.take_notes() {
-                                progress(Event::message(format!("  {note}")));
-                            }
-                            break separated;
-                        }
-                        Err(why) if attempts < 2 && !running.is_alive() => {
-                            progress(Event::message(format!(
-                                "the worker died ({why}); starting it again for {}",
-                                names[pass]
-                            )));
-                            worker = None;
-                            empty(&stems)?;
-                        }
-                        Err(why) => return Err(why),
-                    }
-                };
-                let stem = &separated[0];
+                Ok((input, out))
+            };
+            // What a pass's stems become: the outputs of the units it alone
+            // serves, or stems kept aside for the ones estimated twice.
+            let finish = |pass: usize, stem: &Stems| -> Result<()> {
+                let step = plan.passes[pass];
                 let from = |which: Stem| match which {
                     Stem::Voice => &stem.voice,
                     Stem::Rest => &stem.rest,
                 };
-
                 let mut keep = false;
                 for u in serves(pass) {
                     if plan.takes[u].len() > 1 {
@@ -828,11 +1100,269 @@ fn run(
                         }
                     }
                 }
+                Ok(())
+            };
+            let done_in = |device: usize, pass: usize, started: Instant| {
                 progress(Event::message(format!(
-                    "  {} done in {:.0} s",
+                    "  {}{} done in {:.0} s",
+                    prefix(device),
                     names[pass],
                     started.elapsed().as_secs_f64()
                 )));
+            };
+
+            // This machine: one worker for the whole step, as before there
+            // were remotes. With nothing left in line, it makes again the
+            // passes the remotes are on rather than wait for them (see
+            // `Shared`).
+            let here = || {
+                let stop = shared.stop(0);
+                let mut worker: Option<Worker> = None;
+                while let Some(took) = shared.take(0, true) {
+                    let pass = took.pass;
+                    let started = Instant::now();
+                    announce(0, took);
+                    // `Ok(false)`: another device made the pass first.
+                    let outcome = (|| -> Result<bool> {
+                        let (input, out) = input_of(pass, 0)?;
+                        // A worker that died under a request — a GPU reset
+                        // takes the device's processes down, whoever hung
+                        // it — is started again for that one pass, once. A
+                        // request the worker refused, alive, is not retried:
+                        // it would fail the same way.
+                        let mut attempts = 0;
+                        let separated = loop {
+                            attempts += 1;
+                            let running = match &mut worker {
+                                Some(worker) => worker,
+                                none => none.insert(Worker::start_under(
+                                    config,
+                                    model,
+                                    &local,
+                                    progress,
+                                    Some(stop.clone()),
+                                )?),
+                            };
+                            match running
+                                .separate(std::slice::from_ref(&input), &out, |f| fraction(0, f))
+                            {
+                                Ok(separated) => {
+                                    // An element pymss ran out of device
+                                    // memory on went through MSST: the same
+                                    // stems, slower.
+                                    for note in running.take_notes() {
+                                        progress(Event::message(format!("  {note}")));
+                                    }
+                                    break separated;
+                                }
+                                // Stopped: killed under the request, or
+                                // told before it began and still loaded.
+                                Err(_) if stop.raised() => {
+                                    if !running.is_alive() {
+                                        worker = None;
+                                    }
+                                    return Ok(false);
+                                }
+                                Err(why) if attempts < 2 && !running.is_alive() => {
+                                    progress(Event::message(format!(
+                                        "the worker died ({why}); starting it again for {}",
+                                        names[pass]
+                                    )));
+                                    worker = None;
+                                    empty(&out)?;
+                                }
+                                Err(why) => return Err(why),
+                            }
+                        };
+                        if !shared.claim(0) {
+                            return Ok(false);
+                        }
+                        finish(pass, &separated[0])?;
+                        done_in(0, pass, started);
+                        Ok(true)
+                    })();
+                    match outcome {
+                        Ok(true) => shared.done(0),
+                        Ok(false) => {
+                            dropped(0, pass);
+                            shared.give_back(0);
+                        }
+                        // Stopped while it loaded the model.
+                        Err(_) if stop.raised() && worker.is_none() => {
+                            dropped(0, pass);
+                            shared.give_back(0);
+                        }
+                        Err(why) => {
+                            shared.fail(0, why);
+                            break;
+                        }
+                    }
+                }
+                // What a smaller card has to hold: `inference.block_seconds`
+                // and `inference.batch_size` bring it down.
+                if let Some(peak) = worker.as_ref().and_then(Worker::device_peak) {
+                    progress(Event::message(format!(
+                        "{}device memory: {peak:.1} GiB at most, as torch reserved it",
+                        prefix(0)
+                    )));
+                }
+                // The device goes back before anything else happens.
+                drop(worker);
+            };
+
+            // A remote: one worker for the step too, its model loaded once
+            // (see `remote`). It never fails the step: what it does not
+            // make, this machine makes. Whatever it runs is killed when its
+            // stop is raised.
+            let far = |device: usize, remote: &Remote| {
+                let who = &remote.host;
+                let ssh = Ssh::new(who).stopped_by(shared.stop(device));
+                let stop = ssh.stop().clone();
+                match remote::probe(remote, &ssh) {
+                    // The step was over before the remote answered.
+                    Err(_) if stop.raised() => return,
+                    Err(why) => {
+                        progress(Event::message(format!("{who}: left out: {why}")));
+                        return;
+                    }
+                    Ok(probe) => match probe.unfit() {
+                        Some(why) => {
+                            progress(Event::message(format!("{who}: left out: {why}")));
+                            return;
+                        }
+                        None => progress(Event::message(format!(
+                            "{who}: {}, separating beside this machine",
+                            probe.describe()
+                        ))),
+                    },
+                }
+                /// How a pass went over there.
+                enum Made {
+                    Yes,
+                    /// Another device made it first.
+                    Lost,
+                    /// The remote's GPU is someone else's: why.
+                    Busy(String),
+                }
+                let mut failures = 0;
+                let mut said_busy = false;
+                let mut peak: Option<f64> = None;
+                let mut worker: Option<Box<Worker>> = None;
+                // The most a worker that is let go reserved on its device.
+                let mut keep_peak = |worker: &Worker| {
+                    if let Some(p) = worker.device_peak() {
+                        peak = Some(peak.map_or(p, |q: f64| q.max(p)));
+                    }
+                };
+                while let Some(took) = shared.take(device, false) {
+                    let pass = took.pass;
+                    let started = Instant::now();
+                    let outcome = (|| -> Result<Made> {
+                        // Started at the first pass, and again only after
+                        // one that killed it.
+                        let running = match &mut worker {
+                            Some(worker) => worker,
+                            none => match Worker::start_remote(
+                                remote,
+                                &ssh,
+                                model,
+                                config.inference,
+                                progress,
+                            )? {
+                                Started::Busy(why) => return Ok(Made::Busy(why)),
+                                Started::Ready(worker) => none.insert(worker),
+                            },
+                        };
+                        announce(device, took);
+                        let (input, out) = input_of(pass, device)?;
+                        let separated =
+                            running.separate(std::slice::from_ref(&input), &out, |f| {
+                                fraction(device, f)
+                            })?;
+                        for note in running.take_notes() {
+                            progress(Event::message(format!("  {}{note}", prefix(device))));
+                        }
+                        if !shared.claim(device) {
+                            return Ok(Made::Lost);
+                        }
+                        // Stems that do not make outputs are given back
+                        // with the claim, and the pass is made here.
+                        finish(pass, &separated[0])?;
+                        done_in(device, pass, started);
+                        Ok(Made::Yes)
+                    })();
+                    // A worker the pass killed — stopped under the request,
+                    // or dead — is started again for the next one; one that
+                    // lives on, after a transfer that failed, is kept.
+                    if let Some(dead) = worker.take_if(|worker| !worker.is_alive()) {
+                        keep_peak(&dead);
+                    }
+                    match outcome {
+                        Ok(Made::Yes) => {
+                            shared.done(device);
+                            failures = 0;
+                            said_busy = false;
+                        }
+                        Ok(Made::Lost) => {
+                            dropped(device, pass);
+                            shared.give_back(device);
+                        }
+                        Err(_) if stop.raised() => {
+                            dropped(device, pass);
+                            shared.give_back(device);
+                        }
+                        Ok(Made::Busy(why)) => {
+                            shared.give_back(device);
+                            if !said_busy {
+                                progress(Event::message(format!(
+                                    "{who}: {why}; asked again every {} s",
+                                    BUSY_RETRY.as_secs()
+                                )));
+                                said_busy = true;
+                            }
+                            shared.pause(BUSY_RETRY);
+                        }
+                        Err(why) => {
+                            shared.give_back(device);
+                            failures += 1;
+                            progress(Event::message(format!(
+                                "{who}: {} failed, made here instead: {why}",
+                                names[pass]
+                            )));
+                            if failures >= REMOTE_FAILURES {
+                                progress(Event::message(format!(
+                                    "{who}: left out for the rest of this step"
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some(worker) = &worker {
+                    keep_peak(worker);
+                }
+                // Its GPU goes back as the step ends.
+                drop(worker);
+                if let Some(peak) = peak {
+                    progress(Event::message(format!(
+                        "{}device memory: {peak:.1} GiB at most, as torch reserved it",
+                        prefix(device)
+                    )));
+                }
+            };
+
+            std::thread::scope(|scope| {
+                for (index, remote) in config.remotes.iter().enumerate() {
+                    let far = &far;
+                    scope.spawn(move || far(index + 1, remote));
+                }
+                here();
+                // Whatever a remote still runs — asked what it is, or a pass
+                // this machine made first — has no step left to serve.
+                shared.stop_all();
+            });
+            if let Some(why) = shared.into_failure() {
+                return Err(why);
             }
         }
         for &u in &averaged {
@@ -862,17 +1392,9 @@ fn run(
         Ok(())
     })();
 
-    // What a smaller card has to hold: `inference.block_seconds` and
-    // `inference.batch_size` bring it down.
-    if let Some(peak) = worker.as_ref().and_then(Worker::device_peak) {
-        progress(Event::message(format!(
-            "device memory: {peak:.1} GiB at most, as torch reserved it"
-        )));
-    }
-    // The device goes back before anything else happens, whether the step
+    // The devices went back as their passes ended, whether the step
     // finished or fell over. The tidying cannot be allowed to hide why:
     // whatever the step said is what comes out.
-    drop(worker);
     let _ = discard(&prepared);
     let _ = discard(&stems);
     let _ = clear_parts(&into);
@@ -1034,6 +1556,181 @@ fn clear_parts(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::job::ModelRef;
+
+    fn next(pass: usize, number: usize) -> Option<Took> {
+        Some(Took {
+            pass,
+            number,
+            beside: None,
+        })
+    }
+
+    fn again(pass: usize, number: usize, beside: usize) -> Option<Took> {
+        Some(Took {
+            pass,
+            number,
+            beside: Some(beside),
+        })
+    }
+
+    #[test]
+    fn with_nothing_left_in_line_this_machine_makes_a_remote_pass_again() {
+        let shared = Shared::new([0, 1, 2].into(), 3, 2);
+        // The remote takes the first, this machine the other two.
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), next(1, 2));
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), next(2, 3));
+        assert_eq!(shared.at(0, 0.5), 1.5);
+        assert!(shared.claim(0));
+        shared.done(0);
+        // Nothing left in line and the remote still on its pass: this
+        // machine does not wait for it, it makes it again.
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        // A pass two devices are on counts once, as far as the further.
+        shared.at(1, 0.8);
+        assert_eq!(shared.at(0, 0.3), 2.8);
+        // This machine is first: the remote is stopped, its stems dropped.
+        let remote = shared.stop(1);
+        assert!(!remote.raised());
+        assert!(shared.claim(0));
+        assert!(remote.raised());
+        assert!(!shared.claim(1));
+        shared.give_back(1);
+        shared.done(0);
+        // Every pass made: whatever still runs is stopped, nobody gets more.
+        assert!(shared.stop(0).raised());
+        assert_eq!(shared.take(1, false), None);
+        assert_eq!(shared.take(0, true), None);
+        assert!(shared.into_failure().is_none());
+    }
+
+    #[test]
+    fn a_remote_first_stops_this_machine_which_then_waits_for_the_end() {
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(1));
+        assert!(shared.stop(0).raised());
+        assert!(!shared.claim(0));
+        shared.give_back(0);
+        // The remote writes the outputs; a pass being written is not made
+        // again, so this machine waits, and the step is over when it ends.
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| shared.take(0, true));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiting.is_finished());
+            shared.done(1);
+            assert_eq!(waiting.join().unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn a_pass_a_remote_gives_back_is_made_here() {
+        // Busy, or failed: first in line again.
+        let shared = Shared::new([0, 1].into(), 2, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        shared.give_back(1);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert_eq!(shared.take(1, false), next(1, 2));
+
+        // Given back while this machine makes it again: it stays there.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        shared.give_back(1);
+        assert_eq!(shared.take(1, false), None);
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), None);
+
+        // Claimed, then its stems made no outputs: given back with the
+        // claim, and made here.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert!(shared.claim(1));
+        shared.give_back(1);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert!(shared.claim(0));
+    }
+
+    #[test]
+    fn a_claim_given_back_after_it_stopped_the_other_copy_is_made_again() {
+        // The remote wins, then its stems make no outputs; this machine's
+        // copy was already told to stop. The pass must not be lost between
+        // the two.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(1));
+        assert!(shared.stop(0).raised());
+        shared.give_back(1);
+        // This machine's stopped copy gives it back in turn: once in line.
+        shared.give_back(0);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert_eq!(shared.take(1, false), None);
+        assert!(!shared.stop(0).raised());
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), None);
+        assert!(shared.into_failure().is_none());
+
+        // Or the stopped copy finishes before it is killed: its claim
+        // takes the pass out of line again.
+        let shared = Shared::new([0, 1].into(), 2, 2);
+        assert_eq!(shared.take(0, true), next(0, 1));
+        assert_eq!(shared.take(1, false), next(1, 2));
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), again(1, 2, 1));
+        assert!(shared.claim(1));
+        shared.give_back(1);
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(1, false), None);
+        assert_eq!(shared.take(0, true), None);
+
+        // The same, this machine's copy giving it back first.
+        let shared = Shared::new([0].into(), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(1));
+        shared.give_back(0);
+        shared.give_back(1);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+    }
+
+    #[test]
+    fn a_failure_here_stops_every_device() {
+        let shared = Shared::new([0, 1, 2].into(), 3, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), next(1, 2));
+        shared.fail(0, Error::msg("the disk is full"));
+        assert!(shared.stop(1).raised());
+        assert_eq!(shared.take(1, false), None);
+        assert_eq!(shared.take(0, true), None);
+        assert_eq!(
+            shared.into_failure().map(|e| e.to_string()),
+            Some("the disk is full".to_string())
+        );
+    }
+
+    #[test]
+    fn a_busy_remote_pauses_until_the_line_is_empty() {
+        let shared = Shared::new([0].into(), 1, 2);
+        std::thread::scope(|scope| {
+            let started = Instant::now();
+            let pausing = scope.spawn(|| shared.pause(Duration::from_secs(30)));
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(shared.take(0, true), next(0, 1));
+            assert!(shared.claim(0));
+            shared.done(0);
+            pausing.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10));
+        });
+    }
 
     fn model() -> ModelRef {
         ModelRef {

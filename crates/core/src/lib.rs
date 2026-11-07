@@ -29,6 +29,7 @@ pub mod models;
 pub mod pipeline;
 pub mod probe;
 pub mod progress;
+pub mod remote;
 pub mod remux;
 pub mod run;
 pub mod separate;
