@@ -235,7 +235,9 @@ is in the progress and in the manifest. Switching it redoes the master step, the
 remux, never a separation. See `crates/core/src/duplicates.rs`.
 
 The separation takes the GPU, and only one run may have it: a lock is taken in the working
-directory while a model is loaded, and a second run is told to wait rather than allowed to try.
+directory while a model is loaded, and a second run is told to wait rather than allowed to try. A
+take waits a quarter of a second before it refuses: a lock let go can look held for an instant, while
+a child the run is starting still has a copy of its file.
 During the extraction a run has two workers on a machine, one per model, which share the lock and
 never separate at the same time (below). Other machines' GPUs can take passes beside it: see
 [Other machines](#other-machines).
