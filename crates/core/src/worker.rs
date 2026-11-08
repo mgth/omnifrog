@@ -14,6 +14,23 @@
 //! QUIT                                  ← shut down, releasing the device
 //! ```
 //!
+//! Under pymss, an element can also be separated while the extraction is
+//! still writing it ([`crate::separate`]'s follower), one block at a time:
+//!
+//! ```text
+//! GRID\t<rate>                          ← how an input labelled <rate> is cut
+//! GRID <step> <ahead>                   block k can be made at (k+1)·step + ahead frames
+//! BLK\t<out>\t<base>\t<rate>\t<frames>\t<whole>\t<wav>[\t<wav>]
+//!                                       ← the next block of <base>, its inputs
+//!                                         holding <frames> (whole: and no more)
+//! BLK <base> <from> <to>                <out>/<base>.voix.wav and .sansvoix.wav
+//!                                         hold frames [from, to) of the stems
+//! OK <base>                             that was the last block
+//! DROP\t<base>                          ← forget it
+//! ```
+//!
+//! Each of them ends with `FIN` or `ERR` like a separation.
+//!
 //! Under pymss, an element that runs out of device memory goes through MSST
 //! alone, loaded then and kept: the same stems and `OK` come out, and the
 //! worker says so on standard error, which is passed on to the log.
@@ -106,8 +123,72 @@ enum Word {
     Busy(String),
     /// Where a remote wants the inputs, and leaves the stems.
     Dir(String),
+    /// How the worker cuts a followed element into blocks.
+    Grid(Grid),
+    /// The frames of a followed element one block's stems hold.
+    Block {
+        from: u64,
+        to: u64,
+    },
     /// Anything else the worker or MSST printed.
     Other(String),
+}
+
+/// How the worker cuts an element it follows: blocks of `step` frames, and
+/// block k — unless it is the last — can be made once the input holds
+/// `(k + 1) · step + ahead` frames. The last runs from `k · step` to the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grid {
+    pub step: u64,
+    pub ahead: u64,
+}
+
+impl Grid {
+    /// What the input has to hold before block `k` can be asked for, unless
+    /// it is the last.
+    pub fn ready_at(self, k: u64) -> u64 {
+        (k + 1) * self.step + self.ahead
+    }
+
+    /// How many blocks an input holding `held` frames can be cut into
+    /// before its last one: those that can be made now.
+    pub fn ready(self, held: u64) -> u64 {
+        held.saturating_sub(self.ahead) / self.step.max(1)
+    }
+
+    /// How many blocks an element of `frames` frames is cut into: the plan
+    /// the worker follows, said here only to count.
+    pub fn blocks(self, frames: u64) -> u64 {
+        self.ready(frames) + 1
+    }
+}
+
+/// One block of a followed element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    /// The frames of the element its stems hold: `from == to` when the
+    /// input did not hold enough for one.
+    pub from: u64,
+    pub to: u64,
+    /// The element is done.
+    pub last: bool,
+}
+
+/// What a block is asked of.
+#[derive(Debug, Clone, Copy)]
+pub struct Ask<'a> {
+    /// The element's name: the stems are `<base>.voix.wav` and
+    /// `<base>.sansvoix.wav` in `out_dir`.
+    pub base: &'a str,
+    pub out_dir: &'a Path,
+    /// The rate the model is handed its samples at (the no-resample trick).
+    pub rate: u32,
+    /// Frames every input holds.
+    pub held: u64,
+    /// The inputs are whole: `held` is their length.
+    pub whole: bool,
+    /// One mono input, or two side by side.
+    pub inputs: &'a [PathBuf],
 }
 
 /// A loaded model, fed one element at a time.
@@ -504,40 +585,11 @@ impl Worker {
             request.push('\t');
             request.push_str(input);
         }
-        request.push('\n');
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::msg("the worker's input is closed"))?;
-        if stdin.write_all(request.as_bytes()).is_err() || stdin.flush().is_err() {
-            return Err(self.died("the worker stopped before the request was sent"));
-        }
-        loop {
-            match self.next(QUIET_TIMEOUT) {
-                Ok(Word::Fraction(f)) => fraction(f.clamp(0.0, 1.0)),
-                Ok(Word::Finished) => break,
-                Ok(Word::Other(line)) => {
-                    if let Some(peak) = line
-                        .strip_prefix("VRAM ")
-                        .and_then(|v| v.trim().parse::<f64>().ok())
-                    {
-                        self.peak = Some(self.peak.map_or(peak, |p| p.max(peak)));
-                    }
-                }
-                Ok(Word::Note(line)) => self.notes.push(line),
-                Ok(Word::Failed(why)) => {
-                    return Err(Error::msg(format!("the separation failed: {why}")));
-                }
-                Ok(_) => {}
-                Err(Silence::Quiet) => {
-                    return Err(self.died("the worker went an hour without a word"));
-                }
-                Err(Silence::Gone) => {
-                    return Err(self.died("the worker stopped during the separation"));
-                }
-                Err(Silence::Stopped) => return Err(self.died(STOPPED)),
+        self.request(&request, |word| {
+            if let Word::Fraction(f) = word {
+                fraction(f.clamp(0.0, 1.0));
             }
-        }
+        })?;
         let bases: Vec<String> = inputs
             .iter()
             .map(|input| {
@@ -582,6 +634,137 @@ impl Worker {
                 Ok(stems)
             })
             .collect()
+    }
+
+    /// Send one request and read the worker's words until its `FIN`. `on`
+    /// is handed every word about the request itself (fractions, `OK`,
+    /// `GRID`, `BLK`); the device's peak and the notes are kept here. The
+    /// worker is given an hour between two words, and killed when its stop
+    /// is raised, whatever the request.
+    fn request(&mut self, line: &str, mut on: impl FnMut(Word)) -> Result<()> {
+        // Told to stop before it began: nothing to kill, the worker can
+        // serve the next request.
+        if self.stopped() {
+            return Err(Error::msg(STOPPED));
+        }
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::msg("the worker's input is closed"))?;
+        if stdin.write_all(line.as_bytes()).is_err()
+            || stdin.write_all(b"\n").is_err()
+            || stdin.flush().is_err()
+        {
+            return Err(self.died("the worker stopped before the request was sent"));
+        }
+        loop {
+            match self.next(QUIET_TIMEOUT) {
+                Ok(Word::Finished) => return Ok(()),
+                Ok(Word::Other(line)) => {
+                    if let Some(peak) = line
+                        .strip_prefix("VRAM ")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                    {
+                        self.peak = Some(self.peak.map_or(peak, |p| p.max(peak)));
+                    }
+                }
+                Ok(Word::Note(line)) => self.notes.push(line),
+                Ok(Word::Failed(why)) => {
+                    return Err(Error::msg(format!("the separation failed: {why}")));
+                }
+                Ok(word) => on(word),
+                Err(Silence::Quiet) => {
+                    return Err(self.died("the worker went an hour without a word"));
+                }
+                Err(Silence::Gone) => {
+                    return Err(self.died("the worker stopped during the separation"));
+                }
+                Err(Silence::Stopped) => return Err(self.died(STOPPED)),
+            }
+        }
+    }
+
+    /// How this worker cuts an element it follows, at `rate`. An error is
+    /// a worker that cannot follow one: MSST, which separates whole
+    /// elements only, or a worker on a CPU, where following would take the
+    /// cores the extraction decodes on. Here only: a remote is handed whole
+    /// elements.
+    pub fn grid(&mut self, rate: u32) -> Result<Grid> {
+        if self.remote.is_some() {
+            return Err(Error::msg("a remote separates whole elements only"));
+        }
+        let mut grid = None;
+        self.request(&format!("GRID\t{rate}"), |word| {
+            if let Word::Grid(said) = word {
+                grid = Some(said);
+            }
+        })?;
+        grid.filter(|grid| grid.step > 0)
+            .ok_or_else(|| Error::msg("the worker did not say how it cuts an element"))
+    }
+
+    /// The next block of a followed element, if its inputs hold enough for
+    /// one; `fraction` is how far into the block the worker is.
+    pub fn block(&mut self, ask: &Ask, mut fraction: impl FnMut(f64)) -> Result<Block> {
+        if self.remote.is_some() {
+            return Err(Error::msg("a remote separates whole elements only"));
+        }
+        fs::create_dir_all(ask.out_dir).map_err(|e| Error::io(ask.out_dir, e))?;
+        let mut request = format!(
+            "BLK\t{}\t{}\t{}\t{}\t{}",
+            ask.out_dir.to_string_lossy(),
+            ask.base,
+            ask.rate,
+            ask.held,
+            u8::from(ask.whole)
+        );
+        for input in ask.inputs {
+            request.push('\t');
+            request.push_str(&input.to_string_lossy());
+        }
+        let (mut span, mut last) = (None, false);
+        self.request(&request, |word| match word {
+            Word::Fraction(f) => fraction(f.clamp(0.0, 1.0)),
+            Word::Block { from, to } => span = Some((from, to)),
+            Word::Done => last = true,
+            _ => {}
+        })?;
+        let (from, to) = span.ok_or_else(|| {
+            Error::msg(format!("the worker said nothing of {}'s block", ask.base))
+        })?;
+        if to < from || to > ask.held || (last && to != ask.held) {
+            return Err(Error::msg(format!(
+                "{}: a block of frames {from} to {to}, out of inputs holding {}",
+                ask.base, ask.held
+            )));
+        }
+        Ok(Block { from, to, last })
+    }
+
+    /// Forget a followed element: what the worker kept of it goes.
+    pub fn forget(&mut self, base: &str) -> Result<()> {
+        self.request(&format!("DROP\t{base}"), |_| {})
+    }
+
+    /// From now on, `stop` is what kills this worker: a worker handed from
+    /// one step to the next answers to the step it serves.
+    pub fn set_stop(&mut self, stop: Option<Stop>) {
+        self.stop = stop;
+    }
+
+    /// A worker started by `command`, which speaks the protocol: the tests'
+    /// stand-in for the inference.
+    #[cfg(test)]
+    pub(crate) fn start_command(
+        command: Command,
+        stop: Option<Stop>,
+        progress: Progress,
+    ) -> Result<Self> {
+        let mut worker = Self::spawn(command, "a mock worker".into(), None, None, stop)?;
+        match worker.wait_ready(progress)? {
+            None => Ok(worker),
+            Some(why) => Err(Error::msg(why)),
+        }
     }
 
     /// What standard error said during the requests so far that belongs in
@@ -696,6 +879,24 @@ fn word(line: &str) -> Word {
         Word::Dir(dir.to_string())
     } else if line.starts_with("OK ") {
         Word::Done
+    } else if let Some(grid) = line.strip_prefix("GRID ").and_then(|rest| {
+        let (step, ahead) = rest.trim().split_once(' ')?;
+        Some(Grid {
+            step: step.parse().ok()?,
+            ahead: ahead.trim().parse().ok()?,
+        })
+    }) {
+        Word::Grid(grid)
+    } else if let Some((from, to)) = line.strip_prefix("BLK ").and_then(|rest| {
+        // The base comes first and may hold anything; the two numbers end
+        // the line.
+        let mut fields = rest.rsplitn(3, ' ');
+        let to = fields.next()?.parse().ok()?;
+        let from = fields.next()?.parse().ok()?;
+        fields.next()?;
+        Some((from, to))
+    }) {
+        Word::Block { from, to }
     } else if let Some(value) = line.strip_prefix("GLOB ") {
         match value.trim().parse() {
             Ok(fraction) => Word::Fraction(fraction),
@@ -818,6 +1019,52 @@ mod tests {
             Word::Fraction(f) => assert!((f - 0.4213).abs() < 1e-9),
             _ => panic!("GLOB is a fraction"),
         }
+    }
+
+    #[test]
+    fn a_followed_element_s_words_are_read_too() {
+        assert!(matches!(
+            word("GRID 26460000 352801"),
+            Word::Grid(Grid {
+                step: 26_460_000,
+                ahead: 352_801
+            })
+        ));
+        assert!(matches!(
+            word("BLK 12+11 26460000 52920000"),
+            Word::Block {
+                from: 26_460_000,
+                to: 52_920_000
+            }
+        ));
+        // Nothing ready: an empty block.
+        assert!(matches!(word("BLK 10 0 0"), Word::Block { from: 0, to: 0 }));
+        assert!(matches!(word("BLK 10 0"), Word::Other(_)));
+        assert!(matches!(word("GRID soon"), Word::Other(_)));
+        // The worker's own source answers what the Rust side asks.
+        for said in [
+            "\"GRID {bloc} {avance}\"",
+            "\"BLK {base} {deb} {deb + len(voix)}\"",
+            "champs[0] == \"DROP\"",
+            "champs[0] == \"BLK\" and len(champs) >= 7",
+        ] {
+            assert!(SOURCE.contains(said), "the worker no longer has {said}");
+        }
+    }
+
+    #[test]
+    fn a_grid_counts_the_blocks_the_worker_cuts() {
+        let grid = Grid {
+            step: 100,
+            ahead: 11,
+        };
+        // Short of one step and its lookahead: one block, made at the end.
+        assert_eq!(grid.blocks(1), 1);
+        assert_eq!(grid.blocks(110), 1);
+        assert_eq!(grid.ready_at(0), 111);
+        assert_eq!(grid.blocks(111), 2);
+        assert_eq!(grid.blocks(210), 2);
+        assert_eq!(grid.blocks(211), 3);
     }
 
     #[test]

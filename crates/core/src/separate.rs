@@ -43,6 +43,11 @@
 //! bits below it are arithmetic, and the coder would carry them all (see
 //! `depth`). One an earlier version left at 24 bits is rounded where it is
 //! rather than separated again.
+//!
+//! **The original begun during the extraction.** Under pymss this machine
+//! separates as many of the original's elements as it keeps up with while
+//! the extraction writes them, a block at a time ([`Follower`]); this step
+//! finishes those first, and makes the others as above.
 
 use crate::config::{Config, Pairs, Remote};
 use crate::depth;
@@ -63,6 +68,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+mod follow;
+pub use follow::{Followed, Follower, follows};
 
 /// Everything the pipeline hands around is at this rate, whatever the
 /// model was fed.
@@ -88,23 +96,39 @@ pub struct Separated {
 /// an Auro-3D or an Atmos master with a real bed the dialogue lives in the
 /// centre. No element is skipped on a detection — a voice the detector
 /// misses is a voice that stays in the film under the dubbed one.
+///
+/// `followed` is what was separated while the extraction ran (see
+/// [`Follower`]): this machine finishes those elements first, from where
+/// they are, while the remotes start on the others.
 pub fn original(
     config: &Config,
     job: &Job,
     model: &Model,
     master: &MasterSet,
     pairs: Pairs,
+    followed: Option<Followed>,
+    progress: Progress,
+) -> Result<Separated> {
+    original_with(config, job, model, master, pairs, followed, None, progress)
+}
+
+/// [`original`], this machine's worker started by `start` when there is
+/// one: the tests' mock.
+#[allow(clippy::too_many_arguments)]
+fn original_with(
+    config: &Config,
+    job: &Job,
+    model: &Model,
+    master: &MasterSet,
+    pairs: Pairs,
+    followed: Option<Followed>,
+    start: Option<Start>,
     progress: Progress,
 ) -> Result<Separated> {
     let into = job.separate_dir();
     fs::create_dir_all(&into).map_err(|e| Error::io(&into, e))?;
 
-    let elements: Vec<u32> = master
-        .channels
-        .iter()
-        .filter(|channel| !channel.is_lfe())
-        .map(|channel| channel.id)
-        .collect();
+    let elements = elements_of(master);
     if elements.is_empty() {
         return Err(Error::msg(
             "the master set holds nothing but an LFE; there is no dialogue to take out",
@@ -116,34 +140,17 @@ pub fn original(
         .map(|id| Unit::of(job, Stage::Original, &id.to_string()))
         .collect();
     let trajectories = Trajectories::read(&master.metadata)?;
-    let plan = if pairs.original {
-        // Where each element is, on average: an object by its trajectory, a
-        // bed channel by its speaker. Only its neighbours matter.
-        let rears = master
-            .channels
-            .iter()
-            .any(|c| c.name == "Lrs" || c.name == "Rrs");
-        let angles: Vec<f64> = elements
-            .iter()
-            .zip(&work)
-            .map(|(id, unit)| {
-                let position = match master.channels.iter().find(|c| c.id == *id) {
-                    Some(channel) if !channel.object => voices::position(&channel.name, rears),
-                    _ => mean_position(trajectories.of(*id), wav::frames(&unit.source))
-                        .unwrap_or([0.0, 1.0, 0.0]),
-                };
-                azimuth(position)
-            })
-            .collect();
-        let plan = Plan::from_centre(&angles);
+    let plan = plan_original(master, &elements, &work, pairs, Some(&trajectories))
+        .expect("with the trajectories, every element has a place");
+    if pairs.original {
         progress(Event::message(format!(
             "in pairs, from the centre: {}",
             plan.describe(&work)
         )));
-        plan
-    } else {
-        Plan::alone(work.len())
-    };
+    }
+    // What the extraction's follower made, if it made it of these very
+    // elements, cut into these very passes.
+    let followed = followed.and_then(|followed| followed.fits(master, &plan, progress));
     let bits = mastered_at(job, progress);
     let resumed = run(
         config,
@@ -153,6 +160,8 @@ pub fn original(
         &plan,
         Stage::Original,
         bits,
+        followed,
+        start,
         progress,
     )?;
 
@@ -192,6 +201,55 @@ pub fn original(
     })
 }
 
+/// The original's elements a separation works on: every waveform but the
+/// LFE, in the master set's order.
+fn elements_of(master: &MasterSet) -> Vec<u32> {
+    master
+        .channels
+        .iter()
+        .filter(|channel| !channel.is_lfe())
+        .map(|channel| channel.id)
+        .collect()
+}
+
+/// The passes the original's `elements` are made in. In pairs, by where
+/// each one is on average: an object by its trajectory, a bed channel by
+/// its speaker; only its neighbours matter. Without `trajectories` — the
+/// extraction is still writing them — an object has no place yet, and a
+/// plan that pairs it is `None`.
+fn plan_original(
+    master: &MasterSet,
+    elements: &[u32],
+    work: &[Unit],
+    pairs: Pairs,
+    trajectories: Option<&Trajectories>,
+) -> Option<Plan> {
+    if !pairs.original {
+        return Some(Plan::alone(work.len()));
+    }
+    let rears = master
+        .channels
+        .iter()
+        .any(|c| c.name == "Lrs" || c.name == "Rrs");
+    let angles = elements
+        .iter()
+        .zip(work)
+        .map(|(id, unit)| {
+            let position = match master.channels.iter().find(|c| c.id == *id) {
+                Some(channel) if !channel.object => voices::position(&channel.name, rears),
+                _ => mean_position(trajectories?.of(*id), wav::frames(&unit.source))
+                    .unwrap_or([0.0, 1.0, 0.0]),
+            };
+            Some(azimuth(position))
+        })
+        .collect::<Option<Vec<f64>>>()?;
+    Some(Plan::from_centre(&angles))
+}
+
+/// Starts this machine's worker, killed when the stop is raised: what the
+/// tests hand in instead of the inference.
+type Start<'a> = &'a (dyn Fn(Stop) -> Result<Worker> + Sync);
+
 /// Take the dialogue out of every channel of the dub, and decide how the
 /// voices will be placed.
 pub fn dub(
@@ -200,6 +258,19 @@ pub fn dub(
     model: &Model,
     channels: &[String],
     pairs: Pairs,
+    progress: Progress,
+) -> Result<(Separated, voices::Analysis)> {
+    dub_with(config, job, model, channels, pairs, None, progress)
+}
+
+/// [`dub`], this machine's worker started by `start` when there is one.
+fn dub_with(
+    config: &Config,
+    job: &Job,
+    model: &Model,
+    channels: &[String],
+    pairs: Pairs,
+    start: Option<Start>,
     progress: Progress,
 ) -> Result<(Separated, voices::Analysis)> {
     let into = job.separate_dir();
@@ -229,7 +300,18 @@ pub fn dub(
     }
     // The dub was never the master the stream is coded at: nothing says
     // what its depth was, and its voices are mixed before they are coded.
-    let resumed = run(config, job, model, &work, &plan, Stage::Dub, 24, progress)?;
+    let resumed = run(
+        config,
+        job,
+        model,
+        &work,
+        &plan,
+        Stage::Dub,
+        24,
+        None,
+        start,
+        progress,
+    )?;
 
     progress(Event::message("comparing the dub's voices"));
     let analysis = voices::analyse(&into, "C", progress)?;
@@ -845,6 +927,15 @@ impl Shared {
         self.changed.notify_all();
     }
 
+    /// A pass that was not in line — one the extraction's follower began
+    /// and could not finish — goes in, at the back, to be made whole.
+    fn add(&self, pass: usize) {
+        let mut queue = self.queue();
+        queue.todo.push_back(pass);
+        queue.total += 1;
+        self.changed.notify_all();
+    }
+
     fn fail(&self, device: usize, why: Error) {
         let mut queue = self.queue();
         queue.running[device] = None;
@@ -890,6 +981,11 @@ impl Shared {
 /// average. A unit estimated once is written the moment its pass is done;
 /// one estimated twice is written once both are, and what was kept aside
 /// for it goes.
+///
+/// The passes in `followed` were begun while the extraction ran: they are
+/// not in line, and this machine finishes them first with the worker that
+/// began them, the remotes starting on the rest meanwhile. One that fails
+/// to finish goes back in line, to be made whole.
 #[allow(clippy::too_many_arguments)]
 fn run(
     config: &Config,
@@ -899,6 +995,8 @@ fn run(
     plan: &Plan,
     stage: Stage,
     mastered_at: u32,
+    followed: Option<Followed>,
+    start: Option<Start>,
     progress: Progress,
 ) -> Result<usize> {
     let kind = stage.kind();
@@ -909,6 +1007,11 @@ fn run(
     // in here, and neither is what was kept aside for an average.
     discard(&prepared)?;
     discard(&stems)?;
+    let follow_dir = into.join(follow::DIR);
+    if followed.is_none() {
+        discard(&follow_dir)?;
+    }
+    let following: Vec<usize> = followed.as_ref().map_or_else(Vec::new, Followed::passes);
 
     let mut frames = Vec::with_capacity(units.len());
     let mut finished = vec![false; units.len()];
@@ -968,6 +1071,7 @@ fn run(
             .collect()
     };
     let todo: Vec<usize> = (0..plan.passes.len())
+        .filter(|pass| !following.contains(pass))
         .filter(|&pass| {
             serves(pass)
                 .iter()
@@ -977,18 +1081,41 @@ fn run(
     let averaged: Vec<usize> = (0..units.len())
         .filter(|&u| !finished[u] && plan.takes[u].len() > 1)
         .collect();
-    if todo.is_empty() && averaged.is_empty() {
+    if todo.is_empty() && averaged.is_empty() && following.is_empty() {
         return Ok(done);
+    }
+    if !following.is_empty() {
+        progress(Event::message(format!(
+            "{} {kind}{} followed during the extraction: this machine finishes {} first",
+            following.len(),
+            if following.len() > 1 { "s" } else { "" },
+            if following.len() > 1 { "them" } else { "it" },
+        )));
     }
 
     let total = plan.passes.len();
-    let behind = total - todo.len();
+    let behind = total - todo.len() - following.len();
+    // How much of the followed passes is made, counted in passes.
+    let tails = Mutex::new(followed.as_ref().map_or(0.0, Followed::made));
+    let mut followed = followed;
     let result = (|| -> Result<()> {
-        if !todo.is_empty() {
+        if !todo.is_empty() || followed.is_some() {
             // Fetched here rather than at the first request: the worker
             // loads the checkpoint as it starts, so it has to be on disk
             // before that.
-            let local = models::fetch(model, config, progress)?;
+            let local = match start {
+                None => Some(models::fetch(model, config, progress)?),
+                Some(_) => None,
+            };
+            let start_here = |stop: Stop| -> Result<Worker> {
+                match (start, &local) {
+                    (Some(start), _) => start(stop),
+                    (None, Some(local)) => {
+                        Worker::start_under(config, model, local, progress, Some(stop))
+                    }
+                    (None, None) => unreachable!("fetched when there is no start"),
+                }
+            };
             let shared = Shared::new(
                 todo.iter().copied().collect(),
                 plan.passes.len(),
@@ -1032,9 +1159,10 @@ fn run(
             // devices are.
             let fraction = |device: usize, fraction: f64| {
                 let done = shared.at(device, fraction);
+                let tails = *tails.lock().unwrap_or_else(|p| p.into_inner());
                 progress(Event::ratio(
                     stage.label(),
-                    (behind as f64 + done) / total as f64,
+                    (behind as f64 + tails + done) / total as f64,
                 ));
             };
             // The no-resample trick: the very same samples, under a header
@@ -1115,9 +1243,63 @@ fn run(
             // were remotes. With nothing left in line, it makes again the
             // passes the remotes are on rather than wait for them (see
             // `Shared`).
-            let here = || {
+            let mut here = || {
                 let stop = shared.stop(0);
                 let mut worker: Option<Worker> = None;
+                // What the extraction's follower began, finished first by the
+                // worker that began it: nobody else has the fades it keeps.
+                if let Some(mut began) = followed.take() {
+                    worker = began.take_worker();
+                    let mut left = Vec::new();
+                    for stream in began.streams() {
+                        let pass = stream.pass();
+                        let started = Instant::now();
+                        progress(Event::message(format!(
+                            "{}{} {} ({}): the rest of it, followed during the extraction",
+                            prefix(0),
+                            if plan.passes[pass].right.is_some() {
+                                "pair"
+                            } else {
+                                kind
+                            },
+                            names[pass],
+                            stream.describe(),
+                        )));
+                        let finished = match &mut worker {
+                            Some(running) => {
+                                stream.finish(running, units, &frames, mastered_at, |made| {
+                                    *tails.lock().unwrap_or_else(|p| p.into_inner()) += made;
+                                    fraction(0, 0.0);
+                                })
+                            }
+                            None => Err(Error::msg("the worker that followed it is gone")),
+                        };
+                        match finished {
+                            Ok(()) => done_in(0, pass, started),
+                            Err(why) => {
+                                progress(Event::message(format!(
+                                    "  {}{}: {why}; made whole instead",
+                                    prefix(0),
+                                    names[pass]
+                                )));
+                                // Made again from nothing, it counts from nothing.
+                                *tails.lock().unwrap_or_else(|p| p.into_inner()) -= stream.made();
+                                if worker.as_mut().is_some_and(|w| !w.is_alive()) {
+                                    worker = None;
+                                }
+                                left.push(pass);
+                            }
+                        }
+                    }
+                    for pass in left {
+                        shared.add(pass);
+                    }
+                    if let Some(worker) = &mut worker {
+                        // From here on it serves the step, as a worker it
+                        // had started itself would.
+                        worker.set_stop(Some(stop.clone()));
+                    }
+                }
                 while let Some(took) = shared.take(0, true) {
                     let pass = took.pass;
                     let started = Instant::now();
@@ -1135,13 +1317,7 @@ fn run(
                             attempts += 1;
                             let running = match &mut worker {
                                 Some(worker) => worker,
-                                none => none.insert(Worker::start_under(
-                                    config,
-                                    model,
-                                    &local,
-                                    progress,
-                                    Some(stop.clone()),
-                                )?),
+                                none => none.insert(start_here(stop.clone())?),
                             };
                             match running
                                 .separate(std::slice::from_ref(&input), &out, |f| fraction(0, f))
@@ -1352,9 +1528,12 @@ fn run(
             };
 
             std::thread::scope(|scope| {
+                // With everything followed, the remotes have nothing to take.
                 for (index, remote) in config.remotes.iter().enumerate() {
                     let far = &far;
-                    scope.spawn(move || far(index + 1, remote));
+                    if !todo.is_empty() {
+                        scope.spawn(move || far(index + 1, remote));
+                    }
                 }
                 here();
                 // Whatever a remote still runs — asked what it is, or a pass
@@ -1398,6 +1577,8 @@ fn run(
     let _ = discard(&prepared);
     let _ = discard(&stems);
     let _ = clear_parts(&into);
+    drop(followed);
+    let _ = discard(&follow_dir);
     result?;
     Ok(done)
 }

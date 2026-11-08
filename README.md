@@ -11,8 +11,8 @@ omnifrog dub film.mkv --vo 2 --vf 1 --mkv
 
 What it does, in order: `ffmpeg | harletty` decodes the original (TrueHD Atmos, E-AC-3 JOC, DTS:X,
 Auro-3D) into one mono WAV per element and splits the dubbed track into channels; a separation model
-removes the dialogue from every element of the original and another extracts it from every channel
-of the dub (by default Gabox's Mel-Band Fullness V3 for the original, Kim's Mel-Band FT2 Bleedless
+removes the dialogue from every element of the original — beginning while the extraction is still
+writing them — and another extracts it from every channel of the dub (by default Gabox's Mel-Band Fullness V3 for the original, Kim's Mel-Band FT2 Bleedless
 for the dub); the music and effects the dubbed voices still carry — the original's, a few tens of
 milliseconds late, heard as an echo — are cancelled and the voices put on the original's clock; they
 are levelled to the original's dialogue (BS.1770), placed as static objects, and the scene is encoded as TrueHD Atmos by harlettizer (the original's elements kept as
@@ -237,6 +237,26 @@ The separation takes the GPU, and only one run may have it: a lock is taken in t
 directory while a model is loaded, and a second run is told to wait rather than allowed to try.
 Other machines' GPUs can take passes beside it: see [Other machines](#other-machines).
 
+**During the extraction.** The extraction reads the whole container and is bound by the disk — a
+quarter of an hour for a film — and the GPU would wait through it. Under pymss this machine
+separates the original's elements as the decoder writes them, a block (`inference.block_seconds`)
+at a time, the first element with a block ready first: as many elements as it keeps up with. One
+that falls two blocks behind lets the last of the followed go, which is then separated whole after
+the extraction, like the elements nobody followed — by this machine and the remotes, as before.
+How many it keeps depends on the GPU against the disk; by the times of a card that separates an
+element of a whole film in 107 s against an extraction of 15 minutes, about eight of thirteen (an
+estimate). When the decode ends, a followed element needs its last block or two: the separation
+of the original finishes those first, with the same worker — the model is loaded once for both
+steps — while the remotes start on the rest. An element comes out the same whether it was followed
+or made whole: it is cut into blocks by its length alone, so the fades fall in the same places.
+Only one block's stems are on disk at a time; an element without its dialogue waits in float until
+the depth the original was mastered at is known. A decode that fails or is stopped drops what was
+followed (the extraction starts again anyway). The steps stay six: the progress says how much of
+the original was separated during the extraction, and the extraction's time takes in at most the
+end of the block in flight. Not followed: the dub (another model, after the extraction as
+before), and the original under MSST, on a CPU, or in pairs when it has objects — those are paired
+by where each one is over the whole film.
+
 Progress goes to standard error, a line per percent; `--json` makes it one JSON object per line,
 which is what a front end reads.
 
@@ -295,8 +315,11 @@ configuration's `python`), check `python -c "import torch; print(torch.__version
 
 **A smaller card.** pymss keeps a whole block of an element on the device: `inference.block_seconds`
 (300 by default) is what its memory grows with, and outside the fades between blocks the output does
-not depend on it, to rounding. An element is cut into equal blocks of at most that plus one window
-(the fade), the last one no longer than the others. `inference.batch_size` replaces the model's
+not depend on it, to rounding. An element is cut into blocks of that plus one window (the fade),
+each starting where the one before ends but for the fade, and a last one of what is left — no
+longer than the others at the 25 % overlap, at most one window longer above 50 %. The cut depends
+on the element's length alone, which is what lets a block be made while the extraction is still
+writing it; until November 2026 the blocks were equal, which moves only the fades. `inference.batch_size` replaces the model's
 published batch (windows computed at once; 0 = the catalogue's, else the author's: 1 for Fullness
 V3, Kim FT2 and HyperACE v2 Voc — the catalogue's `batch: 1`, its author's is 2 — and 2 for Big
 Beta 7). Each separation prints the most device memory torch reserved; the runtime's context
@@ -321,7 +344,7 @@ them:
 | | batches of 4 | 6.4 GiB | 121 s | −74 / −73 dB |
 | | `engine: msst` | 2.2 GiB | 121 s | −30 / −29 dB |
 
-Since blocks are equal the block hardly matters on this card: from 600 s to 300 s it takes 0.2 GiB
+Since no block is longer than the others, the block hardly matters on this card: from 600 s to 300 s it takes 0.2 GiB
 off, to 120 s another 0.1, and below that nothing more comes off (the model and one window's work
 stay). The earlier measurement, when the last block took the remainder, put blocks of 600 s at
 5.0 GiB: on these 25 minutes that last block was about 1030 s long. The batch is what costs: 1.1 GiB
@@ -379,7 +402,8 @@ opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 G
 setting of `inference` is this machine's, so a stem is the same wherever it was made; a remote's
 own configuration only says where its Python, MSST, models and work directory are. A remote also
 takes the lock of its own working directory, so its passes and a run on that machine never share
-its GPU.
+its GPU. A remote is handed whole elements only: what is separated during the extraction is this
+machine's.
 
 ## Requirements
 

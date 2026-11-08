@@ -3,6 +3,14 @@
    python separer_msst.py <msst_dir> <config> <checkpoint> <model_type> <bigshifts> <use_tta> <module> [overlap=N] [pymss=P] [bloc=S] [batch=B] --serveur
    --serveur = worker PERSISTANT : charge torch + le modèle UNE fois, imprime "PRET", puis lit une requête par ligne sur stdin :
             SEP\t<dossier_sortie>\t<wav1>[\t<wav2> ...]   -> sépare le lot (même contrat que ci-dessous : "GLOB", "OK <base>" par entrée), puis "FIN" ; sur erreur "ERR <message>" (le worker survit)
+            GRID\t<rate>                                    -> "GRID <step> <ahead>", then "FIN" (pymss on a GPU only, "ERR" otherwise): how an input labelled <rate> is cut
+                                                               into blocks — block k, unless it is the last, can be made once the input holds (k + 1) x step + ahead frames
+            BLK\t<out>\t<base>\t<rate>\t<frames>\t<whole>\t<wav1>[\t<wav2>]
+                                                            -> one block of an element the extraction is still writing (cf. bloc_suivi): its inputs, growing mono WAVs
+                                                               (two side by side for a pair), hold <frames> frames, and are complete at that when <whole> is 1.
+                                                               "BLK <base> <from> <to>": <out>/<base>.voix.wav and .sansvoix.wav now hold frames [from, to) of the
+                                                               stems, faded into the block before; from == to: nothing was ready. "OK <base>" after the last; "FIN".
+            DROP\t<base>                                    -> forget a followed element; "FIN"
             QUIT (ou fin de stdin)                          -> sortie 0
             Raison d'être : l'appelant traite les objets/canaux UN par UN (temporaires réduits) ; sans ce mode chaque élément relançait un process = ré-import de torch
             + init ROCm/CUDA (des Go de bibliothèques mappées) + rechargement du checkpoint, ce qui gèle la machine à chaque élément quand la RAM est chargée.
@@ -17,8 +25,9 @@
             -> MSST. Un élément à court de VRAM sous pymss repasse seul par MSST (chargé à ce moment-là), le reste du lot continue sous pymss.
             Au chargement (avant "PRET"), une ligne "MOTEUR <texte>" dit lequel sépare et pourquoi ; l'appelant l'accroche au bilan de l'étape.
    bloc=S (optional, pymss) = seconds of an element handed to pymss at once (default BLOC_PYMSS_S): pymss keeps a whole block on the device, so this is what
-            its memory grows with. The element is cut into equal blocks of at most S seconds (at least four windows) plus one window, the fade, the last one never longer.
-            Outside the fades between blocks the output does not depend on it, to rounding (cf. BLOC_PYMSS_S).
+            its memory grows with. The element is cut into blocks of S seconds (at least four windows) plus one window, the fade, and a last one of what is left
+            (cf. plan_blocs), which can be cut while the element is still being written (BLK). Outside the fades between blocks the output does not depend on it, to
+            rounding (cf. BLOC_PYMSS_S).
    batch=B (optional) = replaces inference.batch_size of the published config: windows computed at once, memory ~ xB, and on a large card faster.
    idle=G (optional, another machine's pass) = before anything is loaded, read how much of the device's memory other programs hold (cf. occupation) ;
             G GiB or more -> "BUSY <why>" on stdout and exit 0, nothing loaded : whatever else runs on that machine comes first.
@@ -283,21 +292,38 @@ def charge_pymss(config, checkpoint, model_type, bigshifts, use_tta, overlap, pc
 # standardiser nous-mêmes sur l'élément entier. Une entrée qui tient dans un bloc (extraits des tests) passe d'un coup, comme avant. Taille d'un bloc : bloc=S, BLOC_PYMSS_S par défaut.
 BLOC_PYMSS_S = 300
 
-# Découpe d'un élément de n échantillons en blocs [début, fin) : bloc = taille visée (multiple du pas), fondu = recouvrement de deux blocs voisins, pas et bord = ceux des fenêtres de pymss.
-# Autant de blocs qu'il en faut pour qu'aucun ne dépasse bloc + fondu, puis l'élément réparti également entre eux, arrondi au pas pour garder les départs sur la grille : chacun fait eff + fondu
-# (eff <= bloc) et recouvre le suivant d'un fondu, le dernier va jusqu'à n et n'est pas plus long. L'ancien découpage, (n - fondu) // bloc blocs et tout le reste au dernier, faisait celui-ci
-# jusqu'à près de deux blocs : 159 min à 48 kHz (Kim FT2 sous entête 44,1 kHz, 25 %, blocs de 300 s) sortaient en 32 blocs de 5 min 16 s (de l'entête) et un de 10 min 16 s, qui doublait le pic de
-# VRAM et débordait à la fin de l'élément, quand tout le reste était déjà calculé ; maintenant 34 blocs d'au plus 5 min 16 s.
-def plan_blocs(n, bloc, fondu, pas, bord):
-   reste = n - fondu                                                            # Ce que les blocs se partagent : chacun déborde en plus d'un fondu sur le suivant
-   if reste <= bloc: return [(0, n)]                                            # Tient dans un bloc : d'un coup
-   blocs = -(-reste // bloc)
-   eff   = -(-reste // blocs)
-   eff   = -(-eff // pas) * pas                                                 # <= bloc, multiple du pas lui aussi
-   debs  = list(range(0, reste, eff))                                           # Recomptés sur eff (l'arrondi au pas peut en rendre un inutile) : le dernier part avant n - fondu, fondu complet
-   mini  = max(fondu, 2 * bord) + 1                                             # pymss ne rallonge de bord que les entrées de plus de 2 x bord, sinon sa grille glisse : un dernier bloc trop court
-   debs[-1] = min(debs[-1], (n - mini) // pas * pas)                            # part plus tôt, sur la grille (recul de moins d'un bord ; seulement au-delà de 50 % de recouvrement, pas de MSST à
-   return [(d, s + fondu) for d, s in zip(debs, debs[1:])] + [(debs[-1], n)]    # num_overlap >= 3, et après de nombreux blocs : plus de 4 h d'élément à 300 s, une vingtaine de minutes à bloc=60)
+# How an element is cut, from pymss's windows and bloc=S at the input's rate sr: (bloc, fondu, avance, bord). bloc = the block's step, a multiple of the windows'
+# step (pas) so every block starts on the grid pymss would lay on the whole input; fondu = one window, how far a block runs into the next one; bord = what pymss
+# pads each side of its input with (utils._prepare_mix_for_chunks); avance = how much more than a step a block needs past its own start before it can be made
+# while the input may still grow: more than a fade, so the last block always takes a whole one from the block before it, and more than pymss's two borders,
+# below which pymss does not pad its input and its grid slides.
+def grille_pymss(sep, bloc_s, sr):
+   fondu = int(sep.config.audio.chunk_size)                                     # Two blocks overlap by one window of the model
+   pas   = fondu - int(sep.config.inference.get("overlap_size", fondu // 2))    # The step of pymss's windows (cf. charge_pymss)
+   bord  = fondu - pas
+   bloc  = -(-max(bloc_s * sr, 4 * fondu) // pas) * pas                         # A multiple of the step, and never under four windows
+   return bloc, fondu, max(fondu, 2 * bord) + 1, bord
+
+# The blocks [start, end) of an element of n frames: a pure function of n, the same whether the element was whole when it was cut or still being written
+# (cf. BLK). Block k is [k bloc, (k + 1) bloc + fondu) and can be made once the input holds (k + 1) bloc + avance frames; the last one runs from where the
+# others stopped to n, between avance and bloc + avance frames long (bloc + fondu at most for the 50 % overlap and under that every catalogue model runs at).
+# Before November 2026 an element was shared equally between its blocks, which needs n before the first one: the outputs differ only in the fades, which sit
+# elsewhere. An element that fits in one block passes at once, as before.
+def plan_blocs(n, bloc, fondu, avance):
+   k = max(0, (n - avance) // bloc)                                             # Blocks before the last: the k-th is made once n >= (k + 1) bloc + avance
+   return [(i * bloc, (i + 1) * bloc + fondu) for i in range(k)] + [(k * bloc, n)]
+
+# One block's stems (voix, sans) faded into the tail the block before it left (queue: its last fondu frames, not written yet): what of the block is written
+# now, and the tail it leaves for the next one (None after the last). The old block fades out over the common part, the new one in: the edge of each block,
+# the least well estimated, weighs the least.
+def fond_bloc(voix, sans, queue, fondu, dernier):
+   if queue is not None:
+      w = np.linspace(0.0, 1.0, fondu, dtype=np.float32)[:, None]
+      voix[:fondu] = queue[0] * (1.0 - w) + voix[:fondu] * w
+      sans[:fondu] = queue[1] * (1.0 - w) + sans[:fondu] * w
+   garde = len(voix) if dernier else len(voix) - fondu
+   suite = None if dernier else (voix[garde:].copy(), sans[garde:].copy())
+   return voix[:garde], sans[:garde], suite
 
 def stems_pymss(sep, x):                                                        # Un bloc (échantillons, canaux) -> (voix, sansvoix) de la même longueur, (échantillons, canaux du modèle)
    stems  = sep.separate(x[:, 0] if x.shape[1] == 1 else x.T, pbar=False)      # Mono -> dupliqué en stéréo par pymss, comme MSST ; sorties (échantillons, canaux)
@@ -338,15 +364,12 @@ def separe_pymss(ctx, dossier_sortie, entrees, use_tta, secours):
 def element_pymss(ctx, dossier_sortie, e, i, n_entrees, use_tta):
    sep, progres, bloc_s = ctx
    os.makedirs(dossier_sortie, exist_ok=True)
-   fondu = int(sep.config.audio.chunk_size)                                     # Recouvrement de deux blocs = une fenêtre du modèle
-   pas   = fondu - int(sep.config.inference.get("overlap_size", fondu // 2))    # Pas des fenêtres de pymss (cf. charge_pymss)
-   bord  = fondu - pas                                                          # Ce dont pymss rallonge chaque côté de son entrée (utils._prepare_mix_for_chunks)
    rate  = int(sep.config.audio.get("sample_rate", 44100))                      # Rate auquel pymss compte sa progression, en secondes
    base  = os.path.splitext(os.path.basename(e))[0]
    with sf.SoundFile(e) as f:
       n, sr = f.frames, f.samplerate
-      bloc  = -(-max(bloc_s * sr, 4 * fondu) // pas) * pas                      # Multiple du pas : les fenêtres d'un bloc tombent là où pymss les aurait posées sur l'entrée entière (cf. BLOC_PYMSS_S)
-      plan  = plan_blocs(n, bloc, fondu, pas, bord)                             # Blocs de taille égale, le dernier au plus aussi long
+      bloc, fondu, avance, bord = grille_pymss(sep, bloc_s, sr)                 # A block's windows fall where pymss would lay them on the whole input (cf. BLOC_PYMSS_S)
+      plan  = plan_blocs(n, bloc, fondu, avance)
       blocs = len(plan)
       sorties, queue = None, None                                               # queue = les « fondu » derniers échantillons (voix, sans) du bloc précédent, pas encore écrits
       try:
@@ -359,17 +382,110 @@ def element_pymss(ctx, dossier_sortie, e, i, n_entrees, use_tta):
             del x
             if sorties is None:
                sorties = [sf.SoundFile(os.path.join(dossier_sortie, f"{base}.{nom}.wav"), "w", samplerate=sr, channels=voix.shape[1], subtype="FLOAT") for nom in ("voix", "sansvoix")]
-            if queue is not None:                                               # Fondu sur la zone commune : l'ancien bloc s'efface, le nouveau monte
-               w = np.linspace(0.0, 1.0, fondu, dtype=np.float32)[:, None]
-               voix[:fondu] = queue[0] * (1.0 - w) + voix[:fondu] * w
-               sans[:fondu] = queue[1] * (1.0 - w) + sans[:fondu] * w
-            garde = len(voix) if b == blocs - 1 else len(voix) - fondu
-            sorties[0].write(voix[:garde]); sorties[1].write(sans[:garde])
-            queue = None if b == blocs - 1 else (voix[garde:].copy(), sans[garde:].copy())
+            voix, sans, queue = fond_bloc(voix, sans, queue, fondu, b == blocs - 1)
+            sorties[0].write(voix); sorties[1].write(sans)
             del voix, sans
       finally:
          for o in sorties or []: o.close()
    print(f"OK {base}", flush=True)
+
+# --- Following an element while the extraction is still writing it (BLK) ---
+# The caller hands the worker one block at a time, as the decoder's files grow, and reads back what each block finished; the worker keeps, per stream, the
+# next block and the fade the last one left. The plan and the fades are those of element_pymss, so an element comes out the same either way.
+SUIVIS = {}
+
+# The header of a WAV the decoder may still be writing: (channels, bits, float, where the samples start). Its sizes are not trusted — the decoder leaves them
+# at 0 until it ends — so neither is soundfile, which believes them.
+def entete_wav(f):
+   import struct
+   tete = f.read(12)
+   if len(tete) < 12 or tete[:4] != b"RIFF" or tete[8:12] != b"WAVE":
+      raise ValueError("not a WAV file")
+   fmt = None
+   while True:
+      bloc = f.read(8)
+      if len(bloc) < 8:
+         raise ValueError("no data chunk")
+      nom, taille = bloc[:4], struct.unpack("<I", bloc[4:])[0]
+      if nom == b"data":
+         if fmt is None:
+            raise ValueError("data before fmt")
+         return fmt + (f.tell(),)
+      corps = f.read(taille + (taille & 1))
+      if nom == b"fmt ":
+         etiquette, canaux = struct.unpack("<HH", corps[:4])
+         bits = struct.unpack("<H", corps[14:16])[0]
+         if etiquette == 0xFFFE and len(corps) >= 26:                           # WAVE_FORMAT_EXTENSIBLE: the real tag opens the sub-format
+            etiquette = struct.unpack("<H", corps[24:26])[0]
+         if etiquette not in (1, 3):
+            raise ValueError(f"sample format {etiquette}")
+         fmt = (canaux, bits, etiquette == 3)
+
+# Frames [deb, fin) of each input — growing mono WAVs, side by side — as float32 (frames, inputs): to the bit what soundfile reads from the same samples
+# (24-bit / 2^23, which is exact).
+def lit_croissant(entrees, deb, fin):
+   cols = []
+   for e in entrees:
+      with open(e, "rb") as f:                                                  # Opened and closed per block: the extraction renames the file once it is done
+         canaux, bits, flottant, donnees = entete_wav(f)
+         if canaux != 1 or (bits, flottant) not in ((24, False), (32, True)):
+            raise ValueError(f"{e}: {canaux} channel(s), {bits}-bit{' float' if flottant else ''}; a followed input is mono 24-bit PCM or float")
+         taille = bits // 8
+         f.seek(donnees + deb * taille)
+         brut = f.read((fin - deb) * taille)
+      if len(brut) < (fin - deb) * taille:
+         raise ValueError(f"{e}: holds fewer than the {fin} frames it was said to")
+      if flottant:
+         cols.append(np.frombuffer(brut, dtype="<f4").astype(np.float32))
+      else:
+         b = np.frombuffer(brut, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+         v = (b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)) << 8 >> 8               # Sign-extended from 24 bits
+         cols.append(v.astype(np.float32) / np.float32(8388608.0))
+   return np.stack(cols, axis=1)
+
+# GRID: what the caller needs to know when a block can be asked for, at the rate its inputs are labelled.
+def grille_suivi(ctx, sr):
+   import torch
+   if not (torch.cuda.is_available() or torch.backends.mps.is_available()):
+      raise RuntimeError("no GPU: on the CPU, following would take the cores the extraction decodes on")
+   bloc, fondu, avance, bord = grille_pymss(ctx[0], ctx[2], sr)
+   print(f"GRID {bloc} {avance}", flush=True)
+
+# BLK: the next block of the stream « base », if the inputs hold enough of it (all of them: they are the same element, or two of a pair); entier = they are
+# whole at « tient » frames. The block's finished frames go to <base>.voix.wav / <base>.sansvoix.wav in dossier_sortie, replacing the last block's, and
+# « BLK <base> <from> <to> » says which they are (from == to: nothing was ready); « OK <base> » follows the last one. An error forgets the stream.
+def bloc_suivi(ctx, dossier_sortie, base, sr, tient, entier, entrees, use_tta):
+   sep, progres, bloc_s = ctx
+   try:
+      bloc, fondu, avance, bord = grille_pymss(sep, bloc_s, sr)
+      rate = int(sep.config.audio.get("sample_rate", 44100))
+      etat = SUIVIS.setdefault(base, {"k": 0, "queue": None})
+      deb  = etat["k"] * bloc
+      pret = tient >= deb + bloc + avance
+      if not pret and not entier:
+         print(f"BLK {base} {deb} {deb}", flush=True); return
+      fin = deb + bloc + fondu if pret else tient
+      if fin <= deb:
+         raise ValueError(f"{base}: whole at {tient} frames, where its next block starts at {deb}")
+      os.makedirs(dossier_sortie, exist_ok=True)
+      lp = fin - deb + (2 * bord if fin - deb > 2 * bord else 0)
+      progres.entree(0, 1, 3 if use_tta == "1" else 1, 0, 1, -(-lp // rate))
+      x = lit_croissant(entrees, deb, fin)
+      voix, sans = stems_pymss(sep, x)
+      del x
+      voix, sans, etat["queue"] = fond_bloc(voix, sans, etat["queue"], fondu, not pret)
+      for nom, a in (("voix", voix), ("sansvoix", sans)):
+         sf.write(os.path.join(dossier_sortie, f"{base}.{nom}.wav"), a, sr, subtype="FLOAT")
+      etat["k"] += 1
+      print(f"BLK {base} {deb} {deb + len(voix)}", flush=True)
+      if not pret:
+         del SUIVIS[base]
+         print(f"OK {base}", flush=True)
+   except Exception:
+      SUIVIS.pop(base, None)
+      raise
+   finally:
+      pic_vram()
 
 # The peak device memory torch reserved since the last report, in GiB, as "VRAM <GiB>" on stdout; then the peak starts over. Nothing without a GPU.
 def pic_vram():
@@ -430,7 +546,8 @@ def appareil():
    return 0
 
 # Mode serveur : une requête par ligne sur stdin (cf. docstring). Une erreur de lot est signalée ("ERR ...") sans tuer le worker : l'appelant décide.
-def serveur(separe_lot):
+# suivi = the engine's GRID and BLK (pymss), None under MSST: it separates whole elements only.
+def serveur(separe_lot, suivi=None):
    import traceback
    sys.stdin.reconfigure(encoding="utf-8"); sys.stdout.reconfigure(encoding="utf-8")       # Chemins accentués dans les requêtes : UTF-8 dans les deux sens, quel que soit le code page du lanceur (Windows : cp1252 sinon)
    print("PRET", flush=True)
@@ -441,15 +558,39 @@ def serveur(separe_lot):
       if ligne == "QUIT":
          break
       champs = ligne.split("\t")
-      if champs[0] != "SEP" or len(champs) < 3:
+      if champs[0] == "SEP" and len(champs) >= 3:
+         requete = lambda: separe_lot(champs[1], champs[2:])
+      elif champs[0] == "GRID" and len(champs) == 2:
+         requete = lambda: (suivi or _sans_suivi)[0](int(champs[1]))
+      elif champs[0] == "BLK" and len(champs) >= 7:
+         requete = lambda: (suivi or _sans_suivi)[1](champs[1], champs[2], int(champs[3]), int(champs[4]), champs[5] == "1", champs[6:])
+      elif champs[0] == "DROP" and len(champs) == 2:
+         requete = lambda: SUIVIS.pop(champs[1], None)
+      else:
          print(f"ERR requête invalide : {ligne[:80]}", flush=True); continue
+      echec = None
       try:
-         separe_lot(champs[1], champs[2:])
+         requete()
          print("FIN", flush=True)
       except Exception as ex:
          traceback.print_exc()
-         print(f"ERR {type(ex).__name__}: {ex}".replace("\n", " "), flush=True)
+         echec = f"ERR {type(ex).__name__}: {ex}".replace("\n", " ")
+      if echec is not None:                                                     # Out of the except: the exception and the tensors of its trace are let go before the cache is emptied
+         libere()
+         print(echec, flush=True)
    return 0
+
+def _refuse_suivi(*_):
+   raise RuntimeError("the MSST engine separates whole elements only")
+_sans_suivi = (_refuse_suivi, _refuse_suivi)
+
+# What a failed request left on the device goes back to it (after an out-of-memory above all), if torch was ever loaded.
+def libere():
+   if "torch" in sys.modules:
+      import gc, torch
+      gc.collect()
+      if torch.cuda.is_available():
+         torch.cuda.empty_cache()
 
 def main():
    if sys.argv[1:] == ["--device"]:
@@ -487,11 +628,14 @@ def main():
          if not msst: msst.append(charge(msst_dir, config, checkpoint, model_type, bigshifts, use_tta, module, overlap, batch))
          separe(msst[0], sortie, [e], bigshifts, use_tta, i, n)
       separe_lot = lambda sortie, lot: separe_pymss(moteur, sortie, lot, use_tta, secours)
+      suivi = (lambda sr: grille_suivi(moteur, sr),
+               lambda sortie, base, sr, tient, entier, lot: bloc_suivi(moteur, sortie, base, sr, tient, entier, lot, use_tta))
    else:
       ctx = charge(msst_dir, config, checkpoint, model_type, bigshifts, use_tta, module, overlap, batch)
       separe_lot = lambda sortie, lot: separe(ctx, sortie, lot, bigshifts, use_tta)
+      suivi = None
    if persistant:
-      return serveur(separe_lot)
+      return serveur(separe_lot, suivi)
    separe_lot(dossier_sortie, entrees)                                          # Mode historique : un lot, un process
    return 0
 
