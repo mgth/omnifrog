@@ -220,6 +220,8 @@ impl Run {
                 self.push_log(format!("── {number}/{total} {label}"));
             }
             Event::Message { text } => self.push_log(text),
+            // Never sent here: the task keeps traces for the run's log.
+            Event::Trace { .. } => {}
             Event::Fraction {
                 what,
                 done,
