@@ -54,7 +54,9 @@
 //! time — a GPU never separates two things at once (see [`Lock`]) — and
 //! the original comes first: its block when one is ready, its line when
 //! there is time for one more, and a block of the dub only when it ends,
-//! with room to spare, before the original's next one is ready. That room
+//! with room to spare, before the original's next one is ready — and the
+//! dub's line, which stays open for as long as a channel taken could still
+//! be half made by the decode's end, not the original's two blocks. That room
 //! is the original's slack, which it needs: the extraction does not write
 //! at one rate, and where the video is lighter the film comes faster — on
 //! a film, a dub served whenever the original had nothing ready cost the
@@ -434,6 +436,35 @@ impl Trend {
             ..Self::default()
         };
     }
+}
+
+/// How far ahead of the next pass in `common`'s line the extraction may be,
+/// in blocks, for a machine to still take it. The original's, [`BEHIND`]: a
+/// pass taken later starts too far behind to keep up. The dub's, as long as
+/// a channel taken then could still be [`DUB_KEPT`] made by the decode's
+/// end: it only has the gaps the original leaves, so starting behind costs
+/// the original nothing, and the dub's line opens to a machine only once
+/// the original's has closed there.
+fn intake_window(common: &Common, grid: Grid) -> u64 {
+    match common.stage {
+        Stage::Dub if common.whole > 0 => {
+            BEHIND.max(((1.0 - DUB_KEPT) * grid.blocks(common.whole) as f64) as u64)
+        }
+        _ => BEHIND,
+    }
+}
+
+/// Whether a block of the dub that costs `cost` frames of the extraction
+/// fits in a `gap` of frames before the original's next block is ready,
+/// with the room [`DUB_FIT`] keeps for the original.
+fn dub_fits(cost: u64, gap: u64) -> bool {
+    cost as f64 * DUB_FIT <= gap as f64
+}
+
+/// Whether a channel of the dub with `blocks` of its `total` made when the
+/// decode ends is finished by the machine that followed it ([`DUB_KEPT`]).
+fn dub_kept(blocks: u64, total: u64) -> bool {
+    blocks > 0 && blocks as f64 >= DUB_KEPT * total as f64
 }
 
 /// Whether an element `written` frames into a film of `whole` is kept
@@ -976,14 +1007,25 @@ impl<'a> Follower<'a> {
             }
             let (kept, gone): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut machine.streams)
                 .into_iter()
-                .partition(|stream| {
-                    stream.blocks > 0
-                        && (common.stage == Stage::Original
-                            || grid.is_some_and(|grid| {
-                                stream.blocks as f64 >= DUB_KEPT * grid.blocks(stream.length) as f64
-                            }))
+                .partition(|stream| match common.stage {
+                    Stage::Original => stream.blocks > 0,
+                    Stage::Dub => {
+                        grid.is_some_and(|grid| dub_kept(stream.blocks, grid.blocks(stream.length)))
+                    }
                 });
             for stream in gone {
+                if stream.blocks > 0 {
+                    self.trace(
+                        device,
+                        format!(
+                            "the decode is over: {} let go, {}: it is made whole after the \
+                             extraction",
+                            traced(common.stage, &stream.base),
+                            stream.describe()
+                        ),
+                        progress,
+                    );
+                }
                 common.made(stream.pass, None, progress);
                 machine.let_go(stream);
             }
@@ -1093,6 +1135,18 @@ impl<'a> Follower<'a> {
                     if !may_take || !sides[s].open {
                         continue;
                     }
+                    // The dub takes another only while what it has is not
+                    // behind: its gaps would not make that one too.
+                    if common.stage == Stage::Dub
+                        && sides[s].machine.as_ref().is_some_and(|machine| {
+                            machine
+                                .streams
+                                .iter()
+                                .any(|stream| grid.ready(stream.held()) >= stream.blocks + BEHIND)
+                        })
+                    {
+                        continue;
+                    }
                     match self.intake(common, grid) {
                         Ok(Some(stream)) => {
                             if let Some(idle) = idle.take() {
@@ -1121,11 +1175,12 @@ impl<'a> Follower<'a> {
                             self.trace(
                                 device,
                                 format!(
-                                    "takes no more{}: the line is empty, or {BEHIND} blocks behind",
+                                    "takes no more{}: the line is empty, or {} blocks behind",
                                     match common.stage {
                                         Stage::Original => "",
                                         Stage::Dub => " of the dub",
-                                    }
+                                    },
+                                    intake_window(common, grid)
                                 ),
                                 progress,
                             );
@@ -1139,7 +1194,7 @@ impl<'a> Follower<'a> {
                 }
                 if s == 1 {
                     let cost = sides[1].cost.or(sides[0].cost).unwrap_or(0);
-                    if cost as f64 * DUB_FIT > gap as f64 {
+                    if !dub_fits(cost, gap) {
                         continue;
                     }
                 }
@@ -1206,7 +1261,7 @@ impl<'a> Follower<'a> {
                         common.made(stream.pass, None, progress);
                         progress(Event::message(format!(
                             "  {prefix}{}: {why}; it is separated after the extraction",
-                            stream.base
+                            traced(common.stage, &stream.base)
                         )));
                         machine.let_go(stream);
                         if s == 0 {
@@ -1247,6 +1302,9 @@ impl<'a> Follower<'a> {
             } else {
                 self.wait(device);
             }
+        }
+        if let Some(idle) = idle.take() {
+            self.trace_idle(device, sides, commons, idle, progress);
         }
     }
 
@@ -1492,9 +1550,11 @@ impl<'a> Follower<'a> {
         let who = &remote.host;
         let first = if wanted[0] { 0 } else { 1 };
         let ssh = Ssh::new(who).stopped_by(self.stops[first][device].clone());
+        let mut said: Option<usize> = None;
         let fit = match remote::probe(remote, &ssh) {
             Err(why) => {
                 let _ = sender.send((first, Err(why)));
+                said = Some(first);
                 false
             }
             Ok(probe) => match probe.unfit() {
@@ -1516,6 +1576,9 @@ impl<'a> Follower<'a> {
         let mut beside: Option<Seat> = None;
         let mut asked = fit;
         for s in stages {
+            if said == Some(s) {
+                continue;
+            }
             if !asked {
                 let _ = sender.send((s, Ok(None)));
                 continue;
@@ -1568,7 +1631,7 @@ impl<'a> Follower<'a> {
     }
 
     /// The next pass in line, for a machine that has time for one more,
-    /// while it would start fewer than [`BEHIND`] blocks behind the
+    /// while it would start less than [`intake_window`] behind the
     /// extraction; `None` once the line is empty or that far behind.
     fn intake(&self, common: &Common, grid: Grid) -> Result<Option<Stream>> {
         let mut line = common.line.lock().unwrap_or_else(|p| p.into_inner());
@@ -1580,7 +1643,7 @@ impl<'a> Follower<'a> {
             .map(|path| wav::frames(path))
             .min()
             .unwrap_or(0);
-        if grid.ready(held) >= BEHIND {
+        if grid.ready(held) >= intake_window(common, grid) {
             return Ok(None);
         }
         line.pop_front();
@@ -1746,8 +1809,9 @@ impl Followed {
     }
 
     /// What its workers hold on each machine while they wait for their
-    /// step: for another step's workers to stand beside.
-    pub fn beside(&self) -> Beside {
+    /// step: for another step's workers to stand beside. A worker gone is
+    /// no longer there to stand beside.
+    pub fn beside(&mut self) -> Beside {
         let devices = self
             .machines
             .iter()
@@ -1758,10 +1822,13 @@ impl Followed {
             lock: None,
             seats: vec![None; devices],
         };
-        for machine in &self.machines {
-            let Some(worker) = &machine.worker else {
+        for machine in &mut self.machines {
+            let Some(worker) = machine.worker.as_mut() else {
                 continue;
             };
+            if !worker.is_alive() {
+                continue;
+            }
             match machine.device {
                 0 => beside.lock = worker.lock(),
                 d => beside.seats[d] = worker.seat(),
@@ -2286,10 +2353,6 @@ mod tests {
             .map(Duration::from_millis);
         let args: Vec<String> = std::env::args().collect();
         let fail = std::env::var(MOCK_FAIL).ok();
-        let die = match args.iter().any(|arg| arg == "--beside") {
-            true => std::env::var(MOCK_DIE_BESIDE).ok(),
-            false => std::env::var(MOCK_DIE).ok(),
-        };
         let hang = std::env::var(MOCK_HANG).ok();
         let whole_only = std::env::var_os(MOCK_WHOLE_ONLY).is_some();
         // A list of `<base>:<block>`, `*` for any base.
@@ -2320,14 +2383,33 @@ mod tests {
             say("VRAM 0.00 24.00");
             return 0;
         }
+        // As a remote's worker: the seat the remote's own rules give its run
+        // (`remote::seat`), under locks of its own, held until it ends.
+        let mut second = false;
+        let mut _seat = None;
         if args.iter().any(|arg| arg == "remote-worker") {
             if std::env::var_os(MOCK_BUSY).is_some() {
                 say("BUSY another run has its GPU");
                 return 0;
             }
             let mut dir = PathBuf::from(std::env::var_os(MOCK_DIR).expect("the mock's directory"));
+            let run = args
+                .iter()
+                .position(|arg| arg == "--run")
+                .and_then(|at| args.get(at + 1))
+                .cloned();
+            match remote::seat(&dir.with_extension("locks"), run.as_deref()) {
+                Ok((lock, seat)) => {
+                    second = remote::seat_of(&seat.to_string_lossy()) == Seat::Second;
+                    _seat = Some(lock);
+                }
+                Err(why) => {
+                    say(&format!("BUSY {why}"));
+                    return 0;
+                }
+            }
             // The second seat has files of its own.
-            if args.iter().any(|arg| arg == "--beside") {
+            if second {
                 dir.as_mut_os_string().push("-beside");
             }
             for sub in ["in", "out"] {
@@ -2335,6 +2417,10 @@ mod tests {
             }
             say(&format!("DIR {}", dir.display()));
         }
+        let die = match second {
+            true => std::env::var(MOCK_DIE_BESIDE).ok(),
+            false => std::env::var(MOCK_DIE).ok(),
+        };
         say("PRET");
         let mut streams: HashMap<String, (u64, Option<Stems>)> = HashMap::new();
         for line in std::io::stdin().lock().lines() {
@@ -3077,9 +3163,10 @@ mod tests {
         film.rename(&dir);
         let made = [&handed.original, &handed.dub].map(|f| f.as_ref().map_or(0.0, Followed::made));
         said.extracted();
+        let mut handed = handed;
         let beside = handed
             .dub
-            .as_ref()
+            .as_mut()
             .map(Followed::beside)
             .unwrap_or_default();
         bench.separate(&job, handed.original, &beside, &envs[0], &progress);
@@ -3278,6 +3365,22 @@ mod tests {
         assert_eq!(trend.needed(), 1);
         assert_eq!(trend.made(130, 2), Round::Opened);
         assert_eq!(Trend::default().needed(), STUCK);
+    }
+
+    #[test]
+    fn the_dub_has_a_gap_with_room_to_spare_and_is_kept_half_made() {
+        // A block of 100 frames needs 125 before the original's next.
+        assert!(dub_fits(100, 125));
+        assert!(!dub_fits(100, 124));
+        assert!(!dub_fits(1, 0));
+        assert!(dub_fits(0, 0));
+        // Half of a channel's blocks made: finished by that machine.
+        assert!(dub_kept(5, 10));
+        assert!(!dub_kept(4, 10));
+        assert!(dub_kept(6, 11));
+        assert!(!dub_kept(5, 11));
+        // Nothing made: never kept.
+        assert!(!dub_kept(0, 0));
     }
 
     #[test]
@@ -3608,8 +3711,45 @@ mod tests {
     /// eight blocks while the extraction writes one keeps the original's
     /// four elements and follows some of the dub in the time left; nothing
     /// is let go.
+    /// **The dub's line outlives the original's.** Eight elements and a
+    /// machine slow through the first two blocks of film: the original's
+    /// line closes with elements still in it. The machine is then far
+    /// faster than the original needs, and the dub takes its channels in
+    /// those gaps, though the film is past the original's two blocks.
+    #[test]
+    fn the_dub_takes_its_channels_after_the_original_s_line_closed() {
+        let bench = Bench::new("dub-late");
+        let film = Film::objects(8, 160_000).dubbed();
+        let whole = bench.whole(&film, Pairs::default());
+        let per_chunk = |n: usize| if n < 8 { 1.0 } else { 6.0 };
+        let ran = follow_with(
+            &bench,
+            &film,
+            Pairs::default(),
+            [Vec::new(), Vec::new()],
+            STEP / 4,
+            Duration::ZERO,
+            true,
+            Some(&per_chunk),
+        );
+        let said = &ran.said;
+        assert!(
+            said.any("  follow, this machine: takes no more: "),
+            "{}",
+            said.lines()
+        );
+        assert!(
+            said.any("  follow, this machine: takes the dub's "),
+            "{}",
+            said.lines()
+        );
+        assert!(ran.made[1] > 1.0, "{:?}\n{}", ran.made, said.lines());
+        same(&ran.outputs, &whole);
+    }
+
     #[test]
     fn the_dub_has_the_gaps_the_original_leaves() {
+        // (See also the case where the original's line closes first, below.)
         let said = held_to("dub-gaps", STEP / 4, &|_| 2.0, true);
         assert!(
             said.any("during the extraction: 4 of the original's 4 elements followed"),
@@ -3697,6 +3837,11 @@ mod tests {
             dub: true,
             ..Pairs::default()
         };
+        // The pipeline does not hand the follower the dub in pairs.
+        let mut config = bench.config.clone();
+        config.inference.engine = Engine::Pymss;
+        assert!(follows(&config) && !follows_dub(&config, pairs));
+        assert!(follows_dub(&config, Pairs::default()));
         let film = Film::objects(3, 60_000).dubbed();
         let whole = bench.whole(&film, pairs);
         let ran = follow_with(
@@ -3709,6 +3854,7 @@ mod tests {
             true,
             None,
         );
+        // And handed it anyway, the follower leaves it to its step.
         assert!(
             ran.said
                 .any("the dub's channels are separated in pairs: after the extraction"),

@@ -483,12 +483,10 @@ impl Worker {
         let json = |value: std::result::Result<String, serde_json::Error>| {
             value.map_err(|e| Error::msg(format!("the request for {}: {e}", remote.host)))
         };
-        let seat = match beside {
-            Some(Seat::First) => Seat::Second,
-            _ => Seat::First,
-        };
-        let mut line = format!(
-            "{} remote-worker {} {} {}",
+        // The remote gives this run's worker whichever seat is free there,
+        // and none while another run has either.
+        let line = format!(
+            "{} remote-worker {} {} {} --run {}",
             remote.command,
             remote::quote(&json(serde_json::to_string(model))?),
             remote::quote(&json(serde_json::to_string(&inference))?),
@@ -496,11 +494,9 @@ impl Worker {
                 0.0
             } else {
                 remote.idle_below_gib
-            }
+            },
+            remote::quote(remote::run_id())
         );
-        if seat == Seat::Second {
-            line.push_str(" --beside");
-        }
         progress(Event::message(format!(
             "loading {} on {}",
             model.name, remote.host
@@ -508,7 +504,7 @@ impl Worker {
         let far = Far {
             ssh: ssh.clone(),
             host: remote.host.clone(),
-            seat,
+            seat: Seat::First,
             dir: None,
             sent: Vec::new(),
         };
@@ -518,6 +514,9 @@ impl Worker {
         match worker.wait_ready(progress)? {
             Some(why) => Ok(Started::Busy(why)),
             None if worker.remote.as_ref().is_some_and(|far| far.dir.is_some()) => {
+                if let Some(far) = &mut worker.remote {
+                    far.seat = remote::seat_of(far.dir());
+                }
                 Ok(Started::Ready(Box::new(worker)))
             }
             None => Err(worker.died("the remote did not say where its files go")),
@@ -1119,11 +1118,23 @@ pub struct Lock {
 }
 
 /// The lock file of the machine's separations.
-const LOCK: &str = ".separating.lock";
+pub(crate) const LOCK: &str = ".separating.lock";
+/// The lock of a remote's second seat: a run's second worker there, beside
+/// its first (see [`crate::remote`]).
+pub(crate) const LOCK_BESIDE: &str = ".separating-beside.lock";
 
 impl Lock {
+    /// The machine's lock, for a run on this machine: refused while another
+    /// run holds it, or has a second worker here — another machine's run,
+    /// whose first worker may be gone (see [`crate::remote`]).
     pub fn take(work_dir: &Path) -> Result<Self> {
-        Self::take_named(work_dir, LOCK)
+        let lock = Self::take_named(work_dir, LOCK)?;
+        if Self::held_by(work_dir, LOCK_BESIDE).is_some() {
+            return Err(Error::msg(
+                "another run's second worker is separating; wait for it to finish",
+            ));
+        }
+        Ok(lock)
     }
 
     /// The same lock, for another worker of the run that holds it.
@@ -1133,24 +1144,33 @@ impl Lock {
         }
     }
 
-    /// Whether some process holds the machine's lock now. Looked at without
-    /// keeping it, or writing in it.
-    pub fn held(work_dir: &Path) -> bool {
-        let path = work_dir.join(LOCK);
-        match fs::OpenOptions::new()
+    /// Who holds the lock `name` in `work_dir` now: `None` when nobody does;
+    /// otherwise the run it was taken for ([`Lock::take_for`]), empty when it
+    /// was taken for none. Looked at without keeping it, or creating it.
+    pub(crate) fn held_by(work_dir: &Path, name: &str) -> Option<String> {
+        let path = work_dir.join(name);
+        let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(&path)
-        {
-            Ok(file) => matches!(lock(&file), Err(fs::TryLockError::WouldBlock)),
-            Err(_) => false,
+            .ok()?;
+        match lock(&file) {
+            Err(fs::TryLockError::WouldBlock) => {
+                let text = fs::read_to_string(&path).unwrap_or_default();
+                Some(text.lines().nth(1).unwrap_or_default().trim().to_string())
+            }
+            _ => None,
         }
     }
 
     /// The lock on `name` in `work_dir`.
     pub(crate) fn take_named(work_dir: &Path, name: &str) -> Result<Self> {
+        Self::take_for(work_dir, name, None)
+    }
+
+    /// The lock on `name` in `work_dir`, its file saying which `run` took
+    /// it, under the process's id, for [`Lock::held_by`].
+    pub(crate) fn take_for(work_dir: &Path, name: &str, run: Option<&str>) -> Result<Self> {
         fs::create_dir_all(work_dir).map_err(|e| Error::io(work_dir, e))?;
         let path = work_dir.join(name);
         let mut file = fs::OpenOptions::new()
@@ -1164,6 +1184,9 @@ impl Lock {
             Ok(()) => {
                 let _ = file.set_len(0);
                 let _ = writeln!(file, "{}", std::process::id());
+                if let Some(run) = run {
+                    let _ = writeln!(file, "{run}");
+                }
                 let _ = file.flush();
                 Ok(Self {
                     _file: Arc::new(file),
@@ -1173,7 +1196,7 @@ impl Lock {
                 let holder = fs::read_to_string(&path).unwrap_or_default();
                 Err(Error::msg(format!(
                     "another run is separating{}; wait for it to finish",
-                    match holder.trim() {
+                    match holder.lines().next().unwrap_or_default().trim() {
                         "" => String::new(),
                         pid => format!(" (process {pid})"),
                     }

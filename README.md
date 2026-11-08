@@ -280,7 +280,9 @@ extraction's time takes in at most the end of the block in flight.
 **The dub, in the time the original leaves.** Following the original rarely keeps a GPU busy all
 through the extraction (about 80 % of it, measured with a 9070 XT and a 7900 XTX on a 1 h 46
 film), and the dub's channels grow in step with it. So each machine also loads the dub's model, in
-a second worker, and follows the dub's channels block by block, from a line of their own. The
+a second worker, and follows the dub's channels block by block, from a line of their own — open
+for as long as a channel taken could still be half made by the end of the decode, not only the
+original's first two blocks of film, and to a machine whose channels are not behind. The
 machine drives its two workers one request at a time, and the original comes first: its block
 whenever one is ready, its line whenever there is time for one more, and a block of the dub only
 when it would end, with a quarter to spare, before the original's next one is ready — by what a
@@ -293,9 +295,11 @@ made when the decode ends is finished by the machine that followed it, in the du
 it takes from the line, and one less made is made whole by any. Its comparison of the voices and
 its measure of the dialogue run on the finished channels, as before, and a channel comes out the
 same followed or made whole. On the same 9070 XT, with a desktop holding 7.3 GiB of it, the two
-workers took it to 14.8 GiB of 16.3. On a remote, the second worker takes a second seat beside the
-first (`remote-worker --beside`): a remote of an earlier version speaks another protocol, and is
-left out until it is updated.
+workers took it to 14.8 GiB of 16.3. On a remote, each worker says which run it is for
+(`remote-worker … --run <id>`), and the remote gives it whichever of its two seats is free, each with
+a lock of its own: the second only beside the same run's first, and neither to another run while
+this one has a worker there — even once its first is gone and its second still separates. A remote
+of an earlier version speaks another protocol, and is left out of every step until it is updated.
 
 Not followed: anything under MSST or on a CPU, the original in pairs when it has objects — those
 are paired by where each one is over the whole film — and the dub in pairs.

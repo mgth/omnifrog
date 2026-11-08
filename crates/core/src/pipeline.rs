@@ -279,7 +279,7 @@ fn run_logged(
                 // The dub's followers wait for their step beside this one.
                 let beside = followed
                     .dub
-                    .as_ref()
+                    .as_mut()
                     .map(separate::Followed::beside)
                     .unwrap_or_default();
                 let done = separate::original(
