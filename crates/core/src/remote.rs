@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn a_seat_chosen_before_the_other_changed_is_given_back() {
         use crate::worker::soon;
-        let work = std::env::temp_dir().join(format!("omnifrog-stale-{}", std::process::id()));
+        let work = std::env::temp_dir().join(format!("omnifrog-stale-seat-{}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         let (a, b) = (Some("run-a"), Some("run-b"));
         // Run b found both seats free and goes for the first; run a got
