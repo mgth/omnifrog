@@ -88,6 +88,10 @@ pub struct Follower<'a> {
     stop: Stop,
     end: Mutex<End>,
     changed: Condvar,
+    /// The times it found nothing to do: the tests' extraction keeps in step
+    /// with it.
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -110,6 +114,8 @@ impl<'a> Follower<'a> {
             stop: Stop::new(),
             end: Mutex::new(End::default()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            waits: Default::default(),
         }
     }
 
@@ -119,6 +125,13 @@ impl<'a> Follower<'a> {
 
     fn decode_ended(&self) -> Option<bool> {
         self.end().decoded
+    }
+
+    /// Nothing to do: up to a poll, or until the decode ends.
+    fn wait(&self) {
+        #[cfg(test)]
+        self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pause(self.poll);
     }
 
     /// Up to `timeout`, or until the decode ends.
@@ -195,7 +208,7 @@ impl<'a> Follower<'a> {
             if fresh && let Ok(master) = MasterSet::read(&header) {
                 break master;
             }
-            self.pause(self.poll);
+            self.wait();
         };
         let elements = elements_of(&master);
         let units: Vec<Unit> = elements
@@ -253,7 +266,7 @@ impl<'a> Follower<'a> {
                     "the original is separated after the extraction: {why}"
                 )));
                 while self.decode_ended().is_none() {
-                    self.pause(self.poll);
+                    self.wait();
                 }
                 return Ok(Some(followed));
             }
@@ -307,7 +320,7 @@ impl<'a> Follower<'a> {
             let ready = (0..followed.streams.len())
                 .find(|&i| held[i] >= grid.ready_at(followed.streams[i].blocks));
             let Some(i) = ready else {
-                self.pause(self.poll);
+                self.wait();
                 continue;
             };
             let (worker, stream) = followed.split(i)?;
@@ -329,7 +342,7 @@ impl<'a> Follower<'a> {
         // Everything let go, the worker waits all the same: the next step
         // gets it loaded.
         while self.decode_ended().is_none() {
-            self.pause(self.poll);
+            self.wait();
         }
         if self.decode_ended() != Some(true) {
             return Ok(None);
@@ -382,6 +395,11 @@ impl<'a> Follower<'a> {
             poll,
             ..Self::new(config, job, model, pairs)
         }
+    }
+
+    #[cfg(test)]
+    fn waits(&self) -> u64 {
+        self.waits.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1102,7 +1120,7 @@ mod tests {
         /// harletty writes them — and the header after the first chunk.
         /// `until` cuts it short; `begun` is waited for after the first
         /// chunk, so a slow machine starting the mock does not find the
-        /// extraction over.
+        /// extraction over, and `in_step` after every chunk.
         fn grow(
             &self,
             dir: &Path,
@@ -1110,6 +1128,7 @@ mod tests {
             pause: Duration,
             until: Option<u64>,
             begun: &dyn Fn() -> bool,
+            in_step: Option<&dyn Fn()>,
         ) {
             fs::create_dir_all(dir).unwrap();
             let raw = |n: usize| dir.join(format!("{}{n}.wav", extract::RAW));
@@ -1137,6 +1156,9 @@ mod tests {
                     while !begun() && std::time::Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(1));
                     }
+                }
+                if let Some(in_step) = in_step {
+                    in_step();
                 }
                 at = to;
                 std::thread::sleep(pause);
@@ -1285,7 +1307,10 @@ mod tests {
     }
 
     /// Follow `film` as it grows, then separate it: what was followed, the
-    /// outputs, and what the run said.
+    /// outputs, and what the run said. `in_step`, the extraction writes a
+    /// chunk once the follower made every block the last one let it make, so
+    /// that what is followed does not depend on how fast the machine is;
+    /// otherwise it writes one every `pause`.
     fn follow(
         bench: &Bench,
         film: &Film,
@@ -1293,6 +1318,7 @@ mod tests {
         env: Vec<(&'static str, String)>,
         chunk: u64,
         pause: Duration,
+        in_step: bool,
     ) -> (f64, Outputs, Arc<Said>) {
         let job = bench.job("followed", pairs);
         let said = Arc::new(Said::default());
@@ -1309,9 +1335,28 @@ mod tests {
         let dir = job.extract_dir();
         let followed = std::thread::scope(|scope| {
             let following = scope.spawn(|| follower.follow(&progress));
-            film.grow(&dir, chunk, pause, None, &|| {
-                said.any("as the extraction writes it") || said.any("known once it is read")
-            });
+            let begun =
+                || said.any("as the extraction writes it") || said.any("known once it is read");
+            // Caught up once it found nothing to do twice since the chunk was
+            // written: the second time, it had seen the chunk. A follower that
+            // never is gets a minute, then the extraction runs on.
+            let late = std::cell::Cell::new(false);
+            let caught_up = || {
+                let seen = follower.waits();
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !late.get() && follower.waits() < seen + 2 && !following.is_finished() {
+                    late.set(std::time::Instant::now() >= deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            };
+            film.grow(
+                &dir,
+                chunk,
+                pause,
+                None,
+                &begun,
+                in_step.then_some(&caught_up as &dyn Fn()),
+            );
             follower.decoded(true);
             following.join().unwrap()
         });
@@ -1354,6 +1399,7 @@ mod tests {
             Vec::new(),
             2_000,
             Duration::from_millis(2),
+            true,
         );
         assert!(
             made > 1.0,
@@ -1392,6 +1438,7 @@ mod tests {
             Vec::new(),
             2_000,
             Duration::from_millis(2),
+            true,
         );
         assert!(made > 0.5, "{made}\n{}", said.lines());
         same(&followed, &whole);
@@ -1407,6 +1454,7 @@ mod tests {
             Vec::new(),
             2_000,
             Duration::from_millis(1),
+            true,
         );
         assert_eq!(made, 0.0);
         assert!(said.any("known once it is read"), "{}", said.lines());
@@ -1428,6 +1476,7 @@ mod tests {
             env,
             4_000,
             Duration::from_millis(1),
+            false,
         );
         assert!(
             said.any("does not keep up with the extraction"),
@@ -1450,6 +1499,7 @@ mod tests {
             env,
             2_000,
             Duration::from_millis(2),
+            true,
         );
         assert!(said.any("11: the separation failed: RuntimeError: the mock fails here; it is separated after the extraction"), "{}", said.lines());
         same(&followed, &whole);
@@ -1537,6 +1587,7 @@ mod tests {
                 Duration::from_millis(2),
                 Some(40_000),
                 &|| said.any("as the extraction writes it"),
+                None,
             );
             follower.decoded(false);
             following.join().unwrap()
