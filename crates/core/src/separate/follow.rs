@@ -21,8 +21,9 @@
 //! whole after the extraction, by any machine, like the elements nobody
 //! followed. A remote is sent what its inputs gained before each block, and
 //! its stems come back after it; one that is busy or left out follows
-//! nothing, and one still loading its model when the decode ends is let go
-//! rather than hold the extraction's end up.
+//! nothing, and one still loading its model when the decode ends, or still
+//! on a block [`FAR_GRACE`] later, is let go rather than hold the
+//! extraction's end up: what it followed is made whole after it.
 //!
 //! **The same stems.** The worker cuts an element by a plan that is a
 //! function of its length alone, whole or growing, and fades one block into
@@ -77,6 +78,15 @@ const BEHIND: u64 = 2;
 /// How much older than the follower a master set's header may look and
 /// still be this extraction's: some file systems keep coarse times.
 const FRESH: Duration = Duration::from_secs(2);
+/// How long a remote may still take over the block it is on when the
+/// decode ends — seconds, normally — before it is let go: one that hangs
+/// would otherwise hold the extraction's end, and every GPU, for as long as
+/// a worker is given between two words.
+const FAR_GRACE: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(60)
+};
 
 /// Whether this configuration separates the original during the extraction:
 /// under pymss, which cuts an element into blocks.
@@ -102,6 +112,11 @@ pub struct Follower<'a> {
     far_stops: Vec<Stop>,
     /// Per remote: its worker is loaded, and follows.
     following: Vec<AtomicBool>,
+    /// Per remote: it is done following.
+    over: Vec<AtomicBool>,
+    /// Per remote: let go, still on a block [`FAR_GRACE`] after the decode
+    /// ended.
+    late: Vec<AtomicBool>,
     end: Mutex<End>,
     changed: Condvar,
     /// Per machine, the times it found nothing to do once following: the
@@ -155,6 +170,8 @@ impl<'a> Follower<'a> {
             stop: Stop::new(),
             far_stops: (0..remotes).map(|_| Stop::new()).collect(),
             following: (0..remotes).map(|_| AtomicBool::new(false)).collect(),
+            over: (0..remotes).map(|_| AtomicBool::new(false)).collect(),
+            late: (0..remotes).map(|_| AtomicBool::new(false)).collect(),
             end: Mutex::new(End::default()),
             changed: Condvar::new(),
             #[cfg(test)]
@@ -199,8 +216,9 @@ impl<'a> Follower<'a> {
     /// makes no more requests — after the blocks in flight, which are worth
     /// having, or at once when the decode failed: every worker is killed and
     /// nothing they made is kept. A remote still loading its model is let go
-    /// rather than hold the extraction's end up: the separation starts it
-    /// again. Called again, it only waits.
+    /// rather than hold the extraction's end up, and so is one still on its
+    /// block [`FAR_GRACE`] later: the separation makes what it followed
+    /// whole. Called again, it only waits.
     pub fn decoded(&self, ok: bool) {
         let mut end = self.end();
         if end.decoded.is_none() {
@@ -214,6 +232,19 @@ impl<'a> Follower<'a> {
                 }
             }
             self.changed.notify_all();
+        }
+        let (waited, _) = self
+            .changed
+            .wait_timeout_while(end, FAR_GRACE, |end| !end.quiet)
+            .unwrap_or_else(|p| p.into_inner());
+        end = waited;
+        if !end.quiet {
+            for (remote, stop) in self.far_stops.iter().enumerate() {
+                if !self.over[remote].load(Ordering::SeqCst) {
+                    self.late[remote].store(true, Ordering::SeqCst);
+                    stop.raise();
+                }
+            }
         }
         while !end.quiet {
             end = self.changed.wait(end).unwrap_or_else(|p| p.into_inner());
@@ -389,11 +420,23 @@ impl<'a> Follower<'a> {
     /// elements to be separated after the extraction.
     fn machine(&self, device: usize, common: &Common, progress: Progress) -> Option<Machine> {
         let followed = self.follow_on(device, common, progress);
+        if device > 0 {
+            self.over[device - 1].store(true, Ordering::SeqCst);
+        }
         // Done: the tests' extraction no longer waits for it.
         #[cfg(test)]
         self.waits[device].store(tests::DONE, Ordering::SeqCst);
         match followed {
             Ok(machine) => machine,
+            Err(_) if device > 0 && self.late[device - 1].load(Ordering::SeqCst) => {
+                progress(Event::message(format!(
+                    "{}: still on a block {} s after the extraction ended: let go; what it \
+                     followed is separated after the extraction",
+                    name_of(self.config, device),
+                    FAR_GRACE.as_secs()
+                )));
+                None
+            }
             // The decode failed, or the remote was still loading its model
             // as it ended: nothing to say.
             Err(_) if self.stop_of(device).raised() => None,
@@ -1093,7 +1136,8 @@ mod tests {
     const MOCK_DIR: &str = "OMNIFROG_MOCK_DIR";
     /// Set, the mock as a remote's `remote-worker` says its GPU is busy.
     const MOCK_BUSY: &str = "OMNIFROG_MOCK_BUSY";
-    /// `<base>:<block>`: the block the mock hangs on, as a GPU that stalls.
+    /// `<base>:<block>`, `*` for any: the block the mock hangs on, as a GPU
+    /// that stalls.
     const MOCK_HANG: &str = "OMNIFROG_MOCK_HANG";
     /// The mock's grid, in frames: a block's step, the fade, the lookahead.
     const STEP: u64 = 8_000;
@@ -1310,7 +1354,9 @@ mod tests {
                     if die.as_deref() == Some(&format!("{base}:{k}")) {
                         std::process::exit(3);
                     }
-                    if hang.as_deref() == Some(&format!("{base}:{k}")) {
+                    if hang.as_deref() == Some(&format!("{base}:{k}"))
+                        || hang.as_deref() == Some(&format!("*:{k}"))
+                    {
                         std::thread::sleep(Duration::from_secs(600));
                     }
                     let from = k * STEP;
@@ -2117,6 +2163,42 @@ mod tests {
             )),
             "{}",
             said.lines()
+        );
+        same(&followed, &whole);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_hangs_during_the_extraction_is_let_go_when_it_ends() {
+        let mut bench = Bench::new("far-stalls");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        // The remote hangs on the first block of what it takes; the
+        // extraction runs on without it.
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_HANG, "*:0".to_string())])];
+        let started = std::time::Instant::now();
+        let (_, followed, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            false,
+        );
+        assert!(
+            said.any(&format!(
+                "{}: still on a block 1 s after the extraction ended: let go",
+                remote::SHELL
+            )),
+            "{}",
+            said.lines()
+        );
+        // Not the hour a worker is given between two words.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
         );
         same(&followed, &whole);
     }

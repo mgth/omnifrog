@@ -252,8 +252,10 @@ card that separates an element of a whole film in 107 s, a remote that does it i
 extraction of 15 minutes, this machine keeps about seven of thirteen and the remote about six (an
 estimate), and steps 1 to 3 go from about 35 minutes to about 24. When the decode ends, a followed
 element needs its last block or two: each machine finishes its own first, with the same worker —
-the model is loaded once for both steps — then takes what is left in line. What a remote takes too
-long to finish is made again here, whole, the first to finish keeping it, as with any pass. An
+the model is loaded once for both steps — then takes what is left in line. A remote still on a
+block a minute after the decode ended is let go, and what it followed is made whole; what a remote
+takes too long to finish afterwards is made again here, whole, the first to finish keeping it, as
+with any pass. An
 element comes out the same whether it was followed or made whole, and wherever: it is cut into
 blocks by its length alone, so the fades fall in the same places.
 Only one block's stems are on disk at a time; an element without its dialogue waits in float until
