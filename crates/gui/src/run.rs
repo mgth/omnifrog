@@ -67,7 +67,16 @@ pub struct Run {
     /// The most of the current step any fraction has shown, so the overall
     /// bar never goes back when a step moves to its next sub-task.
     step_best: f64,
+    /// The most of the whole run the overall bar has shown: a step started
+    /// early counts towards it, and the step before it is not quite whole
+    /// when it ends, so a step change would otherwise take a little back.
+    overall_best: f64,
     fraction: Option<Fraction>,
+    /// Later steps already under way beside the current one, by index into
+    /// [`Step::ALL`]: the original's separation during the extraction. A
+    /// fraction named after a step (see [`Step::labelled`]) is that step's,
+    /// whichever step it is reported in.
+    ahead: Vec<(usize, Fraction)>,
     pub log: VecDeque<String>,
 }
 
@@ -103,7 +112,9 @@ impl Run {
             step_started: Instant::now(),
             took: vec![None; Step::ALL.len()],
             step_best: 0.0,
+            overall_best: 0.0,
             fraction: None,
+            ahead: Vec::new(),
             log: VecDeque::new(),
         }
     }
@@ -158,6 +169,7 @@ impl Run {
         self.ending = Some((ending, at.saturating_duration_since(self.started)));
         self.worker = None;
         self.fraction = None;
+        self.ahead.clear();
     }
 
     fn push_log(&mut self, line: String) {
@@ -174,6 +186,13 @@ impl Run {
 
     /// Take in `event`, which the worker said `at`.
     fn heard(&mut self, event: Event, at: Instant) {
+        self.take(event, at);
+        if let Some(overall) = self.overall_now() {
+            self.overall_best = self.overall_best.max(overall);
+        }
+    }
+
+    fn take(&mut self, event: Event, at: Instant) {
         let took_line = event.took_line();
         match event {
             Event::Step {
@@ -187,6 +206,17 @@ impl Run {
                 self.step_started = at;
                 self.step_best = 0.0;
                 self.fraction = None;
+                // A step that started early carries on as the step's own
+                // bar, where it was: its rate so far was the step before's,
+                // so the time left is measured afresh.
+                if let Some(at_index) = self.ahead.iter().position(|(of, _)| *of == index) {
+                    let (_, mut early) = self.ahead.remove(at_index);
+                    early.since = at;
+                    early.from = early.value.unwrap_or(0.0);
+                    self.step_best = early.from;
+                    self.fraction = Some(early);
+                }
+                self.ahead.retain(|(of, _)| *of > index);
                 self.push_log(format!("── {number}/{total} {label}"));
             }
             Event::Message { text } => self.push_log(text),
@@ -205,6 +235,28 @@ impl Run {
                     (_, Unit::Bytes) => format!("{what} · {} MB", done >> 20),
                     _ => what.clone(),
                 };
+                let early = Step::labelled(&what)
+                    .map(|step| step.number() as usize - 1)
+                    .filter(|of| self.step.is_some_and(|now| *of > now));
+                if let Some(of) = early {
+                    match self.ahead.iter_mut().find(|(on, _)| *on == of) {
+                        Some((_, f)) => {
+                            f.value = value;
+                            f.text = text;
+                        }
+                        None => self.ahead.push((
+                            of,
+                            Fraction {
+                                what,
+                                value,
+                                text,
+                                since: at,
+                                from: value.unwrap_or(0.0),
+                            },
+                        )),
+                    }
+                    return;
+                }
                 if let Some(v) = value {
                     self.step_best = self.step_best.max(v);
                 }
@@ -244,12 +296,32 @@ impl Run {
         }
     }
 
-    /// The whole run, from 0 to 1, by the steps' weights.
+    /// The whole run, from 0 to 1, by the steps' weights, as far as it has
+    /// ever got.
     fn overall(&self) -> Option<f64> {
+        self.step.map(|_| self.overall_best)
+    }
+
+    /// The whole run now: the steps done, the current one, and what the
+    /// steps started early have made.
+    fn overall_now(&self) -> Option<f64> {
         let step = self.step?;
         let total: f64 = WEIGHTS.iter().sum();
         let before: f64 = WEIGHTS[..step].iter().sum();
-        Some(((before + WEIGHTS[step] * self.step_best) / total).clamp(0.0, 1.0))
+        let early: f64 = self
+            .ahead
+            .iter()
+            .map(|(of, f)| WEIGHTS[*of] * f.value.unwrap_or(0.0))
+            .sum();
+        Some(((before + WEIGHTS[step] * self.step_best + early) / total).clamp(0.0, 1.0))
+    }
+
+    /// How far a later step started early is, from 0 to 1.
+    fn early(&self, i: usize) -> Option<f64> {
+        self.ahead
+            .iter()
+            .find(|(of, _)| *of == i)
+            .map(|(_, f)| f.value.unwrap_or(0.0))
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
@@ -299,6 +371,24 @@ impl Run {
                 ui.spinner();
                 ui.weak(self.log.back().map(String::as_str).unwrap_or("starting…"));
             });
+        }
+        // Each step started early, as a bar of its own under the step's:
+        // the work goes on side by side, and so do the bars.
+        for (of, f) in &self.ahead {
+            let now = self.step.map_or(1, |now| now + 1);
+            let text = match f.value {
+                Some(v) => format!("{}. {} · {:.0} %", of + 1, f.text, v * 100.0),
+                None => format!("{}. {}", of + 1, f.text),
+            };
+            let mut bar = egui::ProgressBar::new(f.value.unwrap_or(0.0) as f32).text(text);
+            if f.value.is_none() {
+                bar = bar.animate(true);
+            }
+            ui.add(bar).on_hover_text(format!(
+                "step {} started while step {now} runs: it keeps pace with it, and carries on \
+                 as its own step from where it got to",
+                of + 1
+            ));
         }
         if let (Some(overall), true) = (self.overall(), self.active()) {
             ui.add(
@@ -365,11 +455,16 @@ impl Run {
                         ("▶", ui.visuals().selection.stroke.color)
                     }
                     (Some(now), _) if i == now => ("✖", Color32::from_rgb(230, 90, 80)),
+                    _ if self.active() && self.early(i).is_some() => {
+                        ("▶", ui.visuals().selection.stroke.color)
+                    }
                     _ => ("○", ui.visuals().weak_text_color()),
                 };
                 let mut text = format!("{mark} {}. {}", i + 1, step.label());
                 if let Some(took) = self.time_of(i) {
                     text.push_str(&format!(" · {}", clock(took)));
+                } else if let (Some(early), true) = (self.early(i), self.active()) {
+                    text.push_str(&format!(" · {:.0} %", early * 100.0));
                 }
                 let label = if Some(i) == self.step && self.active() {
                     RichText::new(text).color(color).strong()
@@ -381,6 +476,12 @@ impl Run {
                     response.on_hover_text(format!(
                         "in this step for {}",
                         clock(self.step_started.elapsed())
+                    ));
+                } else if let (Some(early), true) = (self.early(i), self.active()) {
+                    response.on_hover_text(format!(
+                        "started early, beside step {}: {:.0} % made",
+                        self.step.map_or(1, |now| now + 1),
+                        early * 100.0
                     ));
                 } else if self.first_step.is_some_and(|first| i < first) {
                     response.on_hover_text(match self.took[i] {
@@ -496,6 +597,45 @@ mod tests {
         assert!(run.fraction.is_none());
     }
 
+    /// **Work side by side, bars side by side.** The original's separation
+    /// starts during the extraction and says how far it is under its own
+    /// step's name: it gets a bar of its own beside the decoding's, the
+    /// steps row shows it under way, and the whole run counts it. When the
+    /// extraction ends, its bar becomes the step's, where it was.
+    #[test]
+    fn a_step_started_early_has_a_bar_of_its_own() {
+        let mut run = Run::new(Kind::Dub, "film");
+        let original = Step::SeparateOriginal.label();
+        run.event(step(1));
+        run.event(Event::bytes("decoding", 50, Some(100)));
+        run.event(Event::ratio(original, 0.2));
+        assert_eq!(run.fraction.as_ref().unwrap().what, "decoding");
+        assert_eq!(run.early(1), Some(0.2));
+        assert!((run.overall().unwrap() - (2.0 * 0.5 + 70.0 * 0.2) / 100.0).abs() < 1e-9);
+        run.event(Event::ratio(original, 0.3));
+        run.event(Event::bytes("decoding", 90, Some(100)));
+        assert_eq!(run.early(1), Some(0.3));
+        assert_eq!(run.fraction.as_ref().unwrap().what, "decoding");
+        let before = run.overall().unwrap();
+
+        // The extraction ends a little short of its estimate: the whole
+        // run's bar does not go back, and the separation's carries on where
+        // it was.
+        run.event(step(2));
+        assert_eq!(run.early(1), None);
+        let own = run.fraction.as_ref().unwrap();
+        assert_eq!((own.what.as_str(), own.value), (original, Some(0.3)));
+        let carried = run.overall().unwrap();
+        assert!(carried >= before, "{carried} < {before}");
+        run.event(Event::ratio(original, 0.35));
+        assert!(run.overall().unwrap() > carried);
+        // A fraction named after the step under way, or one before it, is
+        // the step's own.
+        run.event(Event::ratio(Step::Extract.label(), 1.0));
+        assert_eq!(run.fraction.as_ref().unwrap().what, Step::Extract.label());
+        assert!(run.ahead.is_empty());
+    }
+
     fn took(number: u32, seconds: f64, earlier: bool) -> Event {
         Event::Took {
             number,
@@ -542,6 +682,11 @@ mod tests {
         runs[0].event(took(1, 893.4, true));
         runs[0].event(step(2));
         runs[0].event(Event::bytes("decoding", 3 << 20, None));
+        let mut early = Run::new(Kind::Dub, "film");
+        early.event(step(1));
+        early.event(Event::bytes("decoding", 3 << 20, Some(8 << 20)));
+        early.event(Event::ratio(Step::SeparateOriginal.label(), 0.2));
+        runs.push(early);
         runs[1].event(Event::bytes("gfu3", 10 << 20, Some(100 << 20)));
         let mut done = Run::new(Kind::Dub, "film");
         done.finish(Ending::Done(Some("/x/film.mka".into())), Instant::now());

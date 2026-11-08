@@ -61,8 +61,9 @@ would rather not type it:
   the duplicates, where the track goes, start over. `omnifrog-gui FILM.mkv` opens with it.
 - **Progress.** The six steps, each with the time it took once it is done (those an earlier run
   did are marked as such, with the time that run recorded), the current step's bar with an estimate
-  of the time left, the whole run's bar weighted by what each step costs, the elapsed time and the
-  log. The times are the worker's: a window that was not on screen when the run ended still shows
+  of the time left, a bar of its own for a step already under way beside it (the separation of the
+  original during the extraction, also marked ▶ in the steps), the whole run's bar weighted by what
+  each step costs, the elapsed time and the log. The times are the worker's: a window that was not on screen when the run ended still shows
   how long the run took, not how long it was left unwatched. *Stop* ends the run with everything it started; the next run of the
   same film picks up at the step it was in.
 
@@ -260,9 +261,10 @@ element comes out the same whether it was followed or made whole, and wherever: 
 blocks by its length alone, so the fades fall in the same places.
 Only one block's stems are on disk at a time; an element without its dialogue waits in float until
 the depth the original was mastered at is known. A decode that fails or is stopped drops what was
-followed (the extraction starts again anyway). The steps stay six: the progress says how much of
-the original was separated during the extraction, and the extraction's time takes in at most the
-end of the block in flight. Not followed: the dub (another model, after the extraction as
+followed (the extraction starts again anyway). The steps stay six: while the extraction runs, the
+separation says how far it is under its own step's name, as a second bar in the window and at the
+end of the decoding's line in a terminal, and its own step carries on from there; the
+extraction's time takes in at most the end of the block in flight. Not followed: the dub (another model, after the extraction as
 before), and the original under MSST, on a CPU, or in pairs when it has objects — those are paired
 by where each one is over the whole film.
 

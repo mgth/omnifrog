@@ -70,6 +70,20 @@ pub struct Extracted {
     pub begin: Option<f64>,
 }
 
+/// How many seconds a pass reads: what is left of a film `duration` long
+/// from `begin`, or `seconds` of it for a trial; nought when neither is
+/// known. Also what the original's separation measures itself against
+/// while the extraction is still writing it.
+pub fn wanted(duration: f64, begin: Option<f64>, seconds: Option<f64>) -> f64 {
+    let left = duration - begin.unwrap_or(0.0);
+    match (left, seconds) {
+        (d, Some(s)) if d > 0.0 => s.min(d),
+        (_, Some(s)) => s,
+        (d, None) if d > 0.0 => d,
+        _ => 0.0,
+    }
+}
+
 /// How far before the keyframe the input is sought: the demuxer lands on
 /// some earlier keyframe of its own choosing, and what is read between
 /// there and the cut is thrown away.
@@ -220,13 +234,7 @@ pub fn run_with(
     // Every channel is written in step, so the bytes one of them will hold
     // is the whole decode's yardstick, whatever the master set turns out to
     // carry.
-    let left = duration - begin.unwrap_or(0.0);
-    let wanted = match (left, seconds) {
-        (d, Some(s)) if d > 0.0 => s.min(d),
-        (_, Some(s)) => s,
-        (d, None) if d > 0.0 => d,
-        _ => 0.0,
-    };
+    let wanted = wanted(duration, begin, seconds);
     let expected = (wanted > 0.0).then(|| (wanted * RATE as f64) as u64 * BYTES_PER_SAMPLE);
     let piped = pipe(demux, decode, dir, expected, progress);
     decoded(piped.is_ok());

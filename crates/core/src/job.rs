@@ -68,6 +68,15 @@ impl Step {
             Step::Remux => "remux",
         }
     }
+
+    /// The step a progress line is named after: a fraction called by a
+    /// step's [`Step::label`] is that step's own, whichever step it is
+    /// reported in. That is how a step started early, as the original's
+    /// separation is during the extraction, shows as its own bar beside
+    /// the step under way.
+    pub fn labelled(what: &str) -> Option<Step> {
+        Self::ALL.into_iter().find(|step| step.label() == what)
+    }
 }
 
 /// One of the source's tracks, as the manifest remembers it.

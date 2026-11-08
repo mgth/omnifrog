@@ -146,6 +146,62 @@ struct Common<'c> {
     line: Mutex<VecDeque<usize>>,
     /// Several machines: every line says which one it is about.
     named: bool,
+    /// What the step's progress line is drawn from: per pass of the plan,
+    /// the machine on it and the frames made of it so far. A pass let go,
+    /// or followed by a machine left out, loses what was made of it.
+    made: Mutex<Vec<Option<(usize, u64)>>>,
+    /// The frames an element holds once the decoder is done, as far as the
+    /// film's duration says; nought when it does not, and no line is drawn.
+    whole: u64,
+    /// The passes an earlier run made whole.
+    before: usize,
+}
+
+impl Common<'_> {
+    /// `device` has made `frames` of `pass` so far, or (`None`) what was
+    /// made of it is lost; and how far the step is, said.
+    fn made(&self, pass: usize, by: Option<(usize, u64)>, progress: Progress) {
+        let mut made = self.made.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = made.get_mut(pass) {
+            *slot = by;
+        }
+        self.tell(&made, progress);
+    }
+
+    /// `device` is left out: what it was making is lost.
+    fn lost(&self, device: usize, progress: Progress) {
+        let mut made = self.made.lock().unwrap_or_else(|p| p.into_inner());
+        let mut any = false;
+        for slot in made.iter_mut() {
+            if slot.is_some_and(|(on, _)| on == device) {
+                *slot = None;
+                any = true;
+            }
+        }
+        if any {
+            self.tell(&made, progress);
+        }
+    }
+
+    /// How far the separation of the original is, said under the step's own
+    /// name rather than the extraction's, so that a front end draws it as
+    /// the next step started early (see [`crate::job::Step::labelled`]):
+    /// what an earlier run made, and what the machines made since, over
+    /// every pass. The same measure the step itself reports once the
+    /// extraction is over, so the line carries on where this one stopped.
+    /// Said under the lock, so that two machines' blocks are said in the
+    /// order they were made.
+    fn tell(&self, made: &[Option<(usize, u64)>], progress: Progress) {
+        if self.whole == 0 {
+            return;
+        }
+        let frames: u64 = made.iter().flatten().map(|(_, frames)| *frames).sum();
+        let passes = self.plan.passes.len().max(1) as f64;
+        progress(Event::ratio(
+            Stage::Original.label(),
+            (self.before as f64 + frames as f64 / self.whole as f64) / passes,
+        ));
+    }
 }
 
 /// What a machine is called: `device` 0 is this one, `d` the remote
@@ -344,6 +400,13 @@ impl<'a> Follower<'a> {
             names: &names,
             line: Mutex::new(wanted.iter().copied().collect()),
             named: !remotes.is_empty(),
+            made: Mutex::new(vec![None; plan.passes.len()]),
+            whole: {
+                let manifest = &self.job.manifest;
+                let seconds = extract::wanted(manifest.duration, manifest.start, manifest.seconds);
+                (seconds * extract::RATE as f64) as u64
+            },
+            before: plan.passes.len() - wanted.len(),
         };
         progress(Event::message(format!(
             "separating the original as the extraction writes it, {}: as many of its {} {kind} \
@@ -420,6 +483,9 @@ impl<'a> Follower<'a> {
     /// elements to be separated after the extraction.
     fn machine(&self, device: usize, common: &Common, progress: Progress) -> Option<Machine> {
         let followed = self.follow_on(device, common, progress);
+        if followed.is_err() {
+            common.lost(device, progress);
+        }
         if device > 0 {
             self.over[device - 1].store(true, Ordering::SeqCst);
         }
@@ -508,6 +574,7 @@ impl<'a> Follower<'a> {
                 .any(|(stream, &held)| grid.ready(held) >= stream.blocks + BEHIND);
             if behind && may_let_go {
                 let stream = machine.streams.pop().expect("not empty");
+                common.made(stream.pass, None, progress);
                 progress(Event::message(format!(
                     "  {prefix}{} let go: {} does not keep up with the extraction on that many; \
                      it is separated after it",
@@ -525,6 +592,7 @@ impl<'a> Follower<'a> {
                 let inputs = stream.raw.clone();
                 match stream.step(worker, &inputs, held[i], false) {
                     Ok(_) => {
+                        common.made(stream.pass, Some((device, stream.written)), progress);
                         may_let_go = true;
                         may_take = true;
                     }
@@ -535,6 +603,7 @@ impl<'a> Follower<'a> {
                     }
                     Err(why) => {
                         let stream = machine.streams.remove(i);
+                        common.made(stream.pass, None, progress);
                         progress(Event::message(format!(
                             "  {prefix}{}: {why}; it is separated after the extraction",
                             stream.base
@@ -1112,7 +1181,7 @@ mod tests {
     //! grows the decoder's files as harletty does.
 
     use super::*;
-    use crate::job::Job;
+    use crate::job::{Job, Step};
     use crate::models::Catalogue;
     use crate::progress::quiet;
     use std::collections::HashMap;
@@ -1659,16 +1728,44 @@ mod tests {
 
     /// What a run said, kept.
     #[derive(Default)]
-    struct Said(Mutex<Vec<String>>);
+    struct Said(Mutex<Vec<String>>, Mutex<Ratios>);
+
+    /// How far the separation of the original said it was: during the
+    /// extraction, then in its own step.
+    #[derive(Default)]
+    struct Ratios {
+        early: Vec<f64>,
+        own: Vec<f64>,
+        extracted: bool,
+    }
 
     impl Said {
         fn progress(self: &Arc<Self>) -> impl Fn(Event) + Sync + use<> {
             let said = Arc::clone(self);
-            move |event| {
-                if let Event::Message { text } = event {
-                    said.0.lock().unwrap().push(text);
+            move |event| match event {
+                Event::Message { text } => said.0.lock().unwrap().push(text),
+                Event::Fraction {
+                    what,
+                    done,
+                    total: Some(total),
+                    ..
+                } if what == Stage::Original.label() => {
+                    let mut ratios = said.1.lock().unwrap();
+                    let ratio = done as f64 / total as f64;
+                    if ratios.extracted {
+                        ratios.own.push(ratio);
+                    } else {
+                        ratios.early.push(ratio);
+                    }
                 }
+                _ => {}
             }
+        }
+
+        /// What the follower said, and what the step said after it.
+        fn ratios(&self) -> (Vec<f64>, Vec<f64>) {
+            let ratios = self.1.lock().unwrap();
+            (ratios.early.clone(), ratios.own.clone())
         }
 
         fn any(&self, needle: &str) -> bool {
@@ -1698,7 +1795,10 @@ mod tests {
         pause: Duration,
         in_step: bool,
     ) -> (f64, Outputs, Arc<Said>) {
-        let job = bench.job("followed", pairs);
+        let mut job = bench.job("followed", pairs);
+        // The manifest's film is the one grown here, which is what the
+        // follower measures itself against.
+        job.manifest.seconds = Some(film.frames as f64 / extract::RATE as f64);
         let said = Arc::new(Said::default());
         let progress = said.progress();
         let start = |stop: Stop| Worker::start_command(mock(&env), Some(stop), &quiet);
@@ -1749,6 +1849,7 @@ mod tests {
         });
         film.rename(&dir);
         let made = followed.as_ref().map_or(0.0, Followed::made);
+        said.1.lock().unwrap().extracted = true;
         bench.separate(&job, followed, &env, &progress);
         assert!(
             !job.separate_dir().join(DIR).exists(),
@@ -1796,6 +1897,56 @@ mod tests {
         assert!(said.any("during the extraction: "), "{}", said.lines());
         assert!(said.any("followed during the extraction: this machine finishes them first"));
         same(&followed, &whole);
+    }
+
+    /// What the follower said of itself, against what it handed on: it ends
+    /// on exactly what was made of the `passes`, and only ever loses what a
+    /// machine left out or an element let go took with it.
+    fn ends_on_what_was_made(said: &Said, made: f64, passes: usize) {
+        let (early, own) = said.ratios();
+        let last = *early
+            .last()
+            .unwrap_or_else(|| panic!("nothing said\n{}", said.lines()));
+        assert!(
+            (last - made / passes as f64).abs() < 1e-3,
+            "it said {last}, and {made} of {passes} passes were made"
+        );
+        // The step carries on from there to the end.
+        assert!(
+            own.first().is_some_and(|first| *first >= last - 1e-3),
+            "{own:?}"
+        );
+        assert_eq!(own.last().copied(), Some(1.0));
+    }
+
+    /// **Said under the next step's name.** While the extraction runs, the
+    /// separation of the original says how far it is as that step does, so
+    /// a front end draws it as a bar of its own beside the decoding, rising
+    /// with every block, and the step's own bar carries on from it.
+    #[test]
+    fn the_separation_says_how_far_it_is_during_the_extraction() {
+        let bench = Bench::new("said");
+        let film = Film::objects(3, 60_000);
+        let (made, _, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        let (early, _) = said.ratios();
+        assert!(early.len() > 3, "{early:?}");
+        assert!(
+            early.windows(2).all(|pair| pair[1] >= pair[0]),
+            "nothing was let go, and it went back: {early:?}"
+        );
+        assert_eq!(
+            Step::labelled(Stage::Original.label()),
+            Some(Step::SeparateOriginal)
+        );
+        ends_on_what_was_made(&said, made, 3);
     }
 
     #[test]
@@ -1856,7 +2007,7 @@ mod tests {
         // A block takes the mock ten times as long as the decoder takes to
         // write one.
         let env = vec![(MOCK_BLOCK_MS, "20".to_string())];
-        let (_, followed, said) = follow(
+        let (made, followed, said) = follow(
             &bench,
             &film,
             Pairs::default(),
@@ -1870,6 +2021,8 @@ mod tests {
             "{}",
             said.lines()
         );
+        // What was made of an element let go is no longer counted.
+        ends_on_what_was_made(&said, made, 4);
         same(&followed, &whole);
     }
 
@@ -2084,7 +2237,7 @@ mod tests {
         // The second element in line is the remote's: it dies on its second
         // block.
         bench.config.remotes = vec![far_mock(&bench, &[(MOCK_DIE, "11:1".to_string())])];
-        let (_, followed, said) = follow(
+        let (made, followed, said) = follow(
             &bench,
             &film,
             Pairs::default(),
@@ -2102,6 +2255,8 @@ mod tests {
         assert!(said.any("what it followed is separated after it"));
         // This machine kept following.
         assert!(said.any("followed during the extraction: this machine finishes"));
+        // What the remote made of its element is no longer counted.
+        ends_on_what_was_made(&said, made, 4);
         same(&followed, &whole);
     }
 
