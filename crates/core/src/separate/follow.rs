@@ -1809,8 +1809,10 @@ impl Followed {
     }
 
     /// What its workers hold on each machine while they wait for their
-    /// step: for another step's workers to stand beside. A worker gone is
-    /// no longer there to stand beside.
+    /// step: for another step's workers to stand beside. This machine's
+    /// share of the lock is handed on whether its worker is alive or not —
+    /// it is held until the worker is dropped; a remote's worker gone is no
+    /// longer there to stand beside.
     pub fn beside(&mut self) -> Beside {
         let devices = self
             .machines
@@ -1826,12 +1828,10 @@ impl Followed {
             let Some(worker) = machine.worker.as_mut() else {
                 continue;
             };
-            if !worker.is_alive() {
-                continue;
-            }
             match machine.device {
                 0 => beside.lock = worker.lock(),
-                d => beside.seats[d] = worker.seat(),
+                d if worker.is_alive() => beside.seats[d] = worker.seat(),
+                _ => {}
             }
         }
         beside
@@ -3367,6 +3367,40 @@ mod tests {
         assert_eq!(Trend::default().needed(), STUCK);
     }
 
+    /// **A dead worker here still hands on its share of the lock.** A GPU
+    /// reset kills this machine's dub worker before the next step: the
+    /// share it holds is this machine's lock until it is dropped, and the
+    /// next step's worker shares it rather than find its own run in the way.
+    #[test]
+    fn a_dead_worker_here_still_hands_on_its_share_of_this_machine_s_lock() {
+        let bench = Bench::new("dead-share");
+        let work = bench.root.join("lock");
+        let lock = Lock::take(&work).unwrap();
+        let mut worker = Worker::start_command(mock(&[]), None, &quiet)
+            .unwrap()
+            .holding(lock);
+        worker.kill_now();
+        assert!(!worker.is_alive());
+        let mut followed = Followed {
+            stage: Stage::Dub,
+            machines: vec![Machine {
+                device: 0,
+                worker: Some(worker),
+                streams: Vec::new(),
+            }],
+            plan: Plan::empty(0),
+            identity: Vec::new(),
+            dir: bench.root.join("followed"),
+        };
+        let beside = followed.beside();
+        assert!(beside.lock().is_some());
+        // Nobody else gets it meanwhile; once both let go, anyone does.
+        assert!(Lock::take(&work).is_err());
+        drop(beside);
+        drop(followed);
+        assert!(Lock::take(&work).is_ok());
+    }
+
     #[test]
     fn the_dub_has_a_gap_with_room_to_spare_and_is_kept_half_made() {
         // A block of 100 frames needs 125 before the original's next.
@@ -3707,10 +3741,6 @@ mod tests {
         )
     }
 
-    /// **The dub has the gaps the original leaves.** A machine that makes
-    /// eight blocks while the extraction writes one keeps the original's
-    /// four elements and follows some of the dub in the time left; nothing
-    /// is let go.
     /// **The dub's line outlives the original's.** Eight elements and a
     /// machine slow through the first two blocks of film: the original's
     /// line closes with elements still in it. The machine is then far
@@ -3747,9 +3777,12 @@ mod tests {
         same(&ran.outputs, &whole);
     }
 
+    /// **The dub has the gaps the original leaves.** A machine that makes
+    /// eight blocks while the extraction writes one keeps the original's
+    /// four elements and follows some of the dub in the time left; nothing
+    /// is let go.
     #[test]
     fn the_dub_has_the_gaps_the_original_leaves() {
-        // (See also the case where the original's line closes first, below.)
         let said = held_to("dub-gaps", STEP / 4, &|_| 2.0, true);
         assert!(
             said.any("during the extraction: 4 of the original's 4 elements followed"),

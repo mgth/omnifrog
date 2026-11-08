@@ -100,7 +100,8 @@ pub fn run_id() -> &'static str {
 /// go to.
 pub(crate) fn seat_of(dir: &str) -> Seat {
     let last = dir.rsplit(['/', '\\']).find(|part| !part.is_empty());
-    if last == Some(DIR_BESIDE) {
+    // `remote-beside` there; any `…-beside` stands for it (the tests').
+    if last.is_some_and(|last| last == DIR_BESIDE || last.ends_with("-beside")) {
         Seat::Second
     } else {
         Seat::First
@@ -1061,6 +1062,8 @@ mod tests {
         assert_eq!(seat_of("/srv/work/remote"), Seat::First);
         assert_eq!(seat_of("/srv/work/remote-beside"), Seat::Second);
         assert_eq!(seat_of("/srv/work/remote-beside/"), Seat::Second);
+        assert_eq!(seat_of("/tmp/bench/far-beside"), Seat::Second);
+        assert_eq!(seat_of("/tmp/bench/far"), Seat::First);
         assert_eq!(seat_of("C:\\work\\remote-beside"), Seat::Second);
         assert!(!run_id().is_empty());
         assert_eq!(run_id(), run_id());

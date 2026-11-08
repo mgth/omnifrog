@@ -943,6 +943,21 @@ impl Worker {
         }
     }
 
+    /// The tests' worker, holding `lock` as a worker of this machine does.
+    #[cfg(test)]
+    pub(crate) fn holding(mut self, lock: Lock) -> Self {
+        self._lock = Some(lock);
+        self
+    }
+
+    /// The tests' worker, killed as a GPU reset kills one: its process
+    /// gone, what holds it still there.
+    #[cfg(test)]
+    pub(crate) fn kill_now(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// What standard error said during the requests so far that belongs in
     /// the log, as the worker wrote it; emptied by the call. Standard error
     /// is a pipe of its own, so a line written just before `FIN` can come
