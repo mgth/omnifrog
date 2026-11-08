@@ -323,7 +323,9 @@ fn iamf(config: &Config, harlettizer: &Path) -> Check {
 
 /// torch's version and device, with MSST importable, from the venv itself.
 /// Under a ROCm override the card cannot run (`without_override`), torch
-/// is asked without it: the `rocm arch` check already says it is broken.
+/// is asked without any (`HSA_OVERRIDE_GFX_VERSION` and each node's
+/// `HSA_OVERRIDE_GFX_VERSION_<n>`): the `rocm arch` check already says it
+/// is broken.
 fn torch_report(python: &Path, msst: &Path, without_override: bool) -> Result<String, String> {
     let mut c = run::command(python);
     c.arg("-c")
@@ -331,11 +333,16 @@ fn torch_report(python: &Path, msst: &Path, without_override: bool) -> Result<St
         .arg(msst)
         .env("PYTHONWARNINGS", "ignore");
     if without_override {
-        c.env_remove(rocm::OVERRIDE);
+        // Every card's override and each node's own.
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(rocm::is_override) {
+                c.env_remove(&key);
+            }
+        }
     }
     let report = run::output(c);
     let report = if without_override {
-        report.map(|r| format!("{r} (asked without {})", rocm::OVERRIDE))
+        report.map(|r| format!("{r} (asked without the {} variables)", rocm::OVERRIDE))
     } else {
         report
     };

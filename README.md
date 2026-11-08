@@ -455,8 +455,9 @@ the AUR's `omnifrog` goes; the script says when `PATH` finds another one first.
 architecture it names. Within a generation that is how a card ROCm has no kernels for gets to run
 (a gfx1031 as `10.3.0`); across generations the card gets code it cannot run, and the first copy to
 it makes the driver reset the GPU, which closes the desktop's applications. omnifrog compares the
-variable with what the kernel says the cards are (`/sys/class/kfd/kfd/topology`, minding
-`ROCR_VISIBLE_DEVICES` and `HIP_VISIBLE_DEVICES`): `doctor` reports an override of another
+variable — or a card's own `HSA_OVERRIDE_GFX_VERSION_<node>`, which ROCm reads first — with what
+the kernel says the cards are (`/sys/class/kfd/kfd/topology`, minding `ROCR_VISIBLE_DEVICES` and
+`HIP_VISIBLE_DEVICES` as ROCm reads them): `doctor` reports an override of another
 generation than the card the separation runs on as broken (`rocm arch`), and no inference starts
 under it, for a run on this machine or for another machine's pass over SSH. Most often it is a line
 left in `~/.profile`, `~/.bashrc` or `~/.zshrc` from an earlier card; remove it. A
