@@ -49,6 +49,11 @@
 //! under a ROCm override the card cannot run (see [`crate::rocm`] and
 //! [`command`]), which is how a GPU reset is.
 //!
+//! A worker's temporary files — the kernels ROCm compiles, among others —
+//! go to its lock's directory in the working directory ([`Lock::scratch`]),
+//! never to the system's, which can be a small tmpfs that other programs
+//! fill.
+//!
 //! A worker can also run on another machine, through `ssh` and that
 //! machine's omnifrog ([`Worker::start_remote`], [`crate::remote`]): the
 //! same words, two more before `PRET` (`BUSY`, `DIR`), and the files carried
@@ -223,8 +228,9 @@ pub struct Worker {
     /// What standard error said during the requests that is worth the log,
     /// until [`Worker::take_notes`].
     notes: Vec<String>,
-    /// Held for as long as the worker is: one separation at a time. A
-    /// remote's is taken on its own machine.
+    /// Held for as long as the worker is: one separation at a time, and
+    /// the scratch its temporary files are in. A remote's is taken on its
+    /// own machine.
     _lock: Option<Lock>,
     /// What the messages call the process.
     program: String,
@@ -628,6 +634,19 @@ impl Worker {
             model.name
         )));
         let program = config.python().display().to_string();
+        Self::start_here(command, program, lock, stop, progress)
+    }
+
+    /// The worker `command` starts on this machine under `lock`, its
+    /// temporary files in the lock's scratch; once it is ready.
+    pub(crate) fn start_here(
+        mut command: Command,
+        program: String,
+        lock: Lock,
+        stop: Option<Stop>,
+        progress: Progress,
+    ) -> Result<Self> {
+        lock.give_scratch(&mut command);
         let mut worker = Self::spawn(command, program, Some(lock), None, stop)?;
         match worker.wait_ready(progress)? {
             None => Ok(worker),
@@ -1385,6 +1404,8 @@ impl Drop for Worker {
                 let _ = pump.join();
             }
         }
+        // The process is gone: the lock goes next, as the fields are
+        // dropped, and its scratch with its last share.
     }
 }
 
@@ -1458,9 +1479,42 @@ fn word(line: &str) -> Word {
 /// at the same time (see `separate`'s follower). Nothing shares it
 /// implicitly: a second take in the same process is refused like any
 /// other.
+///
+/// Each lock file has a scratch beside it, `.separating.tmp` beside
+/// `.separating.lock`: the temporary directory of the workers under it
+/// ([`Lock::give_scratch`]). The system's can be a tmpfs with a quota per
+/// user, which ROCm's compiler filled once, mid-run, writing its kernels
+/// there. Whoever holds a lock is the only one to use its scratch, so
+/// whatever is in it when the lock is taken was left by a run that did not
+/// end its own way, and is cleared; the scratch goes when the lock's last
+/// share does, while the lock is still held, so the next holder never
+/// loses its own. A remote's second seat has a lock, and a scratch, of its
+/// own.
 pub struct Lock {
-    _file: Arc<fs::File>,
+    held: Arc<Held>,
 }
+
+/// What a lock is while it is held: its file, and its scratch.
+struct Held {
+    _file: fs::File,
+    scratch: PathBuf,
+}
+
+impl Drop for Held {
+    /// The scratch first; the lock goes after, with the file.
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.scratch);
+    }
+}
+
+/// The variables that name a process's temporary directory: `TMPDIR` for
+/// Python's `tempfile`, ROCm and MIOpen everywhere; `TMP` and `TEMP` too on
+/// Windows, where the system's own lookup reads those.
+const TEMP_VARIABLES: &[&str] = if cfg!(windows) {
+    &["TMPDIR", "TMP", "TEMP"]
+} else {
+    &["TMPDIR"]
+};
 
 /// The lock file of the machine's separations.
 pub(crate) const LOCK: &str = ".separating.lock";
@@ -1485,7 +1539,23 @@ impl Lock {
     /// The same lock, for another worker of the run that holds it.
     pub fn share(&self) -> Self {
         Self {
-            _file: Arc::clone(&self._file),
+            held: Arc::clone(&self.held),
+        }
+    }
+
+    /// The directory the workers under this lock keep their temporary
+    /// files in, in the working directory; absolute.
+    pub fn scratch(&self) -> &Path {
+        &self.held.scratch
+    }
+
+    /// Name the scratch to `command`'s process as its temporary directory,
+    /// whatever this process's environment names: a `TMPDIR` of `/tmp` is
+    /// the case the scratch is for, and where large files go is the working
+    /// directory.
+    pub fn give_scratch(&self, command: &mut Command) {
+        for variable in TEMP_VARIABLES {
+            command.env(variable, self.scratch());
         }
     }
 
@@ -1554,8 +1624,20 @@ impl Lock {
             let _ = writeln!(file, "{run}");
         }
         let _ = file.flush();
+        let scratch = work_dir.join(format!(
+            "{}.tmp",
+            name.strip_suffix(".lock").unwrap_or(name)
+        ));
+        // Ours alone now: anything in it was left by a run that did not end
+        // its own way.
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).map_err(|e| Error::io(&scratch, e))?;
+        let scratch = std::path::absolute(&scratch).unwrap_or(scratch);
         Ok(Self {
-            _file: Arc::new(file),
+            held: Arc::new(Held {
+                _file: file,
+                scratch,
+            }),
         })
     }
 }
@@ -1752,6 +1834,82 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A directory of the tests' own for locks, empty.
+    fn lock_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("omnifrog-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_lock_s_scratch_is_cleared_when_taken_and_named_to_the_worker() {
+        let dir = lock_dir("scratch");
+        // What a run killed in the middle of a compile leaves.
+        let left = dir.join(".separating.tmp").join("comgr-x");
+        fs::create_dir_all(&left).unwrap();
+        fs::write(left.join("kernel.o"), b"x").unwrap();
+        let lock = Lock::take(&dir).unwrap();
+        let scratch = lock.scratch().to_path_buf();
+        assert_eq!(
+            scratch,
+            std::path::absolute(dir.join(".separating.tmp")).unwrap()
+        );
+        assert!(scratch.is_dir());
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        let mut command = Command::new("worker");
+        command.env("TMPDIR", "/tmp");
+        lock.give_scratch(&mut command);
+        for variable in TEMP_VARIABLES {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == *variable && value == Some(scratch.as_os_str())),
+                "{variable} does not name the scratch"
+            );
+        }
+        drop(lock);
+        assert!(!scratch.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scratch_stays_while_a_share_of_its_lock_does() {
+        // The original's and the dub's workers during the extraction.
+        let dir = lock_dir("scratch-shared");
+        let first = Lock::take(&dir).unwrap();
+        let second = first.share();
+        assert_eq!(first.scratch(), second.scratch());
+        let kernel = first.scratch().join("kernel.o");
+        fs::write(&kernel, b"x").unwrap();
+        drop(first);
+        assert!(kernel.is_file());
+        let scratch = second.scratch().to_path_buf();
+        drop(second);
+        assert!(!scratch.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_s_second_seat_has_a_scratch_of_its_own() {
+        let dir = lock_dir("scratch-beside");
+        let first = Lock::take_named(&dir, LOCK).unwrap();
+        let kernel = first.scratch().join("kernel.o");
+        fs::write(&kernel, b"x").unwrap();
+        let beside = Lock::take_named(&dir, LOCK_BESIDE).unwrap();
+        assert_eq!(
+            beside.scratch(),
+            std::path::absolute(dir.join(".separating-beside.tmp")).unwrap()
+        );
+        assert!(kernel.is_file(), "the second seat cleared the first's");
+        let scratch = beside.scratch().to_path_buf();
+        drop(beside);
+        assert!(!scratch.exists());
+        assert!(kernel.is_file(), "the second seat took the first's along");
+        drop(first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A worker restarted while another thread starts a child: the child
     /// holds a copy of the lock's file until it runs its program. A
     /// duplicate of the file, closed a little later, stands in for it.
@@ -1761,7 +1919,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("omnifrog-grace-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let held = Lock::take(&dir).unwrap();
-        let copy = held._file.try_clone().unwrap();
+        let copy = held.held._file.try_clone().unwrap();
         drop(held);
         let child = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
