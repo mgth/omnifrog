@@ -445,6 +445,42 @@ impl Appender {
 /// What [`write_header`] writes, in bytes.
 const HEADER: usize = 44;
 
+/// A stream read once, front to back, as a file would be: a seek forward
+/// reads past what it skips, and one back fails. What lets [`header`] read
+/// a WAV coming down a pipe.
+struct Forward<R> {
+    inner: R,
+    /// Bytes read so far.
+    at: u64,
+}
+
+impl<R: Read> Read for Forward<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Read> Seek for Forward<R> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let skip = match to {
+            SeekFrom::Start(offset) if offset >= self.at => offset - self.at,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a stream is only read forward",
+                ));
+            }
+        };
+        let skipped = std::io::copy(&mut self.by_ref().take(skip), &mut std::io::sink())?;
+        if skipped < skip {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(self.at)
+    }
+}
+
 /// A WAV grown from others of one format, their samples copied as they
 /// are, its sizes stated once it is [finished](Joiner::finish): a stem a
 /// remote made a block at a time, whole again here. Nothing is decoded, so
@@ -460,7 +496,10 @@ pub struct Joiner {
 impl Joiner {
     pub fn create(path: &Path) -> Result<Self> {
         create_parent(path)?;
-        let mut writer = BufWriter::new(File::create(path).map_err(|e| Error::io(path, e))?);
+        // A block streamed in is read into this buffer and written from it,
+        // a megabyte at a time.
+        let mut writer =
+            BufWriter::with_capacity(1 << 20, File::create(path).map_err(|e| Error::io(path, e))?);
         // The header's room: its format is the first block's.
         writer
             .write_all(&[0u8; HEADER])
@@ -478,7 +517,43 @@ impl Joiner {
     pub fn append(&mut self, block: &Path) -> Result<u64> {
         let mut file = File::open(block).map_err(|e| Error::io(block, e))?;
         let length = file.metadata().map_err(|e| Error::io(block, e))?.len();
-        let format = header(&mut file, length).map_err(|e| name(block, e))?;
+        self.append_from(&mut file, Some(length), block)
+    }
+
+    /// The samples of the WAV coming down `stream`, header first, after
+    /// those already there, as [`Joiner::append`] takes them from a file:
+    /// a block's stems, fetched from another machine straight into the
+    /// joined stem, nothing written of them on the way. `block` is what it
+    /// is called in an error. Its header has to state its size, which the
+    /// length of a file says otherwise; what comes after the samples is not
+    /// read. Returns how many frames it held.
+    pub fn append_stream(&mut self, stream: impl Read, block: &Path) -> Result<u64> {
+        self.append_from(
+            &mut Forward {
+                inner: stream,
+                at: 0,
+            },
+            None,
+            block,
+        )
+    }
+
+    /// The samples of the WAV `source` holds, after those already there;
+    /// `length` is the file's, `None` for a stream.
+    fn append_from(
+        &mut self,
+        source: &mut (impl Read + Seek),
+        length: Option<u64>,
+        block: &Path,
+    ) -> Result<u64> {
+        let (format, stated) =
+            sized_header(source, length.unwrap_or(u64::MAX)).map_err(|e| name(block, e))?;
+        if length.is_none() && !stated {
+            return Err(Error::msg(format!(
+                "{}: its header does not say how many samples it holds",
+                block.display()
+            )));
+        }
         let shape = |f: Format| (f.channels, f.sample_rate, f.bits, f.float);
         match self.format {
             None => self.format = Some(format),
@@ -497,10 +572,11 @@ impl Joiner {
             }
             Some(_) => {}
         }
-        file.seek(SeekFrom::Start(format.data_offset))
+        source
+            .seek(SeekFrom::Start(format.data_offset))
             .map_err(|e| Error::io(block, e))?;
         let bytes = format.data_bytes();
-        let copied = std::io::copy(&mut file.take(bytes), &mut self.writer)
+        let copied = std::io::copy(&mut source.take(bytes), &mut self.writer)
             .map_err(|e| Error::io(&self.path, e))?;
         if copied != bytes {
             return Err(Error::msg(format!(
@@ -674,6 +750,13 @@ pub(crate) fn sample(bytes: &[u8], bits: u16, float: bool) -> f32 {
 
 /// The header of a stream `length` bytes long, from its start.
 fn header(source: &mut (impl Read + Seek), length: u64) -> Result<Format> {
+    sized_header(source, length).map(|(format, _)| format)
+}
+
+/// [`header`], and whether its `data` chunk states its size: a writer that
+/// streamed to a pipe leaves it at zero or at its maximum, and only the
+/// length of the file then says how many samples it holds.
+fn sized_header(source: &mut (impl Read + Seek), length: u64) -> Result<(Format, bool)> {
     let mut riff = [0u8; 12];
     source
         .read_exact(&mut riff)
@@ -720,19 +803,22 @@ fn header(source: &mut (impl Read + Seek), length: u64) -> Result<Format> {
                 // A writer that streamed to a pipe leaves the size at zero
                 // or at its maximum; what is on disk is then the truth.
                 let available = length.saturating_sub(body);
-                let bytes = match size {
-                    0 | 0xFFFF_FFFF => available,
-                    size => size.min(available),
+                let (bytes, stated) = match size {
+                    0 | 0xFFFF_FFFF => (available, false),
+                    size => (size.min(available), true),
                 };
                 let frame = channels as u64 * (bits as u64 / 8);
-                return Ok(Format {
-                    channels,
-                    sample_rate,
-                    bits,
-                    float,
-                    frames: bytes.checked_div(frame).unwrap_or(0),
-                    data_offset: body,
-                });
+                return Ok((
+                    Format {
+                        channels,
+                        sample_rate,
+                        bits,
+                        float,
+                        frames: bytes.checked_div(frame).unwrap_or(0),
+                        data_offset: body,
+                    },
+                    stated,
+                ));
             }
             _ => {}
         }
@@ -894,6 +980,54 @@ mod tests {
                 .finish()
                 .is_err()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A block streamed in is the block as a file.** The same blocks,
+    /// coming down a stream — one with a chunk of its own before its
+    /// samples, one with a chunk after them that is not read — join into
+    /// the same bytes as from their files. A stream cut short, or whose
+    /// header leaves its size to the length of a file, is refused.
+    #[test]
+    fn a_block_streamed_in_joins_as_its_file_does() {
+        let dir = scratch("join-stream");
+        let (a, b, c) = (dir.join("a.wav"), dir.join("b.wav"), dir.join("c.wav"));
+        let left = [0.5f32, -0.0, 1e-40, 0.25, -1.5];
+        let right = [0.1f32, 0.0, -1e-40, 2.0, 0.3];
+        stereo_float(&a, &left[..2], &right[..2]);
+        stereo_float(&b, &left[2..], &right[2..]);
+        stereo_float(&c, &left, &right);
+        let mut first = std::fs::read(&a).unwrap();
+        first.splice(36..36, *b"fact\x04\x00\x00\x00\x02\x00\x00\x00");
+        let mut second = std::fs::read(&b).unwrap();
+        second.extend_from_slice(b"LIST\x04\x00\x00\x00abcd");
+        let joined = dir.join("joined.wav");
+        let mut joiner = Joiner::create(&joined).unwrap();
+        let mut stream = Cursor::new(first);
+        assert_eq!(joiner.append_stream(&mut stream, &a).unwrap(), 2);
+        let mut stream = Cursor::new(second.clone());
+        assert_eq!(joiner.append_stream(&mut stream, &b).unwrap(), 3);
+        // What follows the samples is left in the stream.
+        assert_eq!(stream.position(), second.len() as u64 - 12);
+        joiner.finish().unwrap();
+        assert_eq!(std::fs::read(&joined).unwrap(), std::fs::read(&c).unwrap());
+        // Cut short.
+        let whole = std::fs::read(&c).unwrap();
+        let mut joiner = Joiner::create(&dir.join("short.wav")).unwrap();
+        let mut stream = Cursor::new(whole[..whole.len() - 3].to_vec());
+        assert!(joiner.append_stream(&mut stream, &c).is_err());
+        // Its size left to the length of a file: a stream has none.
+        let mut piped = whole.clone();
+        piped[40..44].copy_from_slice(&[0; 4]);
+        let mut joiner = Joiner::create(&dir.join("piped.wav")).unwrap();
+        let error = joiner
+            .append_stream(&mut Cursor::new(piped.clone()), &c)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not say"), "{error}");
+        // The same file is read to its length.
+        std::fs::write(&b, &piped).unwrap();
+        assert_eq!(joiner.append(&b).unwrap(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

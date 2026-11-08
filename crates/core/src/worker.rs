@@ -427,14 +427,23 @@ pub struct Last {
     there: String,
     /// Where the element's inputs are there.
     inputs: String,
+    /// Frames its stems hold.
+    frames: u64,
 }
 
 impl Last {
-    /// Its stems, into `out_dir`; then everything of the element goes from
-    /// there.
-    pub fn fetch(self, out_dir: &Path) -> Result<Stems> {
-        fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
-        fetch(&self.ssh, &self.base, &self.there, out_dir, &[self.inputs])
+    /// Its stems, after the others in the element's `joined` stems (its
+    /// voice, then the rest), which then hold all of it and are handed
+    /// back; then everything of the element goes from there.
+    pub fn fetch(self, joined: Joined) -> Result<Joined> {
+        fetch(
+            &self.ssh,
+            &self.base,
+            &self.there,
+            joined,
+            self.frames,
+            &[self.inputs],
+        )
     }
 
     /// Its stems are not wanted: everything of the element goes from there,
@@ -449,16 +458,26 @@ impl Last {
     }
 }
 
-/// The stems of `base` in `there`, on the machine `ssh` reaches, into
-/// `out_dir`; then `there` goes, with `also`.
-fn fetch(ssh: &Ssh, base: &str, there: &str, out_dir: &Path, also: &[String]) -> Result<Stems> {
-    let stems = Stems {
-        voice: out_dir.join(format!("{base}{VOICE_SUFFIX}")),
-        rest: out_dir.join(format!("{base}{REST_SUFFIX}")),
-    };
-    for (suffix, to) in [(VOICE_SUFFIX, &stems.voice), (REST_SUFFIX, &stems.rest)] {
-        ssh.download(&format!("{there}/{base}{suffix}"), to)?;
-    }
+/// An element's stems, joined here as its blocks come back from another
+/// machine: its voice, then the rest.
+pub type Joined = [wav::Joiner; 2];
+
+/// The stems of `base` in `there`, on the machine `ssh` reaches, after
+/// what `joined` holds, `frames` frames each: streamed straight in, so that
+/// nothing of them is written here but the joined stems — a disk that
+/// slows down under a run's writes would otherwise take every block twice.
+/// Then `there` goes, with `also`.
+fn fetch(
+    ssh: &Ssh,
+    base: &str,
+    there: &str,
+    joined: Joined,
+    frames: u64,
+    also: &[String],
+) -> Result<Joined> {
+    let [voice, rest] = joined;
+    let voice = fetch_into(ssh, &format!("{there}/{base}{VOICE_SUFFIX}"), voice, frames)?;
+    let rest = fetch_into(ssh, &format!("{there}/{base}{REST_SUFFIX}"), rest, frames)?;
     let gone: Vec<String> = std::iter::once(there)
         .chain(also.iter().map(String::as_str))
         .map(remote::quote)
@@ -467,7 +486,23 @@ fn fetch(ssh: &Ssh, base: &str, there: &str, out_dir: &Path, also: &[String]) ->
         &format!("rm -rf -- {}", gone.join(" ")),
         remote::QUICK_TIMEOUT,
     )?;
-    Ok(stems)
+    Ok([voice, rest])
+}
+
+/// The stem at `path` there, after what `joiner` holds, which it hands back:
+/// `frames` more, or it fails.
+fn fetch_into(ssh: &Ssh, path: &str, mut joiner: wav::Joiner, frames: u64) -> Result<wav::Joiner> {
+    let block = PathBuf::from(path);
+    let (joiner, added) = ssh.stream(path, move |stream| {
+        let added = joiner.append_stream(stream, &block)?;
+        Ok((joiner, added))
+    })?;
+    if added != frames {
+        return Err(Error::msg(format!(
+            "{path}: {added} frames, where its block holds {frames}"
+        )));
+    }
+    Ok(joiner)
 }
 
 /// How a worker on another machine started.
@@ -1097,14 +1132,14 @@ impl Worker {
     }
 
     /// The rest of an element [begun](Worker::begin_in_blocks): while the
-    /// worker makes block k, block k − 1's stems come back into `out_dir`
-    /// and the input of block k + 1 goes there, so the transfers cost the
-    /// pass nothing but its first block's input and its last block's
-    /// stems. `each` is handed every block's stems in order but the last
-    /// one's, which go once it returns; `fraction` is how far through the
-    /// element the worker is. Returns once the worker made the last block:
-    /// its stems are still there ([`Last`]), for the caller to fetch while
-    /// the worker goes on with the next element.
+    /// worker makes block k, block k − 1's stems come back, straight into
+    /// the element's `joined` stems, and the input of block k + 1 goes
+    /// there, so the transfers cost the pass nothing but its first block's
+    /// input and its last block's stems. `fraction` is how far through the
+    /// element the worker is. Returns once the worker made the last block,
+    /// with the stems joined up to the block before: the last one's are
+    /// still there ([`Last`]), for the caller to fetch while the worker goes
+    /// on with the next element.
     ///
     /// `ahead` is asked once, as soon as all of this element's input is
     /// there, for the element likely to be next: the input of its first
@@ -1115,45 +1150,45 @@ impl Worker {
     ///
     /// An error leaves the worker idle and alive when it can: a transfer
     /// that fails under a block waits for the worker's answer. What it holds
-    /// of the element then is [forgotten](Worker::forget) by the caller.
+    /// of the element then is [forgotten](Worker::forget) by the caller, and
+    /// the joined stems, half made, are gone.
     pub fn run_blocks(
         &mut self,
         blocks: Blocks,
-        out_dir: &Path,
+        mut joined: Joined,
         mut fraction: impl FnMut(f64),
-        mut each: impl FnMut(&Stems) -> Result<()>,
         ahead: impl FnOnce() -> Option<Whole>,
-    ) -> Result<Last> {
+    ) -> Result<(Last, Joined)> {
         let Blocks {
             whole,
             rate,
             grid,
             mut there,
         } = blocks;
-        fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
+        // A remote's request names no directory here.
+        let here = Path::new("");
         let count = grid.blocks(whole.frames);
         let mut ahead = Some(ahead);
-        let mut written = 0;
+        let (mut written, mut made) = (0, 0);
         for k in 0..count {
-            // While block k is made over there.
-            let during = (|| -> Result<()> {
+            // While block k is made over there; block k − 1 made `made`
+            // frames.
+            let during = (|| -> Result<Joined> {
+                let mut joined = joined;
                 if k > 0 {
-                    let stems = self.fetch(&whole.base, k - 1, out_dir)?;
-                    each(&stems)?;
-                    let _ = fs::remove_file(&stems.voice);
-                    let _ = fs::remove_file(&stems.rest);
+                    joined = self.fetch(&whole.base, k - 1, joined, made)?;
                 }
                 let far = self.far()?;
                 if k + 1 < count {
-                    there = far.carry(&whole.ask(grid, k + 1, rate, out_dir))?;
+                    there = far.carry(&whole.ask(grid, k + 1, rate, here))?;
                 }
                 // All of this element's input is there from now on.
                 if k + 2 >= count
                     && let Some(next) = ahead.take().and_then(|ahead| ahead())
                 {
-                    let _ = far.carry(&next.ask(grid, 0, rate, out_dir));
+                    let _ = far.carry(&next.ask(grid, 0, rate, here));
                 }
-                Ok(())
+                Ok(joined)
             })();
             // Read whatever went wrong meanwhile: the worker is idle again
             // once it answered, its block made or not.
@@ -1164,7 +1199,7 @@ impl Worker {
                 Word::Done => last = true,
                 _ => {}
             });
-            during?;
+            joined = during?;
             answered?;
             let (from, to) = span.ok_or_else(|| {
                 Error::msg(format!("the worker said nothing of {}'s block", whole.base))
@@ -1180,12 +1215,12 @@ impl Worker {
                     whole.frames
                 )));
             }
-            written = to;
+            (written, made) = (to, to - from);
             if k + 1 < count {
                 let far = self.far()?;
                 let line = blk(
                     &far.out_of(&whole.base, k + 1),
-                    &whole.ask(grid, k + 1, rate, out_dir),
+                    &whole.ask(grid, k + 1, rate, here),
                     &there,
                 );
                 self.send(&line)?;
@@ -1200,19 +1235,21 @@ impl Worker {
         // Its input has served: it goes with the last block's stems.
         let far = self.far()?;
         far.unsend(&whole.base);
-        Ok(Last {
+        let last = Last {
             ssh: far.ssh.clone(),
             there: far.out_of(&whole.base, count - 1),
             inputs: far.inputs_of(&whole.base),
+            frames: made,
             base: whole.base,
-        })
+        };
+        Ok((last, joined))
     }
 
-    /// Block `k`'s stems of the whole element `base`, from there into
-    /// `out_dir`, and gone from there.
-    fn fetch(&mut self, base: &str, k: u64, out_dir: &Path) -> Result<Stems> {
+    /// Block `k`'s stems of the whole element `base`, `frames` frames, from
+    /// there after what `joined` holds, and gone from there.
+    fn fetch(&mut self, base: &str, k: u64, joined: Joined, frames: u64) -> Result<Joined> {
         let far = self.far()?;
-        fetch(&far.ssh, base, &far.out_of(base, k), out_dir, &[])
+        fetch(&far.ssh, base, &far.out_of(base, k), joined, frames, &[])
     }
 
     fn far(&mut self) -> Result<&mut Far> {
@@ -1891,6 +1928,87 @@ mod tests {
         let taken = Lock::take(&dir);
         child.join().unwrap();
         drop(taken.unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **A block's stems, straight into the element's.** Through the tests'
+    /// remote, a block's two stems are joined after the element's first
+    /// ones, nothing else is written here, and their directory there goes.
+    /// A stem that holds other than its block's frames is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_block_s_stems_go_from_there_straight_into_the_element_s() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-fetch-{}", std::process::id()));
+        let (there, here) = (dir.join("there"), dir.join("here"));
+        fs::create_dir_all(&there).unwrap();
+        let stem = |path: &Path, samples: &[f32]| {
+            let mut bytes = Vec::new();
+            wav::write_header(
+                &mut bytes,
+                wav::Format {
+                    channels: 1,
+                    sample_rate: 44_100,
+                    bits: 32,
+                    float: true,
+                    frames: samples.len() as u64,
+                    data_offset: 0,
+                },
+            )
+            .unwrap();
+            bytes.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+            fs::write(path, bytes).unwrap();
+        };
+        let ssh = Ssh::new(remote::SHELL);
+        let joined = |name: &str| -> Joined {
+            [VOICE_SUFFIX, REST_SUFFIX].map(|suffix| {
+                let mut joiner =
+                    wav::Joiner::create(&here.join(format!("{name}{suffix}"))).unwrap();
+                let first = dir.join(format!("first{suffix}"));
+                stem(&first, &[0.5, -0.5]);
+                joiner.append(&first).unwrap();
+                joiner
+            })
+        };
+        let block = |base: &str, samples: &[f32]| -> String {
+            let out = there.join(format!("{base}.0"));
+            fs::create_dir_all(&out).unwrap();
+            for suffix in [VOICE_SUFFIX, REST_SUFFIX] {
+                stem(&out.join(format!("{base}{suffix}")), samples);
+            }
+            out.to_string_lossy().into_owned()
+        };
+        let out = block("a", &[0.25, 1e-40, -0.0]);
+        let [voice, rest] = fetch(&ssh, "a", &out, joined("a"), 3, &[]).unwrap();
+        voice.finish().unwrap();
+        rest.finish().unwrap();
+        let whole = dir.join("whole.wav");
+        stem(&whole, &[0.5, -0.5, 0.25, 1e-40, -0.0]);
+        for suffix in [VOICE_SUFFIX, REST_SUFFIX] {
+            assert_eq!(
+                fs::read(here.join(format!("a{suffix}"))).unwrap(),
+                fs::read(&whole).unwrap()
+            );
+        }
+        let mut written: Vec<String> = fs::read_dir(&here)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            [format!("a{REST_SUFFIX}"), format!("a{VOICE_SUFFIX}")]
+        );
+        assert!(!Path::new(&out).exists());
+        // One frame short of its block.
+        let out = block("b", &[0.25, 0.75]);
+        let error = fetch(&ssh, "b", &out, joined("b"), 3, &[])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("2 frames, where its block holds 3"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

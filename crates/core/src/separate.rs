@@ -61,7 +61,9 @@ use crate::progress::{Event, Progress};
 use crate::remote::{self, Seat, Ssh};
 use crate::run::Stop;
 use crate::wav;
-use crate::worker::{Grid, Last, Lock, REST_SUFFIX, Started, Stems, VOICE_SUFFIX, Whole, Worker};
+use crate::worker::{
+    Grid, Joined, Last, Lock, REST_SUFFIX, Started, Stems, VOICE_SUFFIX, Whole, Worker,
+};
 use crate::{Error, Result, voices};
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
@@ -1782,7 +1784,7 @@ fn run(
                     pass: usize,
                     started: Instant,
                     last: Last,
-                    joined: [wav::Joiner; 2],
+                    joined: Joined,
                     stems: Stems,
                     /// Where it is joined, here.
                     dir: PathBuf,
@@ -1791,14 +1793,11 @@ fn run(
                     let Tail {
                         pass,
                         last,
-                        joined: [mut voice, mut rest],
+                        joined,
                         stems: separated,
-                        dir,
                         ..
                     } = tail;
-                    let block = last.fetch(&dir.join("block"))?;
-                    voice.append(&block.voice)?;
-                    rest.append(&block.rest)?;
+                    let [voice, rest] = last.fetch(joined)?;
                     voice.finish()?;
                     rest.finish()?;
                     finish(pass, &separated)
@@ -1916,23 +1915,18 @@ fn run(
                         if let Some(before) = tail.take() {
                             settle(before, &mut failures);
                         }
-                        let made = begun.and_then(|([mut voice, mut rest], blocks)| {
-                            let last = running.run_blocks(
+                        let made = begun.and_then(|(joined, blocks)| {
+                            running.run_blocks(
                                 blocks,
-                                &dir.join("block"),
+                                joined,
                                 |f| fraction(device, f),
-                                |block| {
-                                    voice.append(&block.voice)?;
-                                    rest.append(&block.rest).map(|_| ())
-                                },
                                 // The first in line, sent ahead.
                                 || {
                                     let next = shared.next_in_line()?;
                                     ahead = Some(next);
                                     Some(whole_of(next))
                                 },
-                            )?;
-                            Ok((last, [voice, rest]))
+                            )
                         });
                         let (last, joined) = match made {
                             Ok(made) => made,

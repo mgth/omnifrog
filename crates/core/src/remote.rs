@@ -39,6 +39,7 @@
 //! back as it is made. Under pymss a whole element goes the same way, a
 //! block at a time, but its transfers run while the worker makes the next
 //! block (see [`Worker::run_blocks`](crate::worker::Worker::run_blocks)),
+//! its stems streamed straight into the element's here ([`Ssh::stream`]),
 //! and a pass's last block comes back, and its outputs are written here,
 //! while the worker makes the first block of the next one: its GPU waits on
 //! no transfer, but for the input of a first block that could not be sent
@@ -376,6 +377,57 @@ impl Ssh {
             return Err(e);
         }
         fs::rename(&part, to).map_err(|e| Error::io(to, e))
+    }
+
+    /// The path `from` on that machine, read as it comes by `sink`, on a
+    /// thread of its own: nothing is written here but what `sink` writes —
+    /// a block's stem joined straight into the element's. What `sink`
+    /// leaves unread is read to the end, and so is the rest when it fails,
+    /// so that the copy there ends as it should. Returns what `sink` made
+    /// of it. Killed (stopped, or stalled), the copy is not waited for:
+    /// `sink` goes with its thread, and what it held with it.
+    pub fn stream<T: Send + 'static>(
+        &self,
+        from: &str,
+        sink: impl FnOnce(&mut dyn Read) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let mut child = self
+            .command(&format!("cat {}", quote(from)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| self.failed("could not start", e.to_string()))?;
+        let err = read_all(child.stderr.take());
+        let got = Arc::new(AtomicU64::new(0));
+        let drain = child.stdout.take().map(|stdout| {
+            let count = Arc::clone(&got);
+            std::thread::spawn(move || {
+                let mut counted = Counted {
+                    inner: stdout,
+                    count,
+                };
+                let made = sink(&mut counted);
+                let _ = io::copy(&mut counted, &mut io::sink());
+                made
+            })
+        });
+        let moved = || got.load(Ordering::Relaxed);
+        let what = |detail: &str| format!("fetching {from}: {}", detail.trim());
+        // Killed, nothing more is waited for (see `run`).
+        let status = self
+            .watch(&mut child, None, Some(&moved))
+            .map_err(|cut| self.failed(cut, what("")))?;
+        let made = drain.map(|drain| drain.join());
+        let err = joined(err);
+        if !status.success() {
+            return Err(self.failed(&status.to_string(), what(&err)));
+        }
+        match made {
+            Some(Ok(made)) => made,
+            Some(Err(_)) => Err(Error::msg(what("the copy here panicked"))),
+            None => Err(Error::msg(what("no output to read"))),
+        }
     }
 
     /// [`crate::run::watch`] under this connection's stop: the error is the
@@ -887,6 +939,21 @@ fn joined(reader: Option<JoinHandle<String>>) -> String {
         .unwrap_or_default()
 }
 
+/// A stream that keeps `count` up to date with what was read of it: what
+/// the watch of a transfer sees move.
+struct Counted<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.count.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
 /// `io::copy`, keeping `count` up to date as it goes.
 fn copy_counting(from: &mut impl Read, to: &mut impl Write, count: &AtomicU64) -> io::Result<u64> {
     let mut buffer = vec![0u8; 1 << 20];
@@ -1213,6 +1280,53 @@ mod tests {
         // This side leaves the remote out, and says why.
         let probe = Probe::parse(&lines.join("\n"));
         assert_eq!(probe.unfit().as_deref(), Some(why));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **A file there, read as it comes.** Through the tests' remote: the
+    /// sink is handed the file's bytes; one that stops reading early, or
+    /// fails, still lets the copy there end as it should, and its own error
+    /// is the one said. A file that is not there fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_from_there_hands_the_sink_its_bytes_and_ends_whole() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-stream-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("stem.bin");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&file, &bytes).unwrap();
+        let ssh = Ssh::new(SHELL);
+        let path = file.to_string_lossy().into_owned();
+        let read = ssh
+            .stream(&path, |stream| {
+                let mut read = Vec::new();
+                stream
+                    .read_to_end(&mut read)
+                    .map_err(|e| Error::msg(e.to_string()))?;
+                Ok(read)
+            })
+            .unwrap();
+        assert_eq!(read, bytes);
+        // The first bytes only: the rest is read and dropped.
+        let head = ssh
+            .stream(&path, |stream| {
+                let mut head = [0u8; 10];
+                stream
+                    .read_exact(&mut head)
+                    .map_err(|e| Error::msg(e.to_string()))?;
+                Ok(head)
+            })
+            .unwrap();
+        assert_eq!(head[..], bytes[..10]);
+        let failed = ssh
+            .stream(&path, |_| -> Result<()> {
+                Err(Error::msg("the sink's own"))
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(failed.contains("the sink's own"), "{failed}");
+        let gone = dir.join("gone.bin").to_string_lossy().into_owned();
+        assert!(ssh.stream(&gone, |_| Ok(())).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }
