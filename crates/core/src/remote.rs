@@ -707,7 +707,9 @@ fn device_lines(python: &Path) -> std::result::Result<Vec<String>, String> {
 /// process's own standard streams. The worker itself declines when other
 /// programs hold its device (`idle=`, see [`worker::command`]). `run`: the
 /// run the worker is for, which may have one there already ([`seat`]).
-/// Returns the worker's exit code.
+/// Its temporary files go to its seat's scratch in this machine's working
+/// directory, as a worker's do there ([`Lock::scratch`]). Returns the
+/// worker's exit code.
 pub fn serve(
     config: &Config,
     model: &Model,
@@ -742,6 +744,7 @@ pub fn serve(
         fs::create_dir_all(&path).map_err(|e| Error::io(&path, e))?;
     }
     let mut command = worker::command(config, model, &local, inference, Some(idle_below_gib))?;
+    lock.give_scratch(&mut command);
     say(&format!("DIR {}", dir.display()));
     let mut child = command
         .stdin(Stdio::piped())

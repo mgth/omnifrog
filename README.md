@@ -326,7 +326,7 @@ See [`crates/bench/README.md`](crates/bench/README.md).
 (`OMNIFROG_CONFIG` overrides; `OMNIFROG_DATA` moves the venv, MSST, models and work directories). Every key is optional:
 
 ```yaml
-work_dir: /mnt/fast/work         # temporaries, 30-45 GB per film; ASCII only if Dee encodes
+work_dir: /mnt/fast/work         # temporaries, 30-45 GB per film, the worker's own in .separating.tmp; ASCII only if Dee encodes
 models_dir: ~/models             # checkpoints, configs, replacement modules
 python: ~/venv/bin/python        # set by `setup`
 msst_dir: ~/msst                 # set by `setup`
