@@ -1524,7 +1524,9 @@ impl Lock {
 
     /// Who holds the lock `name` in `work_dir` now: `None` when nobody does;
     /// otherwise the run it was taken for ([`Lock::take_for`]), empty when it
-    /// was taken for none. Looked at without keeping it, or creating it.
+    /// was taken for none. Looked at without creating it or keeping it: a
+    /// lock nobody holds is taken for an instant, which a take meanwhile
+    /// waits out ([`TAKE_GRACE`]).
     pub(crate) fn held_by(work_dir: &Path, name: &str) -> Option<String> {
         let path = work_dir.join(name);
         let file = fs::OpenOptions::new()
@@ -1547,7 +1549,8 @@ impl Lock {
     }
 
     /// The lock on `name` in `work_dir`, its file saying which `run` took
-    /// it, under the process's id, for [`Lock::held_by`].
+    /// it, under the process's id, for [`Lock::held_by`]. Refused once it
+    /// has looked held for [`TAKE_GRACE`].
     pub(crate) fn take_for(work_dir: &Path, name: &str, run: Option<&str>) -> Result<Self> {
         fs::create_dir_all(work_dir).map_err(|e| Error::io(work_dir, e))?;
         let path = work_dir.join(name);
@@ -1558,44 +1561,61 @@ impl Lock {
             .truncate(false)
             .open(&path)
             .map_err(|e| Error::io(&path, e))?;
-        match lock(&file) {
-            Ok(()) => {
-                let _ = file.set_len(0);
-                let _ = writeln!(file, "{}", std::process::id());
-                if let Some(run) = run {
-                    let _ = writeln!(file, "{run}");
+        let deadline = Instant::now() + TAKE_GRACE;
+        loop {
+            match lock(&file) {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                let _ = file.flush();
-                let scratch = work_dir.join(format!(
-                    "{}.tmp",
-                    name.strip_suffix(".lock").unwrap_or(name)
-                ));
-                // Ours alone now: anything in it was left by a run that did
-                // not end its own way.
-                let _ = fs::remove_dir_all(&scratch);
-                fs::create_dir_all(&scratch).map_err(|e| Error::io(&scratch, e))?;
-                let scratch = std::path::absolute(&scratch).unwrap_or(scratch);
-                Ok(Self {
-                    held: Arc::new(Held {
-                        _file: file,
-                        scratch,
-                    }),
-                })
+                Err(fs::TryLockError::WouldBlock) => {
+                    let holder = fs::read_to_string(&path).unwrap_or_default();
+                    return Err(Error::msg(format!(
+                        "another run is separating{}; wait for it to finish",
+                        match holder.lines().next().unwrap_or_default().trim() {
+                            "" => String::new(),
+                            pid => format!(" (process {pid})"),
+                        }
+                    )));
+                }
+                Err(fs::TryLockError::Error(e)) => return Err(Error::io(&path, e)),
             }
-            Err(fs::TryLockError::WouldBlock) => {
-                let holder = fs::read_to_string(&path).unwrap_or_default();
-                Err(Error::msg(format!(
-                    "another run is separating{}; wait for it to finish",
-                    match holder.lines().next().unwrap_or_default().trim() {
-                        "" => String::new(),
-                        pid => format!(" (process {pid})"),
-                    }
-                )))
-            }
-            Err(fs::TryLockError::Error(e)) => Err(Error::io(&path, e)),
         }
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{}", std::process::id());
+        if let Some(run) = run {
+            let _ = writeln!(file, "{run}");
+        }
+        let _ = file.flush();
+        let scratch = work_dir.join(format!(
+            "{}.tmp",
+            name.strip_suffix(".lock").unwrap_or(name)
+        ));
+        // Ours alone now: anything in it was left by a run that did not end
+        // its own way.
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).map_err(|e| Error::io(&scratch, e))?;
+        let scratch = std::path::absolute(&scratch).unwrap_or(scratch);
+        Ok(Self {
+            held: Arc::new(Held {
+                _file: file,
+                scratch,
+            }),
+        })
     }
 }
+
+/// How long a take waits for a lock that looks held before it refuses.
+///
+/// A lock let go can stay held for an instant. On Unix, a child that
+/// another thread of the process is starting holds a copy of the lock's
+/// file from its fork until it runs its program, when the copy closes
+/// (close-on-exec); and [`Lock::held_by`] takes a free lock for an instant
+/// to look at it. Without the wait, a worker restarted after a GPU reset,
+/// while a remote's thread starts `ssh`, would be refused its own run's
+/// lock, and the step would fail. A run really holding the lock is told to
+/// wait this much later, which nobody sees.
+const TAKE_GRACE: Duration = Duration::from_millis(250);
 
 /// The lock on `file`, taken if it is free: the standard library's, on
 /// the whole file.
@@ -1643,10 +1663,12 @@ fn lock(file: &fs::File) -> std::result::Result<(), fs::TryLockError> {
     }
 }
 
-/// What `f` gives once it gives it, trying for up to two seconds: a lock
-/// just let go can still be held for an instant by a child another test is
-/// starting — forked with a copy of its file, until it runs its program and
-/// the copy closes (close-on-exec). The tests' lock checks after a `drop`.
+/// What `f` gives once it gives it, trying for up to two seconds: on Unix, a
+/// lock just let go can still be held for an instant by a child another
+/// test is starting — forked with a copy of its file, until it runs its
+/// program and the copy closes (close-on-exec). The tests' lock checks after
+/// a `drop`: a take already waits [`TAKE_GRACE`], too short under the load
+/// of a whole test run, and a look ([`Lock::held_by`]) does not wait.
 #[cfg(test)]
 pub(crate) fn soon<T, E>(
     mut f: impl FnMut() -> std::result::Result<T, E>,
@@ -1848,6 +1870,27 @@ mod tests {
         assert!(!scratch.exists());
         assert!(kernel.is_file(), "the second seat took the first's along");
         drop(first);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A worker restarted while another thread starts a child: the child
+    /// holds a copy of the lock's file until it runs its program. A
+    /// duplicate of the file, closed a little later, stands in for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_still_held_by_a_child_starting_is_waited_for() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-grace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let held = Lock::take(&dir).unwrap();
+        let copy = held.held._file.try_clone().unwrap();
+        drop(held);
+        let child = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(copy);
+        });
+        let taken = Lock::take(&dir);
+        child.join().unwrap();
+        drop(taken.unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 }

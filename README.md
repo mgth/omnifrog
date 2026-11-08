@@ -235,7 +235,9 @@ is in the progress and in the manifest. Switching it redoes the master step, the
 remux, never a separation. See `crates/core/src/duplicates.rs`.
 
 The separation takes the GPU, and only one run may have it: a lock is taken in the working
-directory while a model is loaded, and a second run is told to wait rather than allowed to try.
+directory while a model is loaded, and a second run is told to wait rather than allowed to try. A
+take waits a quarter of a second before it refuses: a lock let go can look held for an instant, while
+a child the run is starting still has a copy of its file.
 During the extraction a run has two workers on a machine, one per model, which share the lock and
 never separate at the same time (below). Other machines' GPUs can take passes beside it: see
 [Other machines](#other-machines).
@@ -298,8 +300,10 @@ same followed or made whole. On the same 9070 XT, with a desktop holding 7.3 GiB
 workers took it to 14.8 GiB of 16.3. On a remote, each worker says which run it is for
 (`remote-worker … --run <id>`), and the remote gives it whichever of its two seats is free, each with
 a lock of its own: the second only beside the same run's first, and neither to another run while
-this one has a worker there — even once its first is gone and its second still separates. A remote
-of an earlier version speaks another protocol, and is left out of every step until it is updated.
+this one has a worker there — even once its first is gone and its second still separates. A seat is
+chosen from a look at both and the other looked at again once it is taken, so two runs choosing at
+once never end up side by side. A remote of an earlier version speaks another protocol, and is left
+out of every step until it is updated.
 
 Not followed: anything under MSST or on a CPU, the original in pairs when it has objects — those
 are paired by where each one is over the whole film — and the dub in pairs.
