@@ -55,7 +55,7 @@ use crate::models::{Local, Model};
 use crate::progress::{Event, Progress};
 use crate::remote::{self, Ssh};
 use crate::run::Stop;
-use crate::{Error, Result};
+use crate::{Error, Result, wav};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -235,6 +235,77 @@ struct Far {
     ssh: Ssh,
     host: String,
     dir: Option<String>,
+    /// The inputs of the elements it follows, as far as they were sent.
+    sent: Vec<Sent>,
+}
+
+/// An input of a followed element, carried to the remote a block at a time.
+struct Sent {
+    /// Its path there.
+    path: String,
+    /// The bytes of it there.
+    bytes: u64,
+    /// Where its samples start: a header written again otherwise is sent
+    /// again from the beginning.
+    data_offset: u64,
+}
+
+impl Far {
+    fn dir(&self) -> &str {
+        self.dir.as_deref().unwrap_or_default()
+    }
+
+    /// Where the inputs of the followed element `base` are there. Named by
+    /// their rank, not their name, which the extraction changes once it is
+    /// done: the same file goes on growing there.
+    fn inputs_of(&self, base: &str) -> String {
+        format!("{}/in/{base}", self.dir())
+    }
+
+    /// Carry there what it does not have yet of `ask`'s inputs — their
+    /// header, and up to the frames they are said to hold — and return
+    /// their paths there.
+    fn carry(&mut self, ask: &Ask) -> Result<Vec<String>> {
+        let dir = self.inputs_of(ask.base);
+        let mut there = Vec::with_capacity(ask.inputs.len());
+        for (rank, input) in ask.inputs.iter().enumerate() {
+            let to = format!("{dir}/{rank}.wav");
+            let format = wav::read_header(input)?;
+            let want = format.data_offset + ask.held * format.bytes_per_frame();
+            // Taken out while it is sent: a transfer cut short leaves a file
+            // there of an unknown length, sent again whole next time.
+            let had = self
+                .sent
+                .iter()
+                .position(|sent| sent.path == to)
+                .map(|at| self.sent.swap_remove(at))
+                .filter(|sent| sent.data_offset == format.data_offset)
+                .map_or(0, |sent| sent.bytes);
+            if want > had {
+                self.ssh.send(input, had, want - had, &to)?;
+            }
+            self.sent.push(Sent {
+                path: to.clone(),
+                bytes: want.max(had),
+                data_offset: format.data_offset,
+            });
+            there.push(to);
+        }
+        Ok(there)
+    }
+
+    /// The inputs of `base` go from there.
+    fn forget(&mut self, base: &str) -> Result<()> {
+        let dir = self.inputs_of(base);
+        let inside = format!("{dir}/");
+        self.sent.retain(|sent| !sent.path.starts_with(&inside));
+        self.ssh
+            .run(
+                &format!("rm -rf -- {}", remote::quote(&dir)),
+                remote::QUICK_TIMEOUT,
+            )
+            .map(|_| ())
+    }
 }
 
 /// How a worker on another machine started.
@@ -381,6 +452,7 @@ impl Worker {
             ssh: ssh.clone(),
             host: remote.host.clone(),
             dir: None,
+            sent: Vec::new(),
         };
         let program = format!("omnifrog on {}", remote.host);
         let stop = Some(ssh.stop().clone());
@@ -687,12 +759,8 @@ impl Worker {
     /// How this worker cuts an element it follows, at `rate`. An error is
     /// a worker that cannot follow one: MSST, which separates whole
     /// elements only, or a worker on a CPU, where following would take the
-    /// cores the extraction decodes on. Here only: a remote is handed whole
-    /// elements.
+    /// cores the extraction decodes on.
     pub fn grid(&mut self, rate: u32) -> Result<Grid> {
-        if self.remote.is_some() {
-            return Err(Error::msg("a remote separates whole elements only"));
-        }
         let mut grid = None;
         self.request(&format!("GRID\t{rate}"), |word| {
             if let Word::Grid(said) = word {
@@ -704,23 +772,31 @@ impl Worker {
     }
 
     /// The next block of a followed element, if its inputs hold enough for
-    /// one; `fraction` is how far into the block the worker is.
+    /// one; `fraction` is how far into the block the worker is. A remote is
+    /// sent first what its inputs gained since the last block, and its
+    /// stems come back into `out_dir`.
     pub fn block(&mut self, ask: &Ask, mut fraction: impl FnMut(f64)) -> Result<Block> {
-        if self.remote.is_some() {
-            return Err(Error::msg("a remote separates whole elements only"));
-        }
         fs::create_dir_all(ask.out_dir).map_err(|e| Error::io(ask.out_dir, e))?;
+        let (out_dir, inputs) = match &mut self.remote {
+            None => (
+                ask.out_dir.to_string_lossy().into_owned(),
+                ask.inputs
+                    .iter()
+                    .map(|input| input.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            ),
+            Some(far) => (format!("{}/out", far.dir()), far.carry(ask)?),
+        };
         let mut request = format!(
-            "BLK\t{}\t{}\t{}\t{}\t{}",
-            ask.out_dir.to_string_lossy(),
+            "BLK\t{out_dir}\t{}\t{}\t{}\t{}",
             ask.base,
             ask.rate,
             ask.held,
             u8::from(ask.whole)
         );
-        for input in ask.inputs {
+        for input in &inputs {
             request.push('\t');
-            request.push_str(&input.to_string_lossy());
+            request.push_str(input);
         }
         let (mut span, mut last) = (None, false);
         self.request(&request, |word| match word {
@@ -738,17 +814,46 @@ impl Worker {
                 ask.base, ask.held
             )));
         }
+        if let Some(far) = &mut self.remote {
+            // The block's stems come back, and go from there; with the last
+            // one, the inputs too.
+            if to > from {
+                let mut gone = Vec::with_capacity(2);
+                for suffix in [VOICE_SUFFIX, REST_SUFFIX] {
+                    let there = format!("{out_dir}/{}{suffix}", ask.base);
+                    far.ssh
+                        .download(&there, &ask.out_dir.join(format!("{}{suffix}", ask.base)))?;
+                    gone.push(remote::quote(&there));
+                }
+                far.ssh.run(
+                    &format!("rm -f -- {}", gone.join(" ")),
+                    remote::QUICK_TIMEOUT,
+                )?;
+            }
+            if last {
+                far.forget(ask.base)?;
+            }
+        }
         Ok(Block { from, to, last })
     }
 
-    /// Forget a followed element: what the worker kept of it goes.
+    /// Forget a followed element: what the worker kept of it goes, and on a
+    /// remote what it was sent of it.
     pub fn forget(&mut self, base: &str) -> Result<()> {
-        self.request(&format!("DROP\t{base}"), |_| {})
+        let dropped = self.request(&format!("DROP\t{base}"), |_| {});
+        if let Some(far) = &mut self.remote {
+            far.forget(base)?;
+        }
+        dropped
     }
 
-    /// From now on, `stop` is what kills this worker: a worker handed from
-    /// one step to the next answers to the step it serves.
+    /// From now on, `stop` is what kills this worker, and a remote's
+    /// transfers: a worker handed from one step to the next answers to the
+    /// step it serves.
     pub fn set_stop(&mut self, stop: Option<Stop>) {
+        if let (Some(far), Some(stop)) = (&mut self.remote, &stop) {
+            far.ssh = far.ssh.clone().stopped_by(stop.clone());
+        }
         self.stop = stop;
     }
 

@@ -238,17 +238,26 @@ directory while a model is loaded, and a second run is told to wait rather than 
 Other machines' GPUs can take passes beside it: see [Other machines](#other-machines).
 
 **During the extraction.** The extraction reads the whole container and is bound by the disk — a
-quarter of an hour for a film — and the GPU would wait through it. Under pymss this machine
-separates the original's elements as the decoder writes them, a block (`inference.block_seconds`)
-at a time, the first element with a block ready first: as many elements as it keeps up with. One
-that falls two blocks behind lets the last of the followed go, which is then separated whole after
-the extraction, like the elements nobody followed — by this machine and the remotes, as before.
-How many it keeps depends on the GPU against the disk; by the times of a card that separates an
-element of a whole film in 107 s against an extraction of 15 minutes, about eight of thirteen (an
-estimate). When the decode ends, a followed element needs its last block or two: the separation
-of the original finishes those first, with the same worker — the model is loaded once for both
-steps — while the remotes start on the rest. An element comes out the same whether it was followed
-or made whole: it is cut into blocks by its length alone, so the fades fall in the same places.
+quarter of an hour for a film — and the GPUs would wait through it. Under pymss every machine that
+is ready, this one and each of the [other machines](#other-machines), separates the original's
+elements as the decoder writes them, a block (`inference.block_seconds`) at a time. They take the
+elements from one line, in order: one each at first, then another each time a machine made a
+block, during about the first two blocks of film — so each ends up with about as many as it keeps
+up with, a faster one more. Each serves its own, the first with a block ready first; one that
+falls two blocks behind lets the last of its own go, which is then separated whole after the
+extraction, like the elements nobody followed. A remote is sent what each of its elements gained
+before every block, and the block's stems come back after it: about 80 MB out and 400 MB back per
+block of ten minutes. How many each keeps depends on its GPU against the disk; by the times of a
+card that separates an element of a whole film in 107 s, a remote that does it in 128 s and an
+extraction of 15 minutes, this machine keeps about seven of thirteen and the remote about six (an
+estimate), and steps 1 to 3 go from about 35 minutes to about 24. When the decode ends, a followed
+element needs its last block or two: each machine finishes its own first, with the same worker —
+the model is loaded once for both steps — then takes what is left in line. A remote still on a
+block a minute after the decode ended is let go, and what it followed is made whole; what a remote
+takes too long to finish afterwards is made again here, whole, the first to finish keeping it, as
+with any pass. An
+element comes out the same whether it was followed or made whole, and wherever: it is cut into
+blocks by its length alone, so the fades fall in the same places.
 Only one block's stems are on disk at a time; an element without its dialogue waits in float until
 the depth the original was mastered at is known. A decode that fails or is stopped drops what was
 followed (the extraction starts again anyway). The steps stay six: the progress says how much of
@@ -402,8 +411,8 @@ opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 G
 setting of `inference` is this machine's, so a stem is the same wherever it was made; a remote's
 own configuration only says where its Python, MSST, models and work directory are. A remote also
 takes the lock of its own working directory, so its passes and a run on that machine never share
-its GPU. A remote is handed whole elements only: what is separated during the extraction is this
-machine's.
+its GPU. During the extraction, a remote follows elements of the original too, as this machine does
+(see *During the extraction* above), and its worker, loaded then, serves the separation after it.
 
 ## Requirements
 
