@@ -7,8 +7,8 @@
 //!
 //! - `remote-check`, once a step: its version, the device torch would run
 //!   on, and how much of that device's memory is in use ([`probe`]). A
-//!   remote of another version, or without a GPU torch can use, is left
-//!   out.
+//!   remote of another version, without a GPU torch can use, or under a
+//!   ROCm override its card cannot run ([`crate::rocm`]), is left out.
 //! - `remote-worker '<model>' '<inference>' <idle below GiB>`, once a step
 //!   ([`serve`]): the worker of [`crate::worker`], its model loaded once
 //!   and fed one pass after another as this machine's is, its protocol
@@ -579,6 +579,11 @@ impl Verdict {
 
 /// The remote's side of [`probe`]: what `remote-check` prints.
 pub fn check(config: &Config) -> Vec<String> {
+    check_under(config, crate::rocm::check())
+}
+
+/// [`check`], with what [`crate::rocm::check`] said of this machine.
+fn check_under(config: &Config, rocm: Option<crate::rocm::Report>) -> Vec<String> {
     let mut lines = vec![format!(
         "OMNIFROG {} {}",
         env!("CARGO_PKG_VERSION"),
@@ -590,6 +595,10 @@ pub fn check(config: &Config) -> Vec<String> {
             "MISSING no Python for the inference at {}: run `omnifrog setup` there",
             python.display()
         ));
+    } else if let Some(why) = rocm.and_then(|report| report.broken) {
+        // Naming the device has torch open the card, under an override it
+        // cannot run: say why instead, and leave Python alone.
+        lines.push(format!("MISSING {why}"));
     } else {
         // The worker names the device it would run on, and reads that very
         // card's memory (`DEVICE`, `VRAM`): what a pass would find.
@@ -954,5 +963,41 @@ mod tests {
             worker::SOURCE.contains("BUSY another program holds"),
             "the worker no longer says BUSY the way this side reads it"
         );
+    }
+
+    #[test]
+    fn under_an_override_the_card_cannot_run_the_check_leaves_python_alone() {
+        let dir = std::env::temp_dir().join(format!("omnifrog-remote-rocm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Not a program: had the check started it to name the device, it
+        // would say that the worker does not start.
+        let python = dir.join("python");
+        fs::write(&python, "not a program\n").unwrap();
+        let config = Config {
+            python: Some(python),
+            msst_dir: Some(dir.clone()),
+            ..Config::default()
+        };
+        let why = "HSA_OVERRIDE_GFX_VERSION=11.0.0 tells ROCm the card the separation runs on is \
+                   a gfx1100, but it is a gfx1201, of another generation";
+        let broken = crate::rocm::Report {
+            summary: "gfx1201".to_string(),
+            broken: Some(why.to_string()),
+            warnings: Vec::new(),
+        };
+        let lines = check_under(&config, Some(broken));
+        assert!(
+            !lines.iter().any(|line| line.contains("does not start")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("DEVICE ")),
+            "{lines:?}"
+        );
+        // This side leaves the remote out, and says why.
+        let probe = Probe::parse(&lines.join("\n"));
+        assert_eq!(probe.unfit().as_deref(), Some(why));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
