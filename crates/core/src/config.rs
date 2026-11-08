@@ -329,8 +329,9 @@ pub struct Inference {
     /// keeps a whole block on the device, so this is what its memory grows
     /// with; outside the fades between blocks the output does not depend on
     /// it, to rounding. It is never taken shorter than four of the model's
-    /// windows, and an element is cut into equal blocks of at most that plus
-    /// one window (the fade), the last one no longer than the others.
+    /// windows; an element is cut into blocks of that plus one window (the
+    /// fade) and a last one of what is left, by its length alone, so that a
+    /// block can be made while the extraction is still writing it.
     pub block_seconds: u32,
     /// Windows computed at once, replacing the model's published
     /// `inference.batch_size`; 0 = the model's. Memory grows with it, and a

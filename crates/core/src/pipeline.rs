@@ -199,6 +199,9 @@ fn run_logged(
         from.label()
     )));
     tell_earlier(&job.manifest, Some(from), progress);
+    // What the extraction separated of the original as it went, for the
+    // step after it to finish.
+    let mut followed: Option<separate::Followed> = None;
     for step in Step::ALL {
         if step < from {
             continue;
@@ -207,19 +210,38 @@ fn run_logged(
         match step {
             Step::Extract => {
                 announce(step, progress);
-                let extracted = extract::run(
-                    config,
-                    &extract::Plan {
-                        source: &media.path,
-                        original,
-                        dub,
-                        dir: &job.extract_dir(),
-                        duration: media.duration,
-                        seconds: options.seconds,
-                        start: job.manifest.start,
-                    },
-                    progress,
-                )?;
+                let dir = job.extract_dir();
+                let plan = extract::Plan {
+                    source: &media.path,
+                    original,
+                    dub,
+                    dir: &dir,
+                    duration: media.duration,
+                    seconds: options.seconds,
+                    start: job.manifest.start,
+                };
+                let follows = separate::follows(config);
+                if follows {
+                    // What the follower writes is this run's from the start.
+                    let signature = signature_original(&job.manifest);
+                    claim(&mut job, separate::Stage::Original, &signature)?;
+                }
+                let (extracted, kept) = if follows {
+                    let follower =
+                        separate::Follower::new(config, &job, model_original, job.manifest.pairs);
+                    std::thread::scope(|scope| {
+                        let following = scope.spawn(|| follower.follow(progress));
+                        let extracted =
+                            extract::run_with(config, &plan, progress, &|ok| follower.decoded(ok));
+                        // Also when the run failed before the decode began.
+                        follower.decoded(extracted.is_ok());
+                        (extracted, following.join().unwrap_or(None))
+                    })
+                } else {
+                    (extract::run(config, &plan, progress), None)
+                };
+                let extracted = extracted?;
+                followed = kept;
                 job.manifest.extract = Some(crate::job::ExtractState {
                     source_codec: extracted.master.source_codec.clone(),
                     elements: extracted.master.channels.iter().map(|c| c.id).collect(),
@@ -232,14 +254,7 @@ fn run_logged(
             Step::SeparateOriginal => {
                 announce(step, progress);
                 let master = MasterSet::find(&job.extract_dir())?;
-                let signature = separate::signature(
-                    &job.manifest.model_original,
-                    &job.manifest.source,
-                    job.manifest.original.index,
-                    job.manifest.seconds,
-                    job.manifest.start,
-                    separate::mode_original(job.manifest.pairs),
-                );
+                let signature = signature_original(&job.manifest);
                 claim(&mut job, separate::Stage::Original, &signature)?;
                 let done = separate::original(
                     config,
@@ -247,6 +262,7 @@ fn run_logged(
                     model_original,
                     &master,
                     job.manifest.pairs,
+                    followed.take(),
                     progress,
                 )?;
                 job.manifest.separate_original = Some(SeparateState {
@@ -498,6 +514,18 @@ fn finish(
         ))),
     }
     Ok(())
+}
+
+/// The signature of the original's stems for this manifest.
+fn signature_original(manifest: &Manifest) -> String {
+    separate::signature(
+        &manifest.model_original,
+        &manifest.source,
+        manifest.original.index,
+        manifest.seconds,
+        manifest.start,
+        separate::mode_original(manifest.pairs),
+    )
 }
 
 /// Make a separation's directory this run's before its first element.

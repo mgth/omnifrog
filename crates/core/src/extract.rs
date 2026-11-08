@@ -53,7 +53,7 @@ pub const RATE: u64 = 48_000;
 pub const BYTES_PER_SAMPLE: u64 = 3;
 
 /// How often the extraction looks at what has been written.
-const POLL: Duration = Duration::from_millis(400);
+pub(crate) const POLL: Duration = Duration::from_millis(400);
 
 /// What one pass produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +96,21 @@ pub struct Plan<'a> {
 /// Decode the original into `plan.dir` and split the dub beside it, in one
 /// pass over the source.
 pub fn run(config: &Config, plan: &Plan, progress: Progress) -> Result<Extracted> {
+    run_with(config, plan, progress, &|_| {})
+}
+
+/// [`run`], `decoded` told once ffmpeg and the decoder are done — whether
+/// they succeeded — and before anything is renamed: until it returns, the
+/// decoder's `canal_<n>.wav` are where it wrote them, and from then on they
+/// are whole. What follows the original as it is written waits there for
+/// its last read of them. It is not told when the run fails before the
+/// decode starts.
+pub fn run_with(
+    config: &Config,
+    plan: &Plan,
+    progress: Progress,
+    decoded: &dyn Fn(bool),
+) -> Result<Extracted> {
     let Plan {
         source,
         original,
@@ -213,7 +228,9 @@ pub fn run(config: &Config, plan: &Plan, progress: Progress) -> Result<Extracted
         _ => 0.0,
     };
     let expected = (wanted > 0.0).then(|| (wanted * RATE as f64) as u64 * BYTES_PER_SAMPLE);
-    pipe(demux, decode, dir, expected, progress)?;
+    let piped = pipe(demux, decode, dir, expected, progress);
+    decoded(piped.is_ok());
+    piped?;
 
     let header = master_prefix.with_extension("atmos");
     let master =

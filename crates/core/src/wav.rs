@@ -346,6 +346,102 @@ pub fn mix_mono(
     Ok(clipped)
 }
 
+/// A mono float WAV written a piece at a time, its sizes stated once it is
+/// [finished](Appender::finish): what an element followed during the
+/// extraction grows in, one block of stems after another.
+///
+/// Every piece goes through [`Reader`], as [`mix_mono`]'s single pick does,
+/// so a file grown so holds, to the bit, what `mix_mono` writes in
+/// [`Sample::Float`] from the whole stem.
+pub struct Appender {
+    writer: BufWriter<File>,
+    path: std::path::PathBuf,
+    sample_rate: u32,
+    frames: u64,
+}
+
+impl Appender {
+    pub fn create(path: &Path, sample_rate: u32) -> Result<Self> {
+        create_parent(path)?;
+        let mut writer = BufWriter::new(File::create(path).map_err(|e| Error::io(path, e))?);
+        write_header(&mut writer, Self::format(sample_rate, 0)).map_err(|e| Error::io(path, e))?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+            sample_rate,
+            frames: 0,
+        })
+    }
+
+    fn format(sample_rate: u32, frames: u64) -> Format {
+        Format {
+            channels: 1,
+            sample_rate,
+            bits: 32,
+            float: true,
+            frames,
+            data_offset: 0,
+        }
+    }
+
+    /// Frames written so far.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Everything `pick` holds, after what is already there; returns how
+    /// many frames it was.
+    pub fn append(&mut self, pick: Pick) -> Result<u64> {
+        let mut reader = pick.open()?;
+        let mut samples = vec![0f32; BLOCK];
+        let mut bytes = vec![0u8; BLOCK * 4];
+        let mut added = 0u64;
+        loop {
+            let read = reader.read_block(&mut samples)?;
+            if read == 0 {
+                break;
+            }
+            for (out, sample) in bytes.chunks_exact_mut(4).zip(&samples[..read]) {
+                out.copy_from_slice(&sample.to_le_bytes());
+            }
+            self.writer
+                .write_all(&bytes[..read * 4])
+                .map_err(|e| Error::io(&self.path, e))?;
+            added += read as u64;
+        }
+        self.frames += added;
+        Ok(added)
+    }
+
+    /// Silence up to `frames`, as [`mix_mono`] pads a stem shorter than the
+    /// element it belongs to.
+    pub fn pad_to(&mut self, frames: u64) -> Result<()> {
+        let zeros = vec![0u8; BLOCK * 4];
+        while self.frames < frames {
+            let take = ((frames - self.frames) as usize).min(BLOCK);
+            self.writer
+                .write_all(&zeros[..take * 4])
+                .map_err(|e| Error::io(&self.path, e))?;
+            self.frames += take as u64;
+        }
+        Ok(())
+    }
+
+    /// The sizes written into the header; the file is whole from here on.
+    pub fn finish(mut self) -> Result<()> {
+        let path = self.path.clone();
+        let io = |e| Error::io(&path, e);
+        self.writer.flush().map_err(io)?;
+        let mut file = self
+            .writer
+            .into_inner()
+            .map_err(|e| Error::io(&path, e.into_error()))?;
+        file.seek(SeekFrom::Start(0)).map_err(io)?;
+        write_header(&mut file, Self::format(self.sample_rate, self.frames)).map_err(io)?;
+        file.flush().map_err(io)
+    }
+}
+
 /// A WAV read in blocks, folded to mono.
 ///
 /// What every measurement walks: several of these advance in step over the
@@ -723,6 +819,47 @@ mod tests {
         // A side past the last one is the last one.
         assert_eq!(write(&[Pick::Channel(&a, 5)]), [0.1, 0.2, 0.3]);
         assert!(mix_mono(&[], &out, 3, 48_000, 1.0, Sample::Float).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_grown_a_block_at_a_time_is_the_one_written_whole() {
+        let dir = scratch("append");
+        let (left, right): (Vec<f32>, Vec<f32>) = (0..5000)
+            .map(|i| {
+                (
+                    (i as f32 * 0.37).sin() * 0.8,
+                    (i as f32 * 0.11).cos() * -0.3,
+                )
+            })
+            .unzip();
+        let whole = dir.join("whole.wav");
+        stereo_float(&whole, &left, &right);
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        stereo_float(&a, &left[..3000], &right[..3000]);
+        stereo_float(&b, &left[3000..], &right[3000..]);
+        let grown = dir.join("grown.wav");
+        let written = dir.join("written.wav");
+        // Padded past the stem, as an element longer than its pair is.
+        for (pick, piece) in [
+            (Pick::Fold(&whole), [Pick::Fold(&a), Pick::Fold(&b)]),
+            (
+                Pick::Channel(&whole, 1),
+                [Pick::Channel(&a, 1), Pick::Channel(&b, 1)],
+            ),
+        ] {
+            let mut appender = Appender::create(&grown, 48_000).unwrap();
+            assert_eq!(appender.append(piece[0]).unwrap(), 3000);
+            assert_eq!(appender.append(piece[1]).unwrap(), 2000);
+            appender.pad_to(5100).unwrap();
+            assert_eq!(appender.frames(), 5100);
+            appender.finish().unwrap();
+            mix_mono(&[pick], &written, 5100, 48_000, 1.0, Sample::Float).unwrap();
+            assert_eq!(
+                std::fs::read(&grown).unwrap(),
+                std::fs::read(&written).unwrap()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
