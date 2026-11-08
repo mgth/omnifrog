@@ -61,7 +61,7 @@ use crate::progress::{Event, Progress};
 use crate::remote::{self, Seat, Ssh};
 use crate::run::Stop;
 use crate::wav;
-use crate::worker::{Lock, Started, Stems, Worker};
+use crate::worker::{Grid, Last, Lock, REST_SUFFIX, Started, Stems, VOICE_SUFFIX, Whole, Worker};
 use crate::{Error, Result, voices};
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
@@ -786,6 +786,9 @@ struct Queue {
     todo: VecDeque<usize>,
     /// Per device: the pass it is on.
     running: Vec<Option<Run>>,
+    /// Per device: a pass it claimed and whose outputs it writes while it
+    /// is on the next one (a remote's, see [`Shared::set_aside`]).
+    writing: Vec<Option<Run>>,
     /// Per pass of the plan: the device that has its stems and writes its
     /// outputs.
     claimed: Vec<Option<usize>>,
@@ -834,6 +837,7 @@ impl Shared {
                 total: todo.len(),
                 todo,
                 running: vec![None; devices],
+                writing: vec![None; devices],
                 claimed: vec![None; passes],
                 numbers: vec![0; passes],
                 pending: vec![0; devices],
@@ -862,12 +866,22 @@ impl Shared {
     /// One that waits makes again the oldest pass another device is on, and
     /// waits only while every pass under way is being written.
     fn take(&self, device: usize, waits: bool) -> Option<Took> {
+        self.take_preferring(device, waits, None)
+    }
+
+    /// [`Shared::take`], `prefer` before the first in line while nobody has
+    /// taken it: the pass whose input a remote sent ahead.
+    fn take_preferring(&self, device: usize, waits: bool, prefer: Option<usize>) -> Option<Took> {
         let mut queue = self.queue();
         loop {
             if queue.failed.is_some() || queue.finished == queue.total {
                 return None;
             }
-            if let Some(pass) = queue.todo.pop_front() {
+            let next = match prefer.and_then(|p| queue.todo.iter().position(|&q| q == p)) {
+                Some(at) => queue.todo.remove(at),
+                None => queue.todo.pop_front(),
+            };
+            if let Some(pass) = next {
                 queue.taken += 1;
                 queue.numbers[pass] = queue.taken;
                 return Some(self.start(&mut queue, device, pass, None));
@@ -890,7 +904,10 @@ impl Shared {
             if let Some(&(beside, run)) = oldest {
                 return Some(self.start(&mut queue, device, run.pass, Some(beside)));
             }
-            if queue.running.iter().all(Option::is_none) && queue.pending.iter().all(|&n| n == 0) {
+            if queue.running.iter().all(Option::is_none)
+                && queue.writing.iter().all(Option::is_none)
+                && queue.pending.iter().all(|&n| n == 0)
+            {
                 return None;
             }
             // A pass a remote is finishing is looked at again once its
@@ -912,6 +929,12 @@ impl Shared {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             };
         }
+    }
+
+    /// The pass first in line: the one a device taking now would have. Only
+    /// a guess of what comes next, since another device may take it first.
+    fn next_in_line(&self) -> Option<usize> {
+        self.queue().todo.front().copied()
     }
 
     fn start(&self, queue: &mut Queue, device: usize, pass: usize, beside: Option<usize>) -> Took {
@@ -949,7 +972,8 @@ impl Shared {
                     .fold(0.0, f64::max)
             })
             .sum();
-        queue.finished as f64 + under_way
+        let writing = queue.writing.iter().flatten().count() as f64;
+        queue.finished as f64 + writing + under_way
     }
 
     /// `device` has the stems of its pass. `true` if it is the first: it
@@ -1001,6 +1025,12 @@ impl Shared {
         let Some(run) = queue.running[device].take() else {
             return;
         };
+        self.back(&mut queue, device, run);
+    }
+
+    /// `run`, which `device` is off, back in line unless it is made
+    /// elsewhere (see [`Shared::give_back`]).
+    fn back(&self, queue: &mut Queue, device: usize, run: Run) {
         if queue.claimed[run.pass] == Some(device) {
             queue.claimed[run.pass] = None;
         }
@@ -1016,6 +1046,37 @@ impl Shared {
             queue.todo.push_front(run.pass);
         }
         self.changed.notify_all();
+    }
+
+    /// `device`, which claimed its pass, writes its outputs while it goes
+    /// on to the next one: a remote whose last block's stems are still
+    /// coming while its GPU makes the next pass's first. Until it is
+    /// [written](Shared::written), this machine waits for it.
+    fn set_aside(&self, device: usize) {
+        let mut queue = self.queue();
+        let run = queue.running[device].take();
+        queue.writing[device] = run;
+    }
+
+    /// `device` wrote the outputs of the pass it set aside.
+    fn written(&self, device: usize) {
+        let mut queue = self.queue();
+        if queue.writing[device].take().is_some() {
+            queue.finished += 1;
+        }
+        if queue.finished == queue.total {
+            self.stop_all();
+        }
+        self.changed.notify_all();
+    }
+
+    /// `device` could not write the outputs of the pass it set aside: its
+    /// claim goes, and the pass back in line.
+    fn unwritten(&self, device: usize) {
+        let mut queue = self.queue();
+        if let Some(run) = queue.writing[device].take() {
+            self.back(&mut queue, device, run);
+        }
     }
 
     /// `count` more passes this run makes that are not in line: those the
@@ -1332,6 +1393,18 @@ fn run(
                 };
                 Ok((input, out))
             };
+            // The same pass as a remote is fed it a block at a time: the
+            // extraction's own files, side by side for a pair, under the
+            // rate the model was trained at, as long as the shorter.
+            let whole_of = |pass: usize| -> Whole {
+                let step = plan.passes[pass];
+                let sides: Vec<usize> = std::iter::once(step.left).chain(step.right).collect();
+                Whole {
+                    base: names[pass].clone(),
+                    inputs: sides.iter().map(|&u| units[u].source.clone()).collect(),
+                    frames: sides.iter().map(|&u| frames[u]).min().unwrap_or(0),
+                }
+            };
             // What a pass's stems become: the outputs of the units it alone
             // serves, or stems kept aside for the ones estimated twice.
             let finish = |pass: usize, stem: &Stems| -> Result<()> {
@@ -1540,7 +1613,11 @@ fn run(
             // A remote: one worker for the step too, its model loaded once
             // (see `remote`). It never fails the step: what it does not
             // make, this machine makes. Whatever it runs is killed when its
-            // stop is raised.
+            // stop is raised. A worker that can follow is fed each pass a
+            // block at a time, its transfers under its compute, and the
+            // next in line's first block sent ahead; once it made a pass's
+            // last block, it takes and begins the next one while that pass's
+            // last stems come back and its outputs are written (`Tail`).
             let far = |device: usize, remote: &Remote, began: Option<Machine>| {
                 let who = &remote.host;
                 let ssh = Ssh::new(who).stopped_by(shared.stop(device));
@@ -1665,15 +1742,126 @@ fn run(
                 /// How a pass went over there.
                 enum Made {
                     Yes,
+                    /// Made and claimed; its outputs are written while the
+                    /// worker makes the next pass's first block.
+                    Aside,
                     /// Another device made it first.
                     Lost,
                     /// The remote's GPU is someone else's: why.
                     Busy(String),
                 }
-                while let Some(took) = shared.take(device, false) {
+                // The pass as one request, as this machine makes it: its
+                // input there whole, then its stems back whole, and its
+                // outputs written.
+                let whole_there = |running: &mut Worker, pass: usize, started: Instant| {
+                    let (input, out) = input_of(pass, device)?;
+                    let separated = running
+                        .separate(std::slice::from_ref(&input), &out, |f| fraction(device, f))?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            Error::msg(format!("the separation of {} left no stems", names[pass]))
+                        })?;
+                    for note in running.take_notes() {
+                        progress(Event::message(format!("  {}{note}", prefix(device))));
+                    }
+                    if !shared.claim(device) {
+                        return Ok(Made::Lost);
+                    }
+                    // Stems that do not make outputs are given back with
+                    // the claim, and the pass is made here.
+                    finish(pass, &separated)?;
+                    done_in(device, pass, started);
+                    Ok(Made::Yes)
+                };
+                /// A pass made there a block at a time and claimed: its last
+                /// block's stems still there, fetched, joined to the others
+                /// and made outputs while the worker makes the next pass's
+                /// first block.
+                struct Tail {
+                    pass: usize,
+                    started: Instant,
+                    last: Last,
+                    joined: [wav::Joiner; 2],
+                    stems: Stems,
+                    /// Where it is joined, here.
+                    dir: PathBuf,
+                }
+                let write = |tail: Tail| -> Result<()> {
+                    let Tail {
+                        pass,
+                        last,
+                        joined: [mut voice, mut rest],
+                        stems: separated,
+                        dir,
+                        ..
+                    } = tail;
+                    let block = last.fetch(&dir.join("block"))?;
+                    voice.append(&block.voice)?;
+                    rest.append(&block.rest)?;
+                    voice.finish()?;
+                    rest.finish()?;
+                    finish(pass, &separated)
+                };
+                // A tail that fails is the remote's failure, as a pass's.
+                let settle = |tail: Tail, failures: &mut u32| {
+                    let (pass, started, dir) = (tail.pass, tail.started, tail.dir.clone());
+                    match write(tail) {
+                        Ok(()) => {
+                            done_in(device, pass, started);
+                            shared.written(device);
+                        }
+                        Err(_) if stop.raised() => {
+                            progress(Event::message(format!(
+                                "  {}{}: stopped before its last stems came back",
+                                prefix(device),
+                                names[pass]
+                            )));
+                            shared.unwritten(device);
+                        }
+                        Err(why) => {
+                            shared.unwritten(device);
+                            *failures += 1;
+                            progress(Event::message(format!(
+                                "{who}: {} failed, made here instead: {why}",
+                                names[pass]
+                            )));
+                        }
+                    }
+                    let _ = discard(&dir);
+                };
+                // How the worker there cuts an element, asked once of each:
+                // `None` for one that separates whole elements only (MSST).
+                let mut cuts: Option<Option<Grid>> = None;
+                // The pass whose input was sent there ahead of its turn.
+                let mut ahead: Option<usize> = None;
+                // The pass before, its last block's stems still there.
+                let mut tail: Option<Tail> = None;
+                loop {
+                    let prefer = ahead.take();
+                    let took = shared.take_preferring(device, false, prefer);
+                    // Sent ahead of a pass another machine took first: it
+                    // goes from there.
+                    if let Some(sent) = prefer
+                        && took.is_none_or(|took| took.pass != sent)
+                        && let Some(running) = &mut worker
+                        && running.is_alive()
+                    {
+                        let _ = running.recall(&names[sent]);
+                    }
+                    let Some(took) = took else {
+                        break;
+                    };
                     let pass = took.pass;
                     let started = Instant::now();
                     let outcome = (|| -> Result<Made> {
+                        // A worker to start first: the tail has nothing to
+                        // be written under.
+                        if worker.is_none()
+                            && let Some(before) = tail.take()
+                        {
+                            settle(before, &mut failures);
+                        }
                         // Started at the first pass, and again only after
                         // one that killed it.
                         let running = match &mut worker {
@@ -1687,36 +1875,121 @@ fn run(
                                 beside.seat(device),
                             )? {
                                 Started::Busy(why) => return Ok(Made::Busy(why)),
-                                Started::Ready(worker) => none.insert(worker),
+                                Started::Ready(worker) => {
+                                    cuts = None;
+                                    none.insert(worker)
+                                }
                             },
                         };
+                        let cut = *cuts.get_or_insert_with(|| {
+                            follows(config)
+                                .then(|| running.grid(model.rate).ok())
+                                .flatten()
+                        });
                         announce(device, took);
-                        let (input, out) = input_of(pass, device)?;
-                        let separated =
-                            running.separate(std::slice::from_ref(&input), &out, |f| {
-                                fraction(device, f)
-                            })?;
+                        let Some(cut) = cut else {
+                            if let Some(before) = tail.take() {
+                                settle(before, &mut failures);
+                            }
+                            return whole_there(running, pass, started);
+                        };
+                        // A block at a time: the stems joined here as they
+                        // come back, in a directory of the pass's own.
+                        let dir = stems.join(format!("{device}.{pass}"));
+                        let separated = Stems {
+                            voice: dir.join(format!("{}{VOICE_SUFFIX}", names[pass])),
+                            rest: dir.join(format!("{}{REST_SUFFIX}", names[pass])),
+                        };
+                        let joined = empty(&dir).and_then(|()| {
+                            Ok([
+                                wav::Joiner::create(&separated.voice)?,
+                                wav::Joiner::create(&separated.rest)?,
+                            ])
+                        });
+                        let begun = joined.and_then(|joined| {
+                            let blocks =
+                                running.begin_in_blocks(whole_of(pass), model.rate, cut)?;
+                            Ok((joined, blocks))
+                        });
+                        // Its first block is being made: the pass before is
+                        // written meanwhile.
+                        if let Some(before) = tail.take() {
+                            settle(before, &mut failures);
+                        }
+                        let made = begun.and_then(|([mut voice, mut rest], blocks)| {
+                            let last = running.run_blocks(
+                                blocks,
+                                &dir.join("block"),
+                                |f| fraction(device, f),
+                                |block| {
+                                    voice.append(&block.voice)?;
+                                    rest.append(&block.rest).map(|_| ())
+                                },
+                                // The first in line, sent ahead.
+                                || {
+                                    let next = shared.next_in_line()?;
+                                    ahead = Some(next);
+                                    Some(whole_of(next))
+                                },
+                            )?;
+                            Ok((last, [voice, rest]))
+                        });
+                        let (last, joined) = match made {
+                            Ok(made) => made,
+                            // Refused there — out of device memory, which
+                            // only a whole element falls back to MSST from —
+                            // or a transfer that failed: the worker is idle,
+                            // and makes it as it did.
+                            Err(why) if !stop.raised() && running.is_alive() => {
+                                progress(Event::message(format!(
+                                    "  {}{}: {why}; separated whole there instead",
+                                    prefix(device),
+                                    names[pass]
+                                )));
+                                let _ = running.forget(&names[pass]);
+                                let _ = discard(&dir);
+                                return whole_there(running, pass, started);
+                            }
+                            Err(why) => {
+                                let _ = discard(&dir);
+                                return Err(why);
+                            }
+                        };
                         for note in running.take_notes() {
                             progress(Event::message(format!("  {}{note}", prefix(device))));
                         }
                         if !shared.claim(device) {
+                            last.drop_there();
+                            let _ = discard(&dir);
                             return Ok(Made::Lost);
                         }
-                        // Stems that do not make outputs are given back
-                        // with the claim, and the pass is made here.
-                        finish(pass, &separated[0])?;
-                        done_in(device, pass, started);
-                        Ok(Made::Yes)
+                        // Its GPU goes on to the next pass at once.
+                        shared.set_aside(device);
+                        tail = Some(Tail {
+                            pass,
+                            started,
+                            last,
+                            joined,
+                            stems: separated,
+                            dir,
+                        });
+                        Ok(Made::Aside)
                     })();
                     // A worker the pass killed — stopped under the request,
                     // or dead — is started again for the next one; one that
                     // lives on, after a transfer that failed, is kept.
                     if let Some(dead) = worker.take_if(|worker| !worker.is_alive()) {
                         keep_peak(&dead);
+                        // What was sent there went with it.
+                        ahead = None;
                     }
                     match outcome {
                         Ok(Made::Yes) => {
                             shared.done(device);
+                            failures = 0;
+                            said_busy = false;
+                        }
+                        Ok(Made::Aside) => {
                             failures = 0;
                             said_busy = false;
                         }
@@ -1746,14 +2019,18 @@ fn run(
                                 "{who}: {} failed, made here instead: {why}",
                                 names[pass]
                             )));
-                            if failures >= REMOTE_FAILURES {
-                                progress(Event::message(format!(
-                                    "{who}: left out for the rest of this step"
-                                )));
-                                break;
-                            }
                         }
                     }
+                    if failures >= REMOTE_FAILURES {
+                        progress(Event::message(format!(
+                            "{who}: left out for the rest of this step"
+                        )));
+                        break;
+                    }
+                }
+                // The last pass's outputs, before the worker goes.
+                if let Some(before) = tail.take() {
+                    settle(before, &mut failures);
                 }
                 if let Some(worker) = &worker {
                     keep_peak(worker);
@@ -1980,6 +2257,7 @@ fn clear_parts(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::job::ModelRef;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn next(pass: usize, number: usize) -> Option<Took> {
@@ -1996,6 +2274,71 @@ mod tests {
             number,
             beside: Some(beside),
         })
+    }
+
+    /// **The pass a remote sent ahead** is the one it takes next while
+    /// nobody took it; once another device did, it takes the first in line.
+    #[test]
+    fn a_remote_takes_the_pass_it_sent_ahead_unless_another_took_it() {
+        let shared = Shared::new(VecDeque::from([0, 1, 2, 3]), 4, 2);
+        assert_eq!(shared.take(0, false), next(0, 1));
+        assert_eq!(shared.next_in_line(), Some(1));
+        // The remote sent 2 ahead, behind 1 in line.
+        assert_eq!(shared.take_preferring(1, false, Some(2)), next(2, 2));
+        shared.done(1);
+        shared.done(0);
+        // Taken meanwhile: the first in line instead.
+        assert_eq!(shared.take_preferring(1, false, Some(2)), next(1, 3));
+        assert_eq!(shared.next_in_line(), Some(3));
+        assert_eq!(shared.take_preferring(0, false, None), next(3, 4));
+        assert_eq!(shared.next_in_line(), None);
+    }
+
+    /// **A pass a remote writes while it is on the next one** is neither in
+    /// line nor made again here: this machine waits for it, and makes it
+    /// once it is given back.
+    #[test]
+    fn a_pass_a_remote_writes_while_on_the_next_one_keeps_this_machine_waiting() {
+        let shared = Arc::new(Shared::new(VecDeque::from([0, 1]), 2, 2));
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert!(shared.claim(1));
+        shared.set_aside(1);
+        // Its GPU on the next pass at once.
+        assert_eq!(shared.take(1, false), next(1, 2));
+        assert_eq!(shared.at(1, 0.5), 1.5);
+        // This machine has nothing in line: it makes again the pass the
+        // remote is on, not the one it writes.
+        assert_eq!(shared.take(0, true), again(1, 2, 1));
+        assert!(shared.claim(0));
+        shared.done(0);
+        shared.give_back(1);
+        // The other one fails to be written: back in line, made here.
+        let waiting = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.take(0, true))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiting.is_finished());
+        shared.unwritten(1);
+        assert_eq!(waiting.join().unwrap(), next(0, 2));
+        assert!(shared.claim(0));
+        shared.done(0);
+        assert_eq!(shared.take(0, true), None);
+    }
+
+    #[test]
+    fn a_pass_a_remote_set_aside_ends_the_step_once_written() {
+        let shared = Arc::new(Shared::new(VecDeque::from([0]), 1, 2));
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert!(shared.claim(1));
+        shared.set_aside(1);
+        let waiting = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.take(0, true))
+        };
+        shared.written(1);
+        assert_eq!(waiting.join().unwrap(), None);
+        assert!(shared.stop(1).raised());
     }
 
     #[test]

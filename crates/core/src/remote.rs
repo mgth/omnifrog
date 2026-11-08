@@ -36,7 +36,15 @@
 //! link against minutes of inference. An element the remote follows during
 //! the extraction goes there a piece at a time — what its waveform gained
 //! since the last block, appended (`cat >>`) — and each block's stems come
-//! back as it is made.
+//! back as it is made. Under pymss a whole element goes the same way, a
+//! block at a time, but its transfers run while the worker makes the next
+//! block (see [`Worker::run_blocks`](crate::worker::Worker::run_blocks)),
+//! and a pass's last block comes back, and its outputs are written here,
+//! while the worker makes the first block of the next one: its GPU waits on
+//! no transfer, but for the input of a first block that could not be sent
+//! ahead during the pass before. Nothing of this is new to the remote: the
+//! same words, the inputs and stems of a whole element in directories of
+//! their own.
 //!
 //! **A GPU in use is left alone.** The worker starts only if the other
 //! programs there hold less than `idle_below_gib` of the memory of the

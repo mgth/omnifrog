@@ -52,7 +52,9 @@
 //! A worker can also run on another machine, through `ssh` and that
 //! machine's omnifrog ([`Worker::start_remote`], [`crate::remote`]): the
 //! same words, two more before `PRET` (`BUSY`, `DIR`), and the files carried
-//! there and back around each request.
+//! there and back around each request — or, for a whole element under
+//! pymss, while the worker makes the block after theirs
+//! ([`Worker::begin_in_blocks`]).
 
 use crate::config::{Config, Engine, Inference, Remote};
 use crate::models::{Local, Model};
@@ -314,18 +316,152 @@ impl Far {
         Ok(there)
     }
 
-    /// The inputs of `base` go from there.
-    fn forget(&mut self, base: &str) -> Result<()> {
-        let dir = self.inputs_of(base);
-        let inside = format!("{dir}/");
+    /// Where block `k` of the whole element `base` leaves its stems there:
+    /// one directory for the even blocks and one for the odd, so that a
+    /// block's stems are fetched while the next one is written beside them.
+    fn out_of(&self, base: &str, k: u64) -> String {
+        format!("{}/out/{base}.{}", self.dir(), k % 2)
+    }
+
+    /// Nothing of the inputs of `base` is counted as there any more: they
+    /// go, or are sent again from the beginning.
+    fn unsend(&mut self, base: &str) {
+        let inside = format!("{}/", self.inputs_of(base));
         self.sent.retain(|sent| !sent.path.starts_with(&inside));
+    }
+
+    /// The inputs of `base` go from there, and whatever stems of it are
+    /// still there.
+    fn forget(&mut self, base: &str) -> Result<()> {
+        self.unsend(base);
+        let gone = [
+            self.inputs_of(base),
+            self.out_of(base, 0),
+            self.out_of(base, 1),
+        ];
+        let quoted: Vec<String> = gone.iter().map(|path| remote::quote(path)).collect();
         self.ssh
             .run(
-                &format!("rm -rf -- {}", remote::quote(&dir)),
+                &format!("rm -rf -- {}", quoted.join(" ")),
                 remote::QUICK_TIMEOUT,
             )
             .map(|_| ())
     }
+}
+
+/// An element to separate whole on another machine, a block at a time
+/// ([`Worker::begin_in_blocks`]).
+#[derive(Debug, Clone)]
+pub struct Whole {
+    /// What the worker calls it: its stems are `<base>.voix.wav` and
+    /// `<base>.sansvoix.wav`.
+    pub base: String,
+    /// One mono input, or two side by side, whole.
+    pub inputs: Vec<PathBuf>,
+    /// Frames every input holds.
+    pub frames: u64,
+}
+
+impl Whole {
+    /// What its inputs have to hold for block `k` of `grid`: up to where
+    /// that block can be made, and all of them for the last one.
+    fn held(&self, grid: Grid, k: u64) -> u64 {
+        if k + 1 < grid.blocks(self.frames) {
+            grid.ready_at(k)
+        } else {
+            self.frames
+        }
+    }
+
+    fn ask<'a>(&'a self, grid: Grid, k: u64, rate: u32, out_dir: &'a Path) -> Ask<'a> {
+        Ask {
+            base: &self.base,
+            out_dir,
+            rate,
+            held: self.held(grid, k),
+            whole: k + 1 == grid.blocks(self.frames),
+            inputs: &self.inputs,
+        }
+    }
+}
+
+/// A `BLK` request: `ask`'s next block, its inputs `inputs` there, its stems
+/// left in `out_dir` there.
+fn blk(out_dir: &str, ask: &Ask, inputs: &[String]) -> String {
+    let mut request = format!(
+        "BLK\t{out_dir}\t{}\t{}\t{}\t{}",
+        ask.base,
+        ask.rate,
+        ask.held,
+        u8::from(ask.whole)
+    );
+    for input in inputs {
+        request.push('\t');
+        request.push_str(input);
+    }
+    request
+}
+
+/// An element a worker on another machine is making a block at a time:
+/// what it is, and the paths there of what was sent of its next block.
+pub struct Blocks {
+    whole: Whole,
+    rate: u32,
+    grid: Grid,
+    there: Vec<String>,
+}
+
+/// The last block of a whole element, made on another machine, its stems
+/// still there: fetched while the worker makes the next element's first
+/// block, so that its GPU waits for no transfer between the two.
+pub struct Last {
+    ssh: Ssh,
+    base: String,
+    /// Where its stems are there.
+    there: String,
+    /// Where the element's inputs are there.
+    inputs: String,
+}
+
+impl Last {
+    /// Its stems, into `out_dir`; then everything of the element goes from
+    /// there.
+    pub fn fetch(self, out_dir: &Path) -> Result<Stems> {
+        fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
+        fetch(&self.ssh, &self.base, &self.there, out_dir, &[self.inputs])
+    }
+
+    /// Its stems are not wanted: everything of the element goes from there,
+    /// if the connection still serves (another machine made it first, and
+    /// may have stopped this one's transfers).
+    pub fn drop_there(self) {
+        let gone = [self.there, self.inputs].map(|path| remote::quote(&path));
+        let _ = self.ssh.run(
+            &format!("rm -rf -- {}", gone.join(" ")),
+            remote::QUICK_TIMEOUT,
+        );
+    }
+}
+
+/// The stems of `base` in `there`, on the machine `ssh` reaches, into
+/// `out_dir`; then `there` goes, with `also`.
+fn fetch(ssh: &Ssh, base: &str, there: &str, out_dir: &Path, also: &[String]) -> Result<Stems> {
+    let stems = Stems {
+        voice: out_dir.join(format!("{base}{VOICE_SUFFIX}")),
+        rest: out_dir.join(format!("{base}{REST_SUFFIX}")),
+    };
+    for (suffix, to) in [(VOICE_SUFFIX, &stems.voice), (REST_SUFFIX, &stems.rest)] {
+        ssh.download(&format!("{there}/{base}{suffix}"), to)?;
+    }
+    let gone: Vec<String> = std::iter::once(there)
+        .chain(also.iter().map(String::as_str))
+        .map(remote::quote)
+        .collect();
+    ssh.run(
+        &format!("rm -rf -- {}", gone.join(" ")),
+        remote::QUICK_TIMEOUT,
+    )?;
+    Ok(stems)
 }
 
 /// How a worker on another machine started.
@@ -770,7 +906,14 @@ impl Worker {
     /// `GRID`, `BLK`); the device's peak and the notes are kept here. The
     /// worker is given an hour between two words, and killed when its stop
     /// is raised, whatever the request.
-    fn request(&mut self, line: &str, mut on: impl FnMut(Word)) -> Result<()> {
+    fn request(&mut self, line: &str, on: impl FnMut(Word)) -> Result<()> {
+        self.send(line)?;
+        self.answer(on)
+    }
+
+    /// Send one request, without waiting for the worker's answer: whatever
+    /// is done before [`Worker::answer`] is done while the worker works.
+    fn send(&mut self, line: &str) -> Result<()> {
         // Told to stop before it began: nothing to kill, the worker can
         // serve the next request.
         if self.stopped() {
@@ -786,6 +929,12 @@ impl Worker {
         {
             return Err(self.died("the worker stopped before the request was sent"));
         }
+        Ok(())
+    }
+
+    /// The worker's words about the request it was sent, until its `FIN`
+    /// (see [`Worker::request`]).
+    fn answer(&mut self, mut on: impl FnMut(Word)) -> Result<()> {
         loop {
             match self.next(QUIET_TIMEOUT) {
                 Ok(Word::Finished) => return Ok(()),
@@ -846,17 +995,7 @@ impl Worker {
             ),
             Some(far) => (format!("{}/out", far.dir()), far.carry(ask)?),
         };
-        let mut request = format!(
-            "BLK\t{out_dir}\t{}\t{}\t{}\t{}",
-            ask.base,
-            ask.rate,
-            ask.held,
-            u8::from(ask.whole)
-        );
-        for input in &inputs {
-            request.push('\t');
-            request.push_str(input);
-        }
+        let request = blk(&out_dir, ask, &inputs);
         if self.remote.is_some() {
             took.send = at.elapsed();
         }
@@ -916,6 +1055,160 @@ impl Worker {
             far.forget(base)?;
         }
         dropped
+    }
+
+    /// Begin `whole` on another machine a block at a time, cut and faded by
+    /// the plan an element followed during the extraction is (`GRID`,
+    /// `BLK`): the same stems as one `SEP` of it. Its first block's input
+    /// goes there — unless it was sent ahead — and the worker is asked for
+    /// that block, which it makes while the caller does something else (the
+    /// pass before's [`Last`]); [`Worker::run_blocks`] goes on from there.
+    pub fn begin_in_blocks(&mut self, whole: Whole, rate: u32, grid: Grid) -> Result<Blocks> {
+        let far = self.far()?;
+        let first = whole.ask(grid, 0, rate, Path::new(""));
+        let there = far.carry(&first)?;
+        let line = blk(&far.out_of(&whole.base, 0), &first, &there);
+        self.send(&line)?;
+        Ok(Blocks {
+            whole,
+            rate,
+            grid,
+            there,
+        })
+    }
+
+    /// The rest of an element [begun](Worker::begin_in_blocks): while the
+    /// worker makes block k, block k − 1's stems come back into `out_dir`
+    /// and the input of block k + 1 goes there, so the transfers cost the
+    /// pass nothing but its first block's input and its last block's
+    /// stems. `each` is handed every block's stems in order but the last
+    /// one's, which go once it returns; `fraction` is how far through the
+    /// element the worker is. Returns once the worker made the last block:
+    /// its stems are still there ([`Last`]), for the caller to fetch while
+    /// the worker goes on with the next element.
+    ///
+    /// `ahead` is asked once, as soon as all of this element's input is
+    /// there, for the element likely to be next: the input of its first
+    /// block goes there too, so the next pass waits for none of its own.
+    /// It stays there until that element is separated or
+    /// [recalled](Worker::recall); a transfer of it that fails is left for
+    /// that element's own blocks to make again.
+    ///
+    /// An error leaves the worker idle and alive when it can: a transfer
+    /// that fails under a block waits for the worker's answer. What it holds
+    /// of the element then is [forgotten](Worker::forget) by the caller.
+    pub fn run_blocks(
+        &mut self,
+        blocks: Blocks,
+        out_dir: &Path,
+        mut fraction: impl FnMut(f64),
+        mut each: impl FnMut(&Stems) -> Result<()>,
+        ahead: impl FnOnce() -> Option<Whole>,
+    ) -> Result<Last> {
+        let Blocks {
+            whole,
+            rate,
+            grid,
+            mut there,
+        } = blocks;
+        fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
+        let count = grid.blocks(whole.frames);
+        let mut ahead = Some(ahead);
+        let mut written = 0;
+        for k in 0..count {
+            // While block k is made over there.
+            let during = (|| -> Result<()> {
+                if k > 0 {
+                    let stems = self.fetch(&whole.base, k - 1, out_dir)?;
+                    each(&stems)?;
+                    let _ = fs::remove_file(&stems.voice);
+                    let _ = fs::remove_file(&stems.rest);
+                }
+                let far = self.far()?;
+                if k + 1 < count {
+                    there = far.carry(&whole.ask(grid, k + 1, rate, out_dir))?;
+                }
+                // All of this element's input is there from now on.
+                if k + 2 >= count
+                    && let Some(next) = ahead.take().and_then(|ahead| ahead())
+                {
+                    let _ = far.carry(&next.ask(grid, 0, rate, out_dir));
+                }
+                Ok(())
+            })();
+            // Read whatever went wrong meanwhile: the worker is idle again
+            // once it answered, its block made or not.
+            let (mut span, mut last) = (None, false);
+            let answered = self.answer(|word| match word {
+                Word::Fraction(f) => fraction((k as f64 + f.clamp(0.0, 1.0)) / count as f64),
+                Word::Block { from, to } => span = Some((from, to)),
+                Word::Done => last = true,
+                _ => {}
+            });
+            during?;
+            answered?;
+            let (from, to) = span.ok_or_else(|| {
+                Error::msg(format!("the worker said nothing of {}'s block", whole.base))
+            })?;
+            let held = whole.held(grid, k);
+            if from != written || to <= from || to > held || last != (k + 1 == count) {
+                return Err(Error::msg(format!(
+                    "{}: block {} of {count}, frames {from} to {to}{}, where {written} of its {} \
+                     frames were made",
+                    whole.base,
+                    k + 1,
+                    if last { " and the last" } else { "" },
+                    whole.frames
+                )));
+            }
+            written = to;
+            if k + 1 < count {
+                let far = self.far()?;
+                let line = blk(
+                    &far.out_of(&whole.base, k + 1),
+                    &whole.ask(grid, k + 1, rate, out_dir),
+                    &there,
+                );
+                self.send(&line)?;
+            }
+        }
+        if written != whole.frames {
+            return Err(Error::msg(format!(
+                "{}: {written} of its {} frames made",
+                whole.base, whole.frames
+            )));
+        }
+        // Its input has served: it goes with the last block's stems.
+        let far = self.far()?;
+        far.unsend(&whole.base);
+        Ok(Last {
+            ssh: far.ssh.clone(),
+            there: far.out_of(&whole.base, count - 1),
+            inputs: far.inputs_of(&whole.base),
+            base: whole.base,
+        })
+    }
+
+    /// Block `k`'s stems of the whole element `base`, from there into
+    /// `out_dir`, and gone from there.
+    fn fetch(&mut self, base: &str, k: u64, out_dir: &Path) -> Result<Stems> {
+        let far = self.far()?;
+        fetch(&far.ssh, base, &far.out_of(base, k), out_dir, &[])
+    }
+
+    fn far(&mut self) -> Result<&mut Far> {
+        self.remote
+            .as_mut()
+            .ok_or_else(|| Error::msg("not a worker on another machine"))
+    }
+
+    /// What was sent there of `base` goes, and nothing else: the input of
+    /// an element sent ahead of its pass, which another machine took.
+    pub fn recall(&mut self, base: &str) -> Result<()> {
+        match &mut self.remote {
+            Some(far) => far.forget(base),
+            None => Ok(()),
+        }
     }
 
     /// From now on, `stop` is what kills this worker, and a remote's

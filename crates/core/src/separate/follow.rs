@@ -2218,6 +2218,25 @@ mod tests {
     const MOCK_WHOLE_ONLY: &str = "OMNIFROG_MOCK_WHOLE_ONLY";
     /// As [`MOCK_DIE`], for the mock on a remote's second seat alone.
     const MOCK_DIE_BESIDE: &str = "OMNIFROG_MOCK_DIE_BESIDE";
+    /// Set, the mock as a remote's `remote-worker` holds a block's stems
+    /// back until it is asked for the next block of the element — or, for
+    /// the last one, asked while another element's input is there, for a
+    /// block of another element — and answers for that one only once they
+    /// were fetched: they wait in named pipes, which a fetch made before
+    /// the next request would wait on in vain.
+    const MOCK_HOLD: &str = "OMNIFROG_MOCK_HOLD";
+    /// A file the mock as a remote's `remote-worker` adds a line to for
+    /// every block it is asked for — `ask <base> <block> sent <bases>`, the
+    /// elements whose inputs are in its directory — and, held back
+    /// ([`MOCK_HOLD`]), `fetched <base> <block> during <base> <block>`.
+    const MOCK_LOG: &str = "OMNIFROG_MOCK_LOG";
+    /// A file the mock as a remote's `remote-worker` waits for (a minute at
+    /// most) at a block it is asked for while another element's input is
+    /// there: the test's word that another machine took that element.
+    const MOCK_WAIT_FOR: &str = "OMNIFROG_MOCK_WAIT_FOR";
+    /// A file the mock waits for (a minute at most) before every whole
+    /// separation but its first.
+    const MOCK_SEP_WAIT: &str = "OMNIFROG_MOCK_SEP_WAIT";
     /// The mock's grid, in frames: a block's step, the fade, the lookahead.
     const STEP: u64 = 8_000;
     const FADE: u64 = 1_000;
@@ -2355,6 +2374,30 @@ mod tests {
         let fail = std::env::var(MOCK_FAIL).ok();
         let hang = std::env::var(MOCK_HANG).ok();
         let whole_only = std::env::var_os(MOCK_WHOLE_ONLY).is_some();
+        let hold = std::env::var_os(MOCK_HOLD).is_some();
+        let log = std::env::var_os(MOCK_LOG).map(PathBuf::from);
+        let wait_for = std::env::var_os(MOCK_WAIT_FOR).map(PathBuf::from);
+        let sep_wait = std::env::var_os(MOCK_SEP_WAIT).map(PathBuf::from);
+        let mut separations = 0;
+        let await_file = |flag: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !flag.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let note = |line: String| {
+            if let Some(log) = &log
+                && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        };
+        // As a remote's: the directory its inputs are sent to.
+        let mut far_dir: Option<PathBuf> = None;
+        // A block's stems held back: its element and block, the directory
+        // and rate they are written at, the stems, and whether it is the
+        // element's last.
+        let mut kept_back: Option<(String, u64, String, u32, Stems, bool)> = None;
         // A list of `<base>:<block>`, `*` for any base.
         let hits = |spec: &Option<String>, base: &str, k: u64| {
             spec.as_deref().is_some_and(|spec| {
@@ -2416,6 +2459,7 @@ mod tests {
                 fs::create_dir_all(dir.join(sub)).unwrap();
             }
             say(&format!("DIR {}", dir.display()));
+            far_dir = Some(dir);
         }
         let die = match second {
             true => std::env::var(MOCK_DIE_BESIDE).ok(),
@@ -2438,6 +2482,12 @@ mod tests {
                     Ok(())
                 }
                 "SEP" => (|| {
+                    separations += 1;
+                    if let Some(flag) = &sep_wait
+                        && separations > 1
+                    {
+                        await_file(flag);
+                    }
                     for input in &fields[2..] {
                         let format =
                             wav::read_header(Path::new(input)).map_err(|e| e.to_string())?;
@@ -2462,6 +2512,47 @@ mod tests {
                     let held: u64 = fields[4].parse().map_err(|_| "frames")?;
                     let whole = fields[5] == "1";
                     let (k, tail) = streams.remove(base).unwrap_or((0, None));
+                    // The elements whose inputs are there.
+                    let mut sent: Vec<String> = far_dir
+                        .as_ref()
+                        .and_then(|dir| fs::read_dir(dir.join("in")).ok())
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.path().is_dir())
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    sent.sort();
+                    let another = sent.iter().any(|other| other != base);
+                    if far_dir.is_some() {
+                        note(format!("ask {base} {k} sent {}", sent.join(",")));
+                        if let Some(flag) = &wait_for
+                            && another
+                        {
+                            await_file(flag);
+                        }
+                    }
+                    // A block held back goes out once the next one is asked
+                    // for — the next of its element, or for an element's last
+                    // one, the first of another — which is answered once it
+                    // went.
+                    let serving = kept_back
+                        .take()
+                        .filter(|(b, j, _, _, _, last)| match last {
+                            false => b == base && j + 1 == k,
+                            true => b != base,
+                        })
+                        .map(|(b, j, out, rate, piece, _)| {
+                            let (went, gone) = channel();
+                            let what = format!("{b} {j}");
+                            std::thread::spawn(move || {
+                                write_stems(&out, &b, rate, &piece);
+                                let _ = went.send(());
+                            });
+                            (what, gone)
+                        });
                     if hits(&fail, base, k) {
                         return Err("RuntimeError: the mock fails here".to_string());
                     }
@@ -2484,8 +2575,30 @@ mod tests {
                     }
                     let stems = separate_block(&read(&fields[6..], from, to)?);
                     let (piece, next) = fade(stems, tail, !ready);
-                    write_stems(out, base, rate, &piece);
+                    if let Some((what, gone)) = serving {
+                        let went = gone.recv_timeout(Duration::from_secs(60)).is_ok();
+                        let fetched = if went { "fetched" } else { "not fetched" };
+                        note(format!("{fetched} {what} during {base} {k}"));
+                    }
+                    // Its directory is the request's, made as the worker does.
+                    fs::create_dir_all(out).map_err(|e| e.to_string())?;
                     let made = piece[0][0].len() as u64;
+                    // The last block too, when another element was sent
+                    // ahead: one comes after it.
+                    if hold && (ready || another) {
+                        for suffix in [VOICE_SUFFIX, REST_SUFFIX] {
+                            let pipe = Path::new(out).join(format!("{base}{suffix}"));
+                            let _ = fs::remove_file(&pipe);
+                            let piped = Command::new("mkfifo").arg(&pipe).status();
+                            if !piped.is_ok_and(|status| status.success()) {
+                                return Err(format!("mkfifo {}", pipe.display()));
+                            }
+                        }
+                        kept_back =
+                            Some((base.to_string(), k, out.to_string(), rate, piece, !ready));
+                    } else {
+                        write_stems(out, base, rate, &piece);
+                    }
                     say(&format!("BLK {base} {from} {}", from + made));
                     if ready {
                         streams.insert(base.to_string(), (k + 1, next));
@@ -2792,8 +2905,20 @@ mod tests {
             env: &[(&str, String)],
             progress: Progress,
         ) -> super::super::Separated {
-            let master = MasterSet::read(&job.extract_dir().join("vo.atmos")).unwrap();
             let start = |stop: Stop| Worker::start_command(mock(env), Some(stop), &quiet);
+            self.separate_started(job, followed, beside, &start, progress)
+        }
+
+        /// The same, this machine's worker started by `start`.
+        fn separate_started(
+            &self,
+            job: &Job,
+            followed: Option<Followed>,
+            beside: &Beside,
+            start: super::super::Start,
+            progress: Progress,
+        ) -> super::super::Separated {
+            let master = MasterSet::read(&job.extract_dir().join("vo.atmos")).unwrap();
             super::super::original_with(
                 &self.config,
                 job,
@@ -4269,5 +4394,380 @@ mod tests {
             started.elapsed()
         );
         same(&followed, &whole);
+    }
+
+    /// The original of `film`, extracted, then separated with the bench's
+    /// remotes beside this machine, whose worker (the mock for `here`)
+    /// starts once `until` holds of what the run said, a minute at most:
+    /// what each machine makes does not depend on how fast it is. `watch`
+    /// sees what the run said as it is said.
+    #[cfg(unix)]
+    fn beside_remotes(
+        bench: &Bench,
+        film: &Film,
+        here: &[(&str, String)],
+        until: impl Fn(&Said) -> bool + Sync,
+        watch: impl Fn(&Said) + Sync,
+    ) -> (Outputs, Arc<Said>) {
+        let job = bench.job("beside", Pairs::default());
+        film.extracted(&job.extract_dir());
+        let said = Arc::new(Said::default());
+        let record = said.progress();
+        let progress = |event: Event| {
+            record(event);
+            watch(&said);
+        };
+        let start = |stop: Stop| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !until(&said) && !stop.raised() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Worker::start_command(mock(here), Some(stop), &quiet)
+        };
+        bench.separate_started(&job, None, &Beside::default(), &start, &progress);
+        (Bench::outputs(&job), said)
+    }
+
+    /// The passes the tests' remote made, by what it said.
+    #[cfg(unix)]
+    fn made_there(said: &Said) -> usize {
+        lines_with(said, &format!("[{}] ", remote::SHELL))
+            .iter()
+            .filter(|line| line.contains(" done in "))
+            .count()
+    }
+
+    /// The blocks the mock as a remote was asked for, in order: the
+    /// element, the block, and the elements whose inputs were there.
+    #[cfg(unix)]
+    fn asked(log: &str) -> Vec<(String, u64, Vec<String>)> {
+        log.lines()
+            .filter_map(|line| {
+                let mut words = line.strip_prefix("ask ")?.split(' ');
+                let base = words.next()?.to_string();
+                let k = words.next()?.parse().ok()?;
+                let sent = match (words.next(), words.next()) {
+                    (Some("sent"), Some(list)) => list
+                        .split(',')
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Some((base, k, sent))
+            })
+            .collect()
+    }
+
+    /// **A remote's whole passes, a block at a time.** After the extraction
+    /// the remote makes three of the four elements, and its GPU never waits
+    /// on a transfer. Each block's stems are fetched while it makes the
+    /// next, an element's last ones while it makes the next element's first
+    /// block: the mock holds them back until it is asked for that one, and
+    /// answers for it only once they went. The input of each element after
+    /// its first is there before that element's first block is asked for:
+    /// sent while the one before was made. All comes out as separated whole
+    /// here, and nothing is left there.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_fetches_each_block_while_it_makes_the_next_and_has_its_next_input_first() {
+        let mut bench = Bench::new("far-blocks");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        let log = bench.root.join("far.log");
+        bench.config.remotes = vec![far_mock(
+            &bench,
+            &[
+                (MOCK_HOLD, "1".to_string()),
+                (MOCK_LOG, log.to_string_lossy().into_owned()),
+            ],
+        )];
+        // This machine starts once the remote made all but the element it
+        // took first.
+        let (outputs, said) =
+            beside_remotes(&bench, &film, &[], |said| made_there(said) >= 3, |_| {});
+        same(&outputs, &whole);
+        assert_eq!(made_there(&said), 3, "{}", said.lines());
+        assert!(!said.any("instead"), "{}", said.lines());
+        let log = fs::read_to_string(&log).unwrap();
+        let asked = asked(&log);
+        let bases: Vec<&String> = asked
+            .iter()
+            .filter(|(_, k, _)| *k == 0)
+            .map(|(base, ..)| base)
+            .collect();
+        assert_eq!(bases.len(), 3, "{log}");
+        let blocks = Grid {
+            step: STEP,
+            ahead: AHEAD,
+        }
+        .blocks(film.frames);
+        assert_eq!(blocks, 8);
+        assert_eq!(asked.len() as u64, 3 * blocks, "{log}");
+        for base in &bases {
+            for k in 1..blocks {
+                assert!(
+                    log.contains(&format!("fetched {base} {} during {base} {k}\n", k - 1)),
+                    "block {} of {base} was not fetched while {k} was made:\n{log}",
+                    k - 1
+                );
+            }
+        }
+        assert!(!log.contains("not fetched"), "{log}");
+        for pair in bases.windows(2) {
+            let (before, next) = (pair[0], pair[1]);
+            // Its GPU went on to the next at once.
+            assert!(
+                log.contains(&format!(
+                    "fetched {before} {} during {next} 0\n",
+                    blocks - 1
+                )),
+                "the last block of {before} was not fetched while {next} began:\n{log}"
+            );
+            let first = asked
+                .iter()
+                .position(|(base, k, _)| base == next && *k == 0)
+                .unwrap();
+            assert!(
+                asked[..first]
+                    .iter()
+                    .any(|(base, _, sent)| base == before && sent.contains(next)),
+                "{next} was not sent while {before} was made:\n{log}"
+            );
+        }
+        assert_eq!(left_there(&bench, "in"), Vec::<String>::new(), "{log}");
+        assert_eq!(left_there(&bench, "out"), Vec::<String>::new(), "{log}");
+    }
+
+    /// **A remote's pairs, and the centre made twice.** The dub in pairs,
+    /// its centre beside its left and its right: the remote makes two of
+    /// the three passes, a block at a time. Each side of a pair's stems is
+    /// a channel's, and the centre is the average of two estimates, kept
+    /// from passes made on both machines or on the remote alone: every
+    /// voice is the one this machine writes alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_s_pairs_and_the_centre_made_twice_come_out_as_here() {
+        let mut bench = Bench::new("far-pairs");
+        let names = ["L", "R", "C", "LFE", "Lss", "Rss"];
+        let channels: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let dub = |bench: &Bench, job: &str, start: super::super::Start, progress: Progress| {
+            let job = bench.job(job, Pairs::ALL);
+            let dir = job.extract_dir();
+            fs::create_dir_all(&dir).unwrap();
+            for (i, name) in names.iter().enumerate() {
+                let mut bytes = Film::wav_header(60_000);
+                bytes.extend(Film::bytes(40 + i as u32, 0, 60_000));
+                fs::write(dir.join(format!("{}{name}.wav", extract::DUB)), bytes).unwrap();
+            }
+            super::super::dub_with(
+                &bench.config,
+                &job,
+                &bench.model,
+                &channels,
+                Pairs::ALL,
+                None,
+                Some(start),
+                progress,
+            )
+            .unwrap();
+            Bench::outputs(&job)
+        };
+        let now = |stop: Stop| Worker::start_command(mock(&[]), Some(stop), &quiet);
+        let alone = dub(&bench, "here", &now, &quiet);
+        assert!(alone.iter().any(|(name, _)| name == "voix_C.wav"));
+        bench.config.remotes = vec![far_mock(&bench, &[])];
+        let said = Arc::new(Said::default());
+        let progress = said.progress();
+        let late = |stop: Stop| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while made_there(&said) < 2 && !stop.raised() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Worker::start_command(mock(&[]), Some(stop), &quiet)
+        };
+        let beside = dub(&bench, "beside", &late, &progress);
+        same(&beside, &alone);
+        assert_eq!(made_there(&said), 2, "{}", said.lines());
+        assert!(!said.any("instead"), "{}", said.lines());
+        assert_eq!(left_there(&bench, "in"), Vec::<String>::new());
+        assert_eq!(left_there(&bench, "out"), Vec::<String>::new());
+    }
+
+    /// **A remote that refuses a block of a whole pass.** Its worker lives:
+    /// what it holds of the element goes, and it makes the element whole in
+    /// one request, as it did before — which is where an element out of
+    /// device memory goes through MSST. Nothing counts as a failure, and
+    /// nothing is left there.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_refuses_a_block_makes_the_element_whole_instead() {
+        let mut bench = Bench::new("far-refuses");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_FAIL, "*:3".to_string())])];
+        let (outputs, said) =
+            beside_remotes(&bench, &film, &[], |said| made_there(said) >= 3, |_| {});
+        same(&outputs, &whole);
+        assert_eq!(made_there(&said), 3, "{}", said.lines());
+        assert_eq!(
+            lines_with(&said, "the mock fails here; separated whole there instead").len(),
+            3,
+            "{}",
+            said.lines()
+        );
+        assert!(!said.any("made here instead"), "{}", said.lines());
+        assert_eq!(left_there(&bench, "in"), Vec::<String>::new());
+        assert_eq!(left_there(&bench, "out"), Vec::<String>::new());
+    }
+
+    /// **A remote whose worker dies under a block of a whole pass**, and
+    /// again under the same block once started again: the element is made
+    /// here, and the remote is left out of the rest of the step.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_dies_under_a_block_twice_is_left_out() {
+        let mut bench = Bench::new("far-dies-whole");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_DIE, "*:3".to_string())])];
+        let left_out = format!("{}: left out for the rest of this step", remote::SHELL);
+        let (outputs, said) =
+            beside_remotes(&bench, &film, &[], |said| said.any(&left_out), |_| {});
+        same(&outputs, &whole);
+        assert!(said.any(&left_out), "{}", said.lines());
+        assert_eq!(
+            lines_with(&said, "failed, made here instead").len(),
+            2,
+            "{}",
+            said.lines()
+        );
+        assert_eq!(made_there(&said), 0, "{}", said.lines());
+    }
+
+    /// **A remote that hangs on a block of a whole pass.** This machine,
+    /// with nothing else left, makes that element again beside it and keeps
+    /// its own; the remote's worker is killed under the block, its element
+    /// dropped, rather than waited for.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_hangs_on_a_block_is_overtaken_here() {
+        let mut bench = Bench::new("far-hangs-whole");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_HANG, "*:2".to_string())])];
+        let far = remote::SHELL;
+        let started = std::time::Instant::now();
+        // This machine starts once the remote is on an element.
+        let (outputs, said) = beside_remotes(
+            &bench,
+            &film,
+            &[],
+            |said| said.any(&format!("[{far}] element ")),
+            |_| {},
+        );
+        same(&outputs, &whole);
+        assert!(
+            said.any(&format!(
+                "again, beside {far}: the first to finish keeps it"
+            )),
+            "{}",
+            said.lines()
+        );
+        assert!(
+            lines_with(
+                &said,
+                "made first by another machine; this one's is dropped"
+            )
+            .iter()
+            .any(|line| line.contains(&format!("[{far}] "))),
+            "{}",
+            said.lines()
+        );
+        assert_eq!(made_there(&said), 0, "{}", said.lines());
+        // Not the hour a worker is given between two words.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// **The input sent ahead of an element another machine took.** The
+    /// remote sends the next in line ahead while it makes its first; this
+    /// machine takes that one first (the remote's last block waits until it
+    /// has, and this machine's next separation until the remote is on
+    /// another element). The remote takes the one after, and what it was
+    /// sent of the other goes from there before it says so.
+    #[cfg(unix)]
+    #[test]
+    fn an_input_sent_ahead_of_an_element_taken_here_goes_from_the_remote() {
+        let mut bench = Bench::new("far-ahead");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        let log = bench.root.join("far.log");
+        let taken_here = bench.root.join("taken-here");
+        let on_another = bench.root.join("on-another");
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        bench.config.remotes = vec![far_mock(
+            &bench,
+            &[(MOCK_LOG, path(&log)), (MOCK_WAIT_FOR, path(&taken_here))],
+        )];
+        let far = remote::SHELL;
+        let sent_ahead = || {
+            asked(&fs::read_to_string(&log).unwrap_or_default())
+                .iter()
+                .any(|(_, _, sent)| sent.len() > 1)
+        };
+        let (outputs, said) = beside_remotes(
+            &bench,
+            &film,
+            &[(MOCK_SEP_WAIT, path(&on_another))],
+            |_| sent_ahead(),
+            |said| {
+                if lines_with(said, "[local] element ").len() >= 2 {
+                    let _ = fs::write(&taken_here, b"");
+                }
+                if lines_with(said, &format!("[{far}] element ")).len() >= 2 {
+                    let _ = fs::write(&on_another, b"");
+                }
+            },
+        );
+        same(&outputs, &whole);
+        let log = fs::read_to_string(&log).unwrap();
+        let asked = asked(&log);
+        let first = asked[0].0.clone();
+        let ahead = asked
+            .iter()
+            .find_map(|(_, _, sent)| sent.iter().find(|base| **base != first))
+            .unwrap_or_else(|| panic!("nothing was sent ahead:\n{log}"))
+            .clone();
+        // Taken here, it was never asked for there, and its input went.
+        assert!(
+            lines_with(&said, "[local] element ")
+                .iter()
+                .any(|line| line.ends_with(&format!("({ahead})"))),
+            "{}",
+            said.lines()
+        );
+        assert!(!asked.iter().any(|(base, ..)| *base == ahead), "{log}");
+        assert!(!left_there(&bench, "in").contains(&ahead), "{log}");
+        // The remote went on to another one, sent nothing of it ahead.
+        let then = lines_with(&said, &format!("[{far}] element "));
+        assert_eq!(then.len(), 2, "{}", said.lines());
+        assert!(
+            !then
+                .iter()
+                .any(|line| line.ends_with(&format!("({ahead})"))),
+            "{}",
+            said.lines()
+        );
+        assert!(
+            asked
+                .iter()
+                .filter(|(base, ..)| *base != first)
+                .all(|(_, _, sent)| !sent.contains(&ahead)),
+            "{log}"
+        );
     }
 }

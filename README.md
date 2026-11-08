@@ -445,7 +445,17 @@ SSH is stopped. Over there, a worker whose connection went is stopped within ten
 card and the lock are free again.
 
 The inputs go there and the stems come back over SSH, through the connection the first command
-opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 GB back. Every
+opens and keeps (on Unix): a pass of a two-hour film is about 1.5 GB out and 5 GB back. Under
+pymss a remote is fed each element a block at a time: while it makes one block, the stems of the
+block before come back and the input of the next one goes, and once all of an element's input is
+there the first block of the next in line goes too. As soon as it made an element's last block it
+takes the next pass and begins it, and that last block's stems come back, and the outputs are
+written here, meanwhile: its GPU waits on no transfer. A remote takes a pass from the line only
+when its GPU is free for it (what it was sent ahead is a guess, dropped there if another machine
+takes that pass first), so the line stays here, and any pass not begun is anyone's. The
+stems are the same as from the element whole (the same blocks, the
+same fades); a block the worker refuses — out of device memory, say — has it make the element
+whole instead, as before, which is where pymss falls back to MSST. Every
 setting of `inference` is this machine's, so a stem is the same wherever it was made; a remote's
 own configuration only says where its Python, MSST, models and work directory are. A remote also
 takes the lock of its own working directory, so its passes and a run on that machine never share

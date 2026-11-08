@@ -442,6 +442,102 @@ impl Appender {
     }
 }
 
+/// What [`write_header`] writes, in bytes.
+const HEADER: usize = 44;
+
+/// A WAV grown from others of one format, their samples copied as they
+/// are, its sizes stated once it is [finished](Joiner::finish): a stem a
+/// remote made a block at a time, whole again here. Nothing is decoded, so
+/// it holds, to the bit, the samples of the blocks it was given, in order.
+pub struct Joiner {
+    writer: BufWriter<File>,
+    path: std::path::PathBuf,
+    /// The first block's.
+    format: Option<Format>,
+    frames: u64,
+}
+
+impl Joiner {
+    pub fn create(path: &Path) -> Result<Self> {
+        create_parent(path)?;
+        let mut writer = BufWriter::new(File::create(path).map_err(|e| Error::io(path, e))?);
+        // The header's room: its format is the first block's.
+        writer
+            .write_all(&[0u8; HEADER])
+            .map_err(|e| Error::io(path, e))?;
+        Ok(Self {
+            writer,
+            path: path.to_path_buf(),
+            format: None,
+            frames: 0,
+        })
+    }
+
+    /// The samples of the WAV at `block`, after those already there;
+    /// returns how many frames it held.
+    pub fn append(&mut self, block: &Path) -> Result<u64> {
+        let mut file = File::open(block).map_err(|e| Error::io(block, e))?;
+        let length = file.metadata().map_err(|e| Error::io(block, e))?.len();
+        let format = header(&mut file, length).map_err(|e| name(block, e))?;
+        let shape = |f: Format| (f.channels, f.sample_rate, f.bits, f.float);
+        match self.format {
+            None => self.format = Some(format),
+            Some(first) if shape(first) != shape(format) => {
+                return Err(Error::msg(format!(
+                    "{}: {} channel(s) at {} Hz, {}-bit, where {} has {} at {} Hz, {}-bit",
+                    block.display(),
+                    format.channels,
+                    format.sample_rate,
+                    format.bits,
+                    self.path.display(),
+                    first.channels,
+                    first.sample_rate,
+                    first.bits
+                )));
+            }
+            Some(_) => {}
+        }
+        file.seek(SeekFrom::Start(format.data_offset))
+            .map_err(|e| Error::io(block, e))?;
+        let bytes = format.data_bytes();
+        let copied = std::io::copy(&mut file.take(bytes), &mut self.writer)
+            .map_err(|e| Error::io(&self.path, e))?;
+        if copied != bytes {
+            return Err(Error::msg(format!(
+                "{}: {copied} of its {bytes} bytes of samples read",
+                block.display()
+            )));
+        }
+        self.frames += format.frames;
+        Ok(format.frames)
+    }
+
+    /// The sizes written into the header; the file is whole from here on.
+    pub fn finish(mut self) -> Result<()> {
+        let path = self.path.clone();
+        let io = |e| Error::io(&path, e);
+        let format = self
+            .format
+            .ok_or_else(|| Error::msg(format!("{}: no block to join", path.display())))?;
+        self.writer.flush().map_err(io)?;
+        let mut file = self
+            .writer
+            .into_inner()
+            .map_err(|e| Error::io(&path, e.into_error()))?;
+        file.seek(SeekFrom::Start(0)).map_err(io)?;
+        write_header(
+            &mut file,
+            Format {
+                frames: self.frames,
+                data_offset: 0,
+                ..format
+            },
+        )
+        .map_err(io)?;
+        file.flush().map_err(io)
+    }
+}
+
 /// A WAV read in blocks, folded to mono.
 ///
 /// What every measurement walks: several of these advance in step over the
@@ -536,11 +632,14 @@ impl Reader {
 }
 
 /// Write a WAV header; the caller writes `format.data_bytes()` after it.
+/// Samples past what the sizes can say (4 GiB: a stereo float stem of a
+/// film over three hours) leave them at their maximum, which a reader takes
+/// for « what is on disk ».
 pub fn write_header(out: &mut impl Write, format: Format) -> std::io::Result<()> {
     let block_align = format.bytes_per_frame() as u32;
-    let data = format.data_bytes() as u32;
+    let data = u32::try_from(format.data_bytes()).unwrap_or(u32::MAX);
     out.write_all(b"RIFF")?;
-    out.write_all(&(36 + data).to_le_bytes())?;
+    out.write_all(&data.saturating_add(36).to_le_bytes())?;
     out.write_all(b"WAVE")?;
     out.write_all(b"fmt ")?;
     out.write_all(&16u32.to_le_bytes())?;
@@ -758,6 +857,64 @@ mod tests {
         let read = reader.read_block(&mut out).unwrap();
         out.truncate(read);
         out
+    }
+
+    /// **A stem joined from its blocks** holds their samples, to the bit,
+    /// whatever chunks their headers carry: what one file of them all
+    /// would, read the same.
+    #[test]
+    fn a_stem_joined_from_its_blocks_holds_their_samples_as_they_are() {
+        let dir = scratch("join");
+        let (a, b, c) = (dir.join("a.wav"), dir.join("b.wav"), dir.join("c.wav"));
+        // Signed zeros and a subnormal: copied, not decoded and encoded.
+        let left = [0.5f32, -0.0, 1e-40, 0.25, -1.5];
+        let right = [0.1f32, 0.0, -1e-40, 2.0, 0.3];
+        stereo_float(&a, &left[..2], &right[..2]);
+        stereo_float(&b, &left[2..], &right[2..]);
+        // A chunk of its own between `fmt ` and `data`, as some writers add.
+        let mut bytes = std::fs::read(&b).unwrap();
+        bytes.splice(36..36, *b"fact\x04\x00\x00\x00\x03\x00\x00\x00");
+        std::fs::write(&b, bytes).unwrap();
+        stereo_float(&c, &left, &right);
+        let joined = dir.join("joined.wav");
+        let mut joiner = Joiner::create(&joined).unwrap();
+        assert_eq!(joiner.append(&a).unwrap(), 2);
+        assert_eq!(joiner.append(&b).unwrap(), 3);
+        joiner.finish().unwrap();
+        assert_eq!(std::fs::read(&joined).unwrap(), std::fs::read(&c).unwrap());
+        // A block of another shape is refused.
+        mono24(&a, &[1, 2, 3]);
+        let mut joiner = Joiner::create(&dir.join("other.wav")).unwrap();
+        joiner.append(&c).unwrap();
+        assert!(joiner.append(&a).is_err());
+        // Nothing to join is no WAV.
+        assert!(
+            Joiner::create(&dir.join("none.wav"))
+                .unwrap()
+                .finish()
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sizes_past_four_gigabytes_are_left_at_their_maximum() {
+        let mut out = Vec::new();
+        let format = Format {
+            channels: 2,
+            sample_rate: 44_100,
+            bits: 32,
+            float: true,
+            frames: 600_000_000,
+            data_offset: 0,
+        };
+        write_header(&mut out, format).unwrap();
+        assert_eq!(out.len(), HEADER);
+        assert_eq!(out[4..8], u32::MAX.to_le_bytes());
+        assert_eq!(out[40..44], u32::MAX.to_le_bytes());
+        // Read back, that is « what is on disk ».
+        out.extend([0u8; 16]);
+        assert_eq!(read(out).unwrap().frames, 2);
     }
 
     #[test]
