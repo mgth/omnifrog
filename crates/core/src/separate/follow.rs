@@ -2210,6 +2210,10 @@ mod tests {
     const MOCK_DIR: &str = "OMNIFROG_MOCK_DIR";
     /// Set, the mock as a remote's `remote-worker` says its GPU is busy.
     const MOCK_BUSY: &str = "OMNIFROG_MOCK_BUSY";
+    /// Set, the mock writes `mock.tmp` into the temporary directory it was
+    /// given, as ROCm's compiler would a kernel, with the variables that
+    /// name it.
+    const MOCK_TEMP: &str = "OMNIFROG_MOCK_TEMP";
     /// `<base>:<block>`, `*` for any: the block the mock hangs on, as a GPU
     /// that stalls.
     const MOCK_HANG: &str = "OMNIFROG_MOCK_HANG";
@@ -2465,6 +2469,13 @@ mod tests {
             true => std::env::var(MOCK_DIE_BESIDE).ok(),
             false => std::env::var(MOCK_DIE).ok(),
         };
+        if std::env::var_os(MOCK_TEMP).is_some() {
+            let said: Vec<String> = ["TMPDIR", "TMP", "TEMP"]
+                .iter()
+                .map(|key| format!("{key}={}", std::env::var(key).unwrap_or_default()))
+                .collect();
+            fs::write(std::env::temp_dir().join("mock.tmp"), said.join("\n")).unwrap();
+        }
         say("PRET");
         let mut streams: HashMap<String, (u64, Option<Stems>)> = HashMap::new();
         for line in std::io::stdin().lock().lines() {
@@ -4769,5 +4780,84 @@ mod tests {
                 .all(|(_, _, sent)| !sent.contains(&ahead)),
             "{log}"
         );
+    }
+
+    /// A worker started here as a run starts its first, under the lock of
+    /// the bench's working directory; and the scratch its temporary files
+    /// go to.
+    fn start_here(bench: &Bench, command: Command) -> (Result<Worker>, PathBuf) {
+        let work = bench.config.work_dir();
+        let lock = crate::worker::soon(|| crate::worker::Lock::take(&work)).unwrap();
+        let scratch = lock.scratch().to_path_buf();
+        let started = Worker::start_here(command, "a mock worker".into(), lock, None, &quiet);
+        (started, scratch)
+    }
+
+    #[test]
+    fn a_run_s_workers_keep_their_temporary_files_in_the_working_directory() {
+        let bench = Bench::new("scratch");
+        let temp = [(MOCK_TEMP, "1".to_string())];
+        let (first, scratch) = start_here(&bench, mock(&temp));
+        let first = first.unwrap();
+        let work = std::path::absolute(bench.config.work_dir()).unwrap();
+        assert!(scratch.starts_with(&work), "{}", scratch.display());
+        let said = fs::read_to_string(scratch.join("mock.tmp")).unwrap();
+        let named: &[&str] = if cfg!(windows) {
+            &["TMPDIR", "TMP", "TEMP"]
+        } else {
+            &["TMPDIR"]
+        };
+        for key in named {
+            assert!(
+                said.lines()
+                    .any(|line| line == format!("{key}={}", scratch.display())),
+                "{key} does not name the scratch: {said}"
+            );
+        }
+        // The dub's worker beside the original's, under its lock: the same
+        // scratch, kept for as long as either of them is there.
+        fs::remove_file(scratch.join("mock.tmp")).unwrap();
+        let second = Worker::start_here(
+            mock(&temp),
+            "a mock worker".into(),
+            first.lock().unwrap(),
+            None,
+            &quiet,
+        )
+        .unwrap();
+        assert!(scratch.join("mock.tmp").is_file());
+        // A normal end: `QUIT`, and the worker leaves on its own.
+        drop(first);
+        assert!(scratch.join("mock.tmp").is_file());
+        drop(second);
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn a_worker_that_dies_or_never_starts_leaves_no_temporary_files() {
+        let bench = Bench::new("scratch-dies");
+        // As a GPU reset kills a worker, under a request.
+        let env = [(MOCK_TEMP, "1".to_string()), (MOCK_DIE, "x:0".to_string())];
+        let (worker, scratch) = start_here(&bench, mock(&env));
+        let mut worker = worker.unwrap();
+        assert!(scratch.join("mock.tmp").is_file());
+        let ask = Ask {
+            base: "x",
+            out_dir: &bench.root.join("out"),
+            rate: 48_000,
+            held: 0,
+            whole: false,
+            inputs: &[],
+        };
+        let died = worker.block(&ask, |_| {}).err().unwrap().to_string();
+        assert!(died.contains("stopped during the separation"), "{died}");
+        assert!(!worker.is_alive());
+        drop(worker);
+        assert!(!scratch.exists());
+        // A worker whose program does not start at all.
+        let (refused, scratch) =
+            start_here(&bench, Command::new(bench.root.join("no-such-worker")));
+        assert!(refused.is_err());
+        assert!(!scratch.exists());
     }
 }
