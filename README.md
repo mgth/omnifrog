@@ -300,8 +300,10 @@ same followed or made whole. On the same 9070 XT, with a desktop holding 7.3 GiB
 workers took it to 14.8 GiB of 16.3. On a remote, each worker says which run it is for
 (`remote-worker … --run <id>`), and the remote gives it whichever of its two seats is free, each with
 a lock of its own: the second only beside the same run's first, and neither to another run while
-this one has a worker there — even once its first is gone and its second still separates. A remote
-of an earlier version speaks another protocol, and is left out of every step until it is updated.
+this one has a worker there — even once its first is gone and its second still separates. A seat is
+chosen from a look at both and the other looked at again once it is taken, so two runs choosing at
+once never end up side by side. A remote of an earlier version speaks another protocol, and is left
+out of every step until it is updated.
 
 Not followed: anything under MSST or on a CPU, the original in pairs when it has objects — those
 are paired by where each one is over the whole film — and the dub in pairs.

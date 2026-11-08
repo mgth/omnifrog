@@ -772,23 +772,48 @@ pub(crate) fn seat(
 ) -> std::result::Result<(Lock, PathBuf), String> {
     let first = Lock::held_by(work_dir, worker::LOCK);
     let second = Lock::held_by(work_dir, worker::LOCK_BESIDE);
-    let ours = |holder: &Option<String>| match (holder, run) {
-        (Some(holder), Some(run)) => holder == run,
-        _ => false,
-    };
-    let take = |name: &str, dir: &str| {
-        Lock::take_for(work_dir, name, run)
-            .map(|lock| (lock, work_dir.join(dir)))
-            .map_err(|why| why.to_string())
-    };
     match (&first, &second) {
-        (None, None) => take(worker::LOCK, DIR),
-        (None, Some(_)) if ours(&second) => take(worker::LOCK, DIR),
-        (Some(_), None) if ours(&first) => take(worker::LOCK_BESIDE, DIR_BESIDE),
-        (None, Some(_)) => {
-            Err("another run's second worker is separating; wait for it to finish".to_string())
-        }
-        _ => Err("another run is separating; wait for it to finish".to_string()),
+        (None, None) => claim(work_dir, run, Seat::First),
+        (None, Some(_)) if ours(&second, run) => claim(work_dir, run, Seat::First),
+        (Some(_), None) if ours(&first, run) => claim(work_dir, run, Seat::Second),
+        (None, Some(_)) => Err(BESIDE_BUSY.to_string()),
+        _ => Err(BUSY.to_string()),
+    }
+}
+
+/// Why a run's worker gets no seat: another run has the first.
+const BUSY: &str = "another run is separating; wait for it to finish";
+/// Why a run's worker gets no seat: another run's worker is on the second.
+const BESIDE_BUSY: &str = "another run's second worker is separating; wait for it to finish";
+
+/// Whether the seat's `holder` is `run`.
+fn ours(holder: &Option<String>, run: Option<&str>) -> bool {
+    matches!((holder, run), (Some(holder), Some(run)) if holder == run)
+}
+
+/// The `seat` [`seat`] chose for `run`, from a look at both. The take can
+/// wait ([`Lock::take_for`]), and the other seat change meanwhile, so the
+/// other seat is looked at again once this one is held, and this one given
+/// back if it is no longer what the choice was made on. Each seat's taker
+/// looks at the other seat after taking its own: of two runs taking one
+/// seat each, the later sees the earlier and gives its seat back.
+fn claim(
+    work_dir: &Path,
+    run: Option<&str>,
+    seat: Seat,
+) -> std::result::Result<(Lock, PathBuf), String> {
+    let (name, other, dir) = match seat {
+        Seat::First => (worker::LOCK, worker::LOCK_BESIDE, DIR),
+        Seat::Second => (worker::LOCK_BESIDE, worker::LOCK, DIR_BESIDE),
+    };
+    let lock = Lock::take_for(work_dir, name, run).map_err(|why| why.to_string())?;
+    let beside = Lock::held_by(work_dir, other);
+    match seat {
+        // The second is free, or this run's own.
+        Seat::First if beside.is_some() && !ours(&beside, run) => Err(BESIDE_BUSY.to_string()),
+        // The first is still this run's.
+        Seat::Second if !ours(&beside, run) => Err(BUSY.to_string()),
+        _ => Ok((lock, work_dir.join(dir))),
     }
 }
 
@@ -1073,6 +1098,45 @@ mod tests {
         drop(again);
         // All gone: any run.
         let (other, _) = soon(|| seat(&work, b)).unwrap();
+        drop(other);
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// **A seat chosen on a look gone stale.** A run's worker chooses its
+    /// seat from a look at both, then takes it, which can wait; whatever
+    /// changed meanwhile, it never ends up beside another run's.
+    #[test]
+    fn a_seat_chosen_before_the_other_changed_is_given_back() {
+        use crate::worker::soon;
+        let work = std::env::temp_dir().join(format!("omnifrog-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let (a, b) = (Some("run-a"), Some("run-b"));
+        // Run b found both seats free and goes for the first; run a got
+        // both before it, and lets its first go while b's take waits.
+        let (first, _) = seat(&work, a).unwrap();
+        let (second, _) = seat(&work, a).unwrap();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(first);
+        });
+        let taken = claim(&work, b, Seat::First);
+        late.join().unwrap();
+        assert!(taken.is_err(), "run b got the first beside run a's second");
+        // Nothing of b's is kept: run a gets its first back.
+        let (again, _) = soon(|| seat(&work, a)).unwrap();
+        drop(again);
+        drop(second);
+        // Run a found its first there and goes for the second; its first
+        // went, and run b took the first, before a's take.
+        let (first, _) = soon(|| seat(&work, a)).unwrap();
+        drop(first);
+        let (other, _) = soon(|| seat(&work, b)).unwrap();
+        let taken = claim(&work, a, Seat::Second);
+        assert!(taken.is_err(), "run a got the second beside run b's first");
+        drop(taken);
+        // Run b's first is still alone: run b gets the second beside it.
+        let (beside, _) = soon(|| seat(&work, b)).unwrap();
+        drop(beside);
         drop(other);
         let _ = fs::remove_dir_all(&work);
     }
