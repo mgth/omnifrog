@@ -52,7 +52,7 @@
 use crate::config::{Config, Pairs, Remote};
 use crate::depth;
 use crate::extract;
-use crate::job::Job;
+use crate::job::{Job, Step};
 use crate::loudness::{self, Voice};
 use crate::master::{Keyframe, MasterSet, Trajectories};
 use crate::models::{self, Model};
@@ -373,11 +373,13 @@ impl Stage {
         }
     }
 
-    /// What the step's one progress line is called.
+    /// What the step's one progress line is called: the step's own name,
+    /// which is how a front end tells it from the step it runs beside (see
+    /// [`Step::labelled`]).
     fn label(self) -> &'static str {
         match self {
-            Stage::Original => "dialogue out of the original",
-            Stage::Dub => "dialogue out of the dub",
+            Stage::Original => Step::SeparateOriginal.label(),
+            Stage::Dub => Step::SeparateDub.label(),
         }
     }
 

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use omnifrog_core::config::{Config, Encoder, IamfCodec, Pairs};
 use omnifrog_core::doctor::{self, Status};
+use omnifrog_core::job::Step;
 use omnifrog_core::models::{self, Catalogue};
 use omnifrog_core::progress::{Event, Unit};
 use omnifrog_core::setup::{self, Gpu};
@@ -269,7 +270,38 @@ impl From<EncoderArg> for Encoder {
 struct Reporter {
     tty: bool,
     json: bool,
-    state: Mutex<(String, u64)>,
+    state: Mutex<Line>,
+}
+
+/// The line a terminal rewrites, and what it last said.
+struct Line {
+    /// The fraction it is about, and the percent it said.
+    what: String,
+    percent: u64,
+    /// What it says of that fraction.
+    text: String,
+    /// The step under way, by number; nought before the first.
+    step: u32,
+    /// Later steps already under way beside it, by name, and the percent
+    /// each said: added to the line on a terminal, a line of their own
+    /// otherwise. See `Step::labelled`.
+    early: Vec<(String, u64)>,
+    /// A line is on the terminal without its newline yet.
+    open: bool,
+}
+
+impl Line {
+    /// The line with `text` on it, and the steps started early after it:
+    /// `  decoding: 63 % (5310 / 8400 MB) · 2. dialogue out of the original: 21 %`.
+    fn shown(&self, text: &str) -> String {
+        let mut line = text.to_string();
+        for (what, percent) in &self.early {
+            line.push_str(if line.is_empty() { "  " } else { " · " });
+            let number = Step::labelled(what).map_or(0, Step::number);
+            line.push_str(&format!("{number}. {what}: {percent} %"));
+        }
+        line
+    }
 }
 
 impl Reporter {
@@ -277,7 +309,14 @@ impl Reporter {
         Self {
             tty: std::io::stderr().is_terminal() && !json,
             json,
-            state: Mutex::new((String::new(), u64::MAX)),
+            state: Mutex::new(Line {
+                what: String::new(),
+                percent: u64::MAX,
+                text: String::new(),
+                step: 0,
+                early: Vec::new(),
+                open: false,
+            }),
         }
     }
 
@@ -295,7 +334,13 @@ impl Reporter {
                 number,
                 total,
                 label,
-            } => Event::message(format!("{number}/{total} {label}")),
+            } => {
+                state.step = number;
+                state
+                    .early
+                    .retain(|(what, _)| Step::labelled(what).is_some_and(|s| s.number() > number));
+                Event::message(format!("{number}/{total} {label}"))
+            }
             Event::Took { .. } => {
                 Event::message(format!("  {}", event.took_line().unwrap_or_default()))
             }
@@ -304,9 +349,11 @@ impl Reporter {
         match event {
             Event::Step { .. } | Event::Took { .. } => unreachable!("worded as a message above"),
             Event::Message { text } => {
-                if self.tty && !state.0.is_empty() {
+                if self.tty && state.open {
                     let _ = writeln!(err);
-                    state.0.clear();
+                    state.open = false;
+                    state.what.clear();
+                    state.text.clear();
                 }
                 let _ = writeln!(err, "{text}");
             }
@@ -322,14 +369,35 @@ impl Reporter {
                     Some(t) if t > 0 => done * 100 / t,
                     _ => done >> 24,
                 };
-                let same = state.0 == what;
-                if same && state.1 == step && !self.tty {
+                // A later step under way beside this one: its percent goes
+                // at the end of the line, or on a line of its own.
+                let now = state.step;
+                if Step::labelled(&what).is_some_and(|s| s.number() > now) {
+                    let said = state.early.iter().position(|(w, _)| *w == what);
+                    if said.is_some_and(|at| state.early[at].1 == step) {
+                        return;
+                    }
+                    match said {
+                        Some(at) => state.early[at].1 = step,
+                        None => state.early.push((what.clone(), step)),
+                    }
+                    if self.tty {
+                        let _ = write!(err, "\r{}\x1b[K", state.shown(&state.text));
+                        state.open = true;
+                    } else {
+                        let _ = writeln!(err, "  {what}: {step} %, started beside step {now}");
+                    }
                     return;
                 }
-                if !same && self.tty && !state.0.is_empty() {
+                let same = state.what == what;
+                if same && state.percent == step && !self.tty {
+                    return;
+                }
+                if !same && self.tty && state.open && !state.what.is_empty() {
                     let _ = writeln!(err);
                 }
-                *state = (what.clone(), step);
+                state.what = what.clone();
+                state.percent = step;
                 let text = match (total, unit) {
                     (Some(t), Unit::Bytes) if t > 0 => format!(
                         "  {what}: {} % ({} / {} MB)",
@@ -347,10 +415,14 @@ impl Reporter {
                     (_, Unit::Items | Unit::Ratio) => format!("  {what}: {done}"),
                 };
                 if self.tty {
-                    let _ = write!(err, "\r{text}\x1b[K");
+                    let _ = write!(err, "\r{}\x1b[K", state.shown(&text));
+                    state.text = text;
+                    state.open = true;
                     if total.is_some_and(|t| done >= t) {
                         let _ = writeln!(err);
-                        state.0.clear();
+                        state.open = false;
+                        state.what.clear();
+                        state.text.clear();
                     }
                 } else {
                     let _ = writeln!(err, "{text}");
@@ -794,5 +866,30 @@ fn reset_sigpipe() {
     // else runs; no handler is installed, nothing else refers to it.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A step started early rides at the end of the step's own line, or is
+    /// the line when the step has none.
+    #[test]
+    fn a_step_started_early_is_said_after_the_line() {
+        let original = Step::SeparateOriginal.label().to_string();
+        let line = Line {
+            what: "decoding".into(),
+            percent: 63,
+            text: String::new(),
+            step: 1,
+            early: vec![(original, 21)],
+            open: false,
+        };
+        assert_eq!(
+            line.shown("  decoding: 63 % (5310 / 8400 MB)"),
+            "  decoding: 63 % (5310 / 8400 MB) · 2. dialogue out of the original: 21 %"
+        );
+        assert_eq!(line.shown(""), "  2. dialogue out of the original: 21 %");
     }
 }
