@@ -44,10 +44,11 @@
 //! `depth`). One an earlier version left at 24 bits is rounded where it is
 //! rather than separated again.
 //!
-//! **The original begun during the extraction.** Under pymss this machine
-//! separates as many of the original's elements as it keeps up with while
-//! the extraction writes them, a block at a time ([`Follower`]); this step
-//! finishes those first, and makes the others as above.
+//! **Begun during the extraction.** Under pymss every machine separates as
+//! many of the original's elements as it keeps up with while the extraction
+//! writes them, a block at a time, and as many of the dub's channels as the
+//! time the original leaves it allows ([`Follower`]); each step finishes
+//! what was followed of it first, and makes the others as above.
 
 use crate::config::{Config, Pairs, Remote};
 use crate::depth;
@@ -57,10 +58,10 @@ use crate::loudness::{self, Voice};
 use crate::master::{Keyframe, MasterSet, Trajectories};
 use crate::models::{self, Model};
 use crate::progress::{Event, Progress};
-use crate::remote::{self, Ssh};
+use crate::remote::{self, Seat, Ssh};
 use crate::run::Stop;
 use crate::wav;
-use crate::worker::{Started, Stems, Worker};
+use crate::worker::{Lock, Started, Stems, Worker};
 use crate::{Error, Result, voices};
 use std::collections::VecDeque;
 use std::f64::consts::TAU;
@@ -71,7 +72,28 @@ use std::time::{Duration, Instant};
 
 mod follow;
 use follow::Machine;
-pub use follow::{Followed, Follower, follows};
+pub use follow::{Followed, Follower, Handed, follows, follows_dub};
+
+/// What another separation of this run still holds on each machine — the
+/// workers that followed the dub during the extraction, between the
+/// extraction and the dub's own step: this machine's lock, and each
+/// remote's seat. A worker the step starts there stands beside it.
+#[derive(Default)]
+pub struct Beside {
+    lock: Option<Lock>,
+    /// By device: 0 is this machine, which has no seat.
+    seats: Vec<Option<Seat>>,
+}
+
+impl Beside {
+    fn lock(&self) -> Option<&Lock> {
+        self.lock.as_ref()
+    }
+
+    fn seat(&self, device: usize) -> Option<Seat> {
+        self.seats.get(device).copied().flatten()
+    }
+}
 
 /// Everything the pipeline hands around is at this rate, whatever the
 /// model was fed.
@@ -99,8 +121,10 @@ pub struct Separated {
 /// misses is a voice that stays in the film under the dubbed one.
 ///
 /// `followed` is what was separated while the extraction ran (see
-/// [`Follower`]): this machine finishes those elements first, from where
-/// they are, while the remotes start on the others.
+/// [`Follower`]): each machine finishes those elements first, from where
+/// they are, and then takes from the line. `beside` is what the dub's
+/// follower still holds on each machine, waiting for its own step.
+#[allow(clippy::too_many_arguments)]
 pub fn original(
     config: &Config,
     job: &Job,
@@ -108,9 +132,12 @@ pub fn original(
     master: &MasterSet,
     pairs: Pairs,
     followed: Option<Followed>,
+    beside: &Beside,
     progress: Progress,
 ) -> Result<Separated> {
-    original_with(config, job, model, master, pairs, followed, None, progress)
+    original_with(
+        config, job, model, master, pairs, followed, beside, None, progress,
+    )
 }
 
 /// [`original`], this machine's worker started by `start` when there is
@@ -123,6 +150,7 @@ fn original_with(
     master: &MasterSet,
     pairs: Pairs,
     followed: Option<Followed>,
+    beside: &Beside,
     start: Option<Start>,
     progress: Progress,
 ) -> Result<Separated> {
@@ -151,7 +179,8 @@ fn original_with(
     }
     // What the extraction's follower made, if it made it of these very
     // elements, cut into these very passes.
-    let followed = followed.and_then(|followed| followed.fits(master, &plan, progress));
+    let followed =
+        followed.and_then(|followed| followed.fits(&follow::identity(master), &plan, progress));
     let bits = mastered_at(job, progress);
     let resumed = run(
         config,
@@ -162,6 +191,7 @@ fn original_with(
         Stage::Original,
         bits,
         followed,
+        beside,
         start,
         progress,
     )?;
@@ -253,52 +283,75 @@ type Start<'a> = &'a (dyn Fn(Stop) -> Result<Worker> + Sync);
 
 /// Take the dialogue out of every channel of the dub, and decide how the
 /// voices will be placed.
+///
+/// `followed` is what was separated of it while the extraction ran (see
+/// [`Follower`]): each machine finishes those channels first, from where
+/// they are, and then takes from the line.
 pub fn dub(
     config: &Config,
     job: &Job,
     model: &Model,
     channels: &[String],
     pairs: Pairs,
+    followed: Option<Followed>,
     progress: Progress,
 ) -> Result<(Separated, voices::Analysis)> {
-    dub_with(config, job, model, channels, pairs, None, progress)
+    dub_with(
+        config, job, model, channels, pairs, followed, None, progress,
+    )
+}
+
+/// The dub's channels a separation works on — every one but the LFE, which
+/// carries no dialogue and is the one channel never re-voiced, round the
+/// room from the left — their units, and the passes they are made in.
+fn dub_work(
+    job: &Job,
+    channels: &[String],
+    pairs: Pairs,
+) -> Result<(Vec<String>, Vec<Unit>, Plan)> {
+    let mut wanted: Vec<String> = channels
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case("LFE"))
+        .cloned()
+        .collect();
+    wanted.sort_by_key(|name| SPATIAL_ORDER.iter().position(|o| o == name).unwrap_or(99));
+    if wanted.is_empty() {
+        return Err(Error::msg("the dub has no channel to take dialogue from"));
+    }
+    let work: Vec<Unit> = wanted
+        .iter()
+        .map(|name| Unit::of(job, Stage::Dub, name))
+        .collect();
+    let names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let plan = Plan::of_dub(&names, pairs);
+    Ok((wanted, work, plan))
 }
 
 /// [`dub`], this machine's worker started by `start` when there is one.
+#[allow(clippy::too_many_arguments)]
 fn dub_with(
     config: &Config,
     job: &Job,
     model: &Model,
     channels: &[String],
     pairs: Pairs,
+    followed: Option<Followed>,
     start: Option<Start>,
     progress: Progress,
 ) -> Result<(Separated, voices::Analysis)> {
     let into = job.separate_dir();
     fs::create_dir_all(&into).map_err(|e| Error::io(&into, e))?;
 
-    // The LFE carries no dialogue, and is the one channel never re-voiced.
-    let mut wanted: Vec<&String> = channels
-        .iter()
-        .filter(|name| !name.eq_ignore_ascii_case("LFE"))
-        .collect();
-    wanted.sort_by_key(|name| SPATIAL_ORDER.iter().position(|o| o == name).unwrap_or(99));
-    if wanted.is_empty() {
-        return Err(Error::msg("the dub has no channel to take dialogue from"));
-    }
-
-    let work: Vec<Unit> = wanted
-        .iter()
-        .map(|name| Unit::of(job, Stage::Dub, name))
-        .collect();
-    let names: Vec<&str> = wanted.iter().map(|name| name.as_str()).collect();
-    let plan = Plan::of_dub(&names, pairs);
+    let (wanted, work, plan) = dub_work(job, channels, pairs)?;
     if plan.passes.len() < work.len() || plan.takes.iter().any(|t| t.len() > 1) {
         progress(Event::message(format!(
             "in pairs: {}",
             plan.describe(&work)
         )));
     }
+    // What the extraction's follower made, if it made it of these very
+    // channels, cut into these very passes.
+    let followed = followed.and_then(|followed| followed.fits(&wanted, &plan, progress));
     // The dub was never the master the stream is coded at: nothing says
     // what its depth was, and its voices are mixed before they are coded.
     let resumed = run(
@@ -309,7 +362,8 @@ fn dub_with(
         &plan,
         Stage::Dub,
         24,
-        None,
+        followed,
+        &Beside::default(),
         start,
         progress,
     )?;
@@ -342,7 +396,7 @@ fn dub_with(
     )));
     Ok((
         Separated {
-            elements: wanted.iter().map(|name| (*name).clone()).collect(),
+            elements: wanted,
             resumed,
             lkfs: measure.or_unmeasured(),
         },
@@ -1052,9 +1106,10 @@ impl Shared {
 /// for it goes.
 ///
 /// The passes in `followed` were begun while the extraction ran: they are
-/// not in line, and this machine finishes them first with the worker that
-/// began them, the remotes starting on the rest meanwhile. One that fails
-/// to finish goes back in line, to be made whole.
+/// not in line, and each machine finishes its own first with the worker
+/// that began them, then takes from the line. One that fails to finish
+/// goes back in line, to be made whole. A worker started on a machine
+/// where `beside` holds one stands beside it.
 #[allow(clippy::too_many_arguments)]
 fn run(
     config: &Config,
@@ -1065,6 +1120,7 @@ fn run(
     stage: Stage,
     mastered_at: u32,
     followed: Option<Followed>,
+    beside: &Beside,
     start: Option<Start>,
     progress: Progress,
 ) -> Result<usize> {
@@ -1076,7 +1132,7 @@ fn run(
     // in here, and neither is what was kept aside for an average.
     discard(&prepared)?;
     discard(&stems)?;
-    let follow_dir = into.join(follow::DIR);
+    let follow_dir = into.join(follow::dir_of(stage));
     if followed.is_none() {
         discard(&follow_dir)?;
     }
@@ -1184,9 +1240,14 @@ fn run(
             let start_here = |stop: Stop| -> Result<Worker> {
                 match (start, &local) {
                     (Some(start), _) => start(stop),
-                    (None, Some(local)) => {
-                        Worker::start_under(config, model, local, progress, Some(stop))
-                    }
+                    (None, Some(local)) => Worker::start_under(
+                        config,
+                        model,
+                        local,
+                        progress,
+                        Some(stop),
+                        beside.lock(),
+                    ),
                     (None, None) => unreachable!("fetched when there is no start"),
                 }
             };
@@ -1623,6 +1684,7 @@ fn run(
                                 model,
                                 config.inference,
                                 progress,
+                                beside.seat(device),
                             )? {
                                 Started::Busy(why) => return Ok(Made::Busy(why)),
                                 Started::Ready(worker) => none.insert(worker),

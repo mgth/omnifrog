@@ -199,9 +199,9 @@ fn run_logged(
         from.label()
     )));
     tell_earlier(&job.manifest, Some(from), progress);
-    // What the extraction separated of the original as it went, for the
-    // step after it to finish.
-    let mut followed: Option<separate::Followed> = None;
+    // What the extraction separated of the original and of the dub as it
+    // went, for their steps to finish.
+    let mut followed = separate::Handed::default();
     for step in Step::ALL {
         if step < from {
             continue;
@@ -221,24 +221,44 @@ fn run_logged(
                     start: job.manifest.start,
                 };
                 let follows = separate::follows(config);
+                let follows_dub = separate::follows_dub(config, job.manifest.pairs);
                 if follows {
                     // What the follower writes is this run's from the start.
                     let signature = signature_original(&job.manifest);
                     claim(&mut job, separate::Stage::Original, &signature)?;
                 }
+                if follows_dub {
+                    let signature = signature_dub(&job.manifest);
+                    claim(&mut job, separate::Stage::Dub, &signature)?;
+                }
+                // The dub's channels as the extraction will name them.
+                let channels: Vec<String> = if follows_dub {
+                    extract::dub_paths(&dir, dub.channels)?
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 let (extracted, kept) = if follows {
-                    let follower =
-                        separate::Follower::new(config, &job, model_original, job.manifest.pairs);
+                    let follower = separate::Follower::new(
+                        config,
+                        &job,
+                        model_original,
+                        model_dub,
+                        &channels,
+                        job.manifest.pairs,
+                    );
                     std::thread::scope(|scope| {
                         let following = scope.spawn(|| follower.follow(progress));
                         let extracted =
                             extract::run_with(config, &plan, progress, &|ok| follower.decoded(ok));
                         // Also when the run failed before the decode began.
                         follower.decoded(extracted.is_ok());
-                        (extracted, following.join().unwrap_or(None))
+                        (extracted, following.join().unwrap_or_default())
                     })
                 } else {
-                    (extract::run(config, &plan, progress), None)
+                    (extract::run(config, &plan, progress), Default::default())
                 };
                 let extracted = extracted?;
                 followed = kept;
@@ -256,13 +276,20 @@ fn run_logged(
                 let master = MasterSet::find(&job.extract_dir())?;
                 let signature = signature_original(&job.manifest);
                 claim(&mut job, separate::Stage::Original, &signature)?;
+                // The dub's followers wait for their step beside this one.
+                let beside = followed
+                    .dub
+                    .as_mut()
+                    .map(separate::Followed::beside)
+                    .unwrap_or_default();
                 let done = separate::original(
                     config,
                     &job,
                     model_original,
                     &master,
                     job.manifest.pairs,
-                    followed.take(),
+                    followed.original.take(),
+                    &beside,
                     progress,
                 )?;
                 job.manifest.separate_original = Some(SeparateState {
@@ -282,14 +309,7 @@ fn run_logged(
                     .ok_or_else(|| {
                         Error::msg("the extraction did not record the dub's channels")
                     })?;
-                let signature = separate::signature(
-                    &job.manifest.model_dub,
-                    &job.manifest.source,
-                    job.manifest.dub.index,
-                    job.manifest.seconds,
-                    job.manifest.start,
-                    separate::mode_dub(job.manifest.pairs),
-                );
+                let signature = signature_dub(&job.manifest);
                 claim(&mut job, separate::Stage::Dub, &signature)?;
                 let (done, analysis) = separate::dub(
                     config,
@@ -297,6 +317,7 @@ fn run_logged(
                     model_dub,
                     &channels,
                     job.manifest.pairs,
+                    followed.dub.take(),
                     progress,
                 )?;
                 job.manifest.separate_dub = Some(SeparateState {
@@ -514,6 +535,18 @@ fn finish(
         ))),
     }
     Ok(())
+}
+
+/// The signature of the dub's stems for this manifest.
+fn signature_dub(manifest: &Manifest) -> String {
+    separate::signature(
+        &manifest.model_dub,
+        &manifest.source,
+        manifest.dub.index,
+        manifest.seconds,
+        manifest.start,
+        separate::mode_dub(manifest.pairs),
+    )
 }
 
 /// The signature of the original's stems for this manifest.
