@@ -248,9 +248,10 @@ up with, a faster one more. Each serves its own, the first with a block ready fi
 reads the container at its own pace, so the film comes faster where the picture is light, and the
 element served last falls behind first: a machine with one two blocks behind is watched over
 rounds of as many blocks as it follows elements, and lets the last of its own go only after two
-rounds in a row that did not shrink what it has left to separate — a burst it catches up on loses
-nothing, and it never lets one go a block — and only one less than half made, which costs less
-made again whole than finished after the extraction. What is let go is separated whole after the
+rounds in a row that did not shrink what it has left to separate (one round for the next, once it
+let one go) — a burst it catches up on loses nothing, and it never lets one go a block — and only
+one less than half made, which costs less made again whole than finished after the extraction;
+unless it already has more left than a whole element and another machine could take it. What is let go is separated whole after the
 extraction, like the elements nobody followed. Every block a machine asks for, what it took (a
 remote's transfers, the worker, folding the stems in), every stretch with nothing to do and what it
 waited for, and every round watched go to the run's log, as `follow, …` lines. A remote is sent

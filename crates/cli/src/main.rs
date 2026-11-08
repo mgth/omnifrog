@@ -321,16 +321,16 @@ impl Reporter {
     }
 
     fn report(&self, event: Event) {
-        // The run's log has it; a terminal, or a front end reading the
-        // JSON, would drown in it.
-        if matches!(event, Event::Trace { .. }) {
-            return;
-        }
         let mut err = std::io::stderr().lock();
         if self.json {
             if let Ok(line) = serde_json::to_string(&event) {
                 let _ = writeln!(err, "{line}");
             }
+            return;
+        }
+        // The run's log has it, and a terminal would drown in it; a front
+        // end reading the JSON gets it, to keep or leave.
+        if matches!(event, Event::Trace { .. }) {
             return;
         }
         let mut state = self.state.lock().unwrap();
