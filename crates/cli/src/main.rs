@@ -134,6 +134,9 @@ enum Command {
         inference: String,
         /// Decline while other programs hold this much of the GPU's memory, in GiB; 0 = never
         idle_below_gib: f64,
+        /// The second seat: beside a worker of the same run that has the machine's lock
+        #[arg(long)]
+        beside: bool,
     },
     /// Measure the separation's device memory under several settings, to choose inference.block_seconds and inference.batch_size for a smaller card
     BenchVram {
@@ -471,13 +474,15 @@ fn main() -> Result<()> {
             model,
             inference,
             idle_below_gib,
+            beside,
         } => {
             let config = Config::load()?;
             let model: models::Model =
                 serde_json::from_str(&model).context("the model the other machine sent")?;
             let inference = serde_json::from_str(&inference)
                 .context("the inference settings the other machine sent")?;
-            let code = omnifrog_core::remote::serve(&config, &model, inference, idle_below_gib)?;
+            let code =
+                omnifrog_core::remote::serve(&config, &model, inference, idle_below_gib, beside)?;
             std::process::exit(code);
         }
         Command::Config => cmd_config(),

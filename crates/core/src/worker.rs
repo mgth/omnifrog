@@ -41,11 +41,13 @@
 //! libraries every time, which freezes the machine when memory is tight,
 //! and reload the checkpoint on top.
 //!
-//! One worker runs at a time on this machine: [`Lock`] is taken in the
-//! working directory before the first one starts. Two separations sharing a
-//! GPU is how a driver panic is arranged. Nor does one start under a ROCm
-//! override the card cannot run (see [`crate::rocm`] and [`command`]),
-//! which is how a GPU reset is.
+//! One run separates at a time on this machine: [`Lock`] is taken in the
+//! working directory before its first worker starts. Two separations
+//! sharing a GPU is how a driver panic is arranged: the two workers a run
+//! has during the extraction, one per model, share the lock and are driven
+//! one request at a time (see `separate`'s follower). Nor does one start
+//! under a ROCm override the card cannot run (see [`crate::rocm`] and
+//! [`command`]), which is how a GPU reset is.
 //!
 //! A worker can also run on another machine, through `ssh` and that
 //! machine's omnifrog ([`Worker::start_remote`], [`crate::remote`]): the
@@ -55,7 +57,7 @@
 use crate::config::{Config, Engine, Inference, Remote};
 use crate::models::{Local, Model};
 use crate::progress::{Event, Progress};
-use crate::remote::{self, Ssh};
+use crate::remote::{self, Seat, Ssh};
 use crate::run::Stop;
 use crate::{Error, Result, wav};
 use std::collections::VecDeque;
@@ -236,6 +238,8 @@ enum Silence {
 struct Far {
     ssh: Ssh,
     host: String,
+    /// Which of the machine's two seats it has.
+    seat: Seat,
     dir: Option<String>,
     /// The inputs of the elements it follows, as far as they were sent.
     sent: Vec<Sent>,
@@ -407,17 +411,20 @@ impl Worker {
         local: &Local,
         progress: Progress,
     ) -> Result<Self> {
-        Self::start_under(config, model, local, progress, None)
+        Self::start_under(config, model, local, progress, None, None)
     }
 
     /// [`Worker::start`], the worker killed whenever `stop` is raised —
-    /// while it loads, or under a request.
+    /// while it loads, or under a request. `beside` is the lock another
+    /// worker of this run holds, which this one shares; it takes it
+    /// otherwise.
     pub fn start_under(
         config: &Config,
         model: &Model,
         local: &Local,
         progress: Progress,
         stop: Option<Stop>,
+        beside: Option<&Lock>,
     ) -> Result<Self> {
         // What is off without endangering the card; an override it cannot
         // run is refused by `command`.
@@ -426,7 +433,10 @@ impl Worker {
                 progress(Event::message(format!("warning: {warning}")));
             }
         }
-        let lock = Lock::take(&config.work_dir())?;
+        let lock = match beside {
+            Some(held) => held.share(),
+            None => Lock::take(&config.work_dir())?,
+        };
         let command = command(config, model, local, config.inference, None)?;
         progress(Event::message(format!(
             "loading {} on the inference device",
@@ -444,23 +454,39 @@ impl Worker {
     /// `inference` settings, so that a stem comes out the same wherever it
     /// was made. The model is fetched there if it has to be. The worker is
     /// stopped by `ssh`'s [`Stop`], as its transfers are.
+    ///
+    /// `beside` is the seat another worker of this run has there, if one
+    /// does: this one takes the other seat, and does not count that
+    /// worker's device memory as another program's (see [`remote`]).
     pub fn start_remote(
         remote: &Remote,
         ssh: &Ssh,
         model: &Model,
         inference: Inference,
         progress: Progress,
+        beside: Option<Seat>,
     ) -> Result<Started> {
         let json = |value: std::result::Result<String, serde_json::Error>| {
             value.map_err(|e| Error::msg(format!("the request for {}: {e}", remote.host)))
         };
-        let line = format!(
+        let seat = match beside {
+            Some(Seat::First) => Seat::Second,
+            _ => Seat::First,
+        };
+        let mut line = format!(
             "{} remote-worker {} {} {}",
             remote.command,
             remote::quote(&json(serde_json::to_string(model))?),
             remote::quote(&json(serde_json::to_string(&inference))?),
-            remote.idle_below_gib
+            if beside.is_some() {
+                0.0
+            } else {
+                remote.idle_below_gib
+            }
         );
+        if seat == Seat::Second {
+            line.push_str(" --beside");
+        }
         progress(Event::message(format!(
             "loading {} on {}",
             model.name, remote.host
@@ -468,6 +494,7 @@ impl Worker {
         let far = Far {
             ssh: ssh.clone(),
             host: remote.host.clone(),
+            seat,
             dir: None,
             sent: Vec::new(),
         };
@@ -913,6 +940,17 @@ impl Worker {
         self.remote.as_ref().map(|far| far.host.as_str())
     }
 
+    /// The seat a remote worker has there; `None` here.
+    pub fn seat(&self) -> Option<Seat> {
+        self.remote.as_ref().map(|far| far.seat)
+    }
+
+    /// The lock this worker holds on this machine, for another worker of
+    /// the run to share; `None` for a remote's, or the tests' mock.
+    pub fn lock(&self) -> Option<Lock> {
+        self._lock.as_ref().map(Lock::share)
+    }
+
     /// The error a dead worker leaves, with the last it said.
     fn died(&mut self, what: &str) -> Error {
         // The input closed too: over there, the end of it is what tells
@@ -1042,14 +1080,51 @@ fn word(line: &str) -> Word {
 /// and which no check of a process id can rule out once ids are reused. The
 /// file itself stays; it holds the id of the last run that took it, for the
 /// message a second run gets.
+///
+/// A run's own workers share it ([`Lock::share`]): the extraction follows
+/// the original and the dub with one worker each, and they never separate
+/// at the same time (see `separate`'s follower). Nothing shares it
+/// implicitly: a second take in the same process is refused like any
+/// other.
 pub struct Lock {
-    _file: fs::File,
+    _file: Arc<fs::File>,
 }
+
+/// The lock file of the machine's separations.
+const LOCK: &str = ".separating.lock";
 
 impl Lock {
     pub fn take(work_dir: &Path) -> Result<Self> {
+        Self::take_named(work_dir, LOCK)
+    }
+
+    /// The same lock, for another worker of the run that holds it.
+    pub fn share(&self) -> Self {
+        Self {
+            _file: Arc::clone(&self._file),
+        }
+    }
+
+    /// Whether some process holds the machine's lock now. Looked at without
+    /// keeping it, or writing in it.
+    pub fn held(work_dir: &Path) -> bool {
+        let path = work_dir.join(LOCK);
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(file) => matches!(lock(&file), Err(fs::TryLockError::WouldBlock)),
+            Err(_) => false,
+        }
+    }
+
+    /// The lock on `name` in `work_dir`.
+    pub(crate) fn take_named(work_dir: &Path, name: &str) -> Result<Self> {
         fs::create_dir_all(work_dir).map_err(|e| Error::io(work_dir, e))?;
-        let path = work_dir.join(".separating.lock");
+        let path = work_dir.join(name);
         let mut file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1062,7 +1137,9 @@ impl Lock {
                 let _ = file.set_len(0);
                 let _ = writeln!(file, "{}", std::process::id());
                 let _ = file.flush();
-                Ok(Self { _file: file })
+                Ok(Self {
+                    _file: Arc::new(file),
+                })
             }
             Err(fs::TryLockError::WouldBlock) => {
                 let holder = fs::read_to_string(&path).unwrap_or_default();

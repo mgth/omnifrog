@@ -9,15 +9,24 @@
 //!   on, and how much of that device's memory is in use ([`probe`]). A
 //!   remote of another version, without a GPU torch can use, or under a
 //!   ROCm override its card cannot run ([`crate::rocm`]), is left out.
-//! - `remote-worker '<model>' '<inference>' <idle below GiB>`, once a step
-//!   ([`serve`]): the worker of [`crate::worker`], its model loaded once
-//!   and fed one pass after another as this machine's is, its protocol
-//!   untouched, with two words of its own before `PRET`:
+//! - `remote-worker '<model>' '<inference>' <idle below GiB> [--beside]`,
+//!   once a step ([`serve`]): the worker of [`crate::worker`], its model
+//!   loaded once and fed one pass after another as this machine's is, its
+//!   protocol untouched, with two words of its own before `PRET`:
 //!
 //! ```text
 //! BUSY <why>     another program holds its GPU, or another run does: nothing was loaded
 //! DIR <path>     where the inputs go and the stems come out, on that machine
 //! ```
+//!
+//! **Two seats.** A run has at most two workers on a machine: during the
+//! extraction it follows the original and the dub there with one worker
+//! each, and hands each to its step ([`Seat`]). The first takes the
+//! machine's lock, as any run's worker; the second (`--beside`) only
+//! stands beside a worker that holds it, and has a lock and a directory of
+//! its own. This side never asks for the second seat without having the
+//! first, and asks no idle GPU of a machine where it already has a worker:
+//! the memory in use there is that worker's.
 //!
 //! The inputs go there and the stems come back through `ssh … cat`, over
 //! the connection the first command opened and kept (on Unix): a pass of a
@@ -66,10 +75,21 @@ pub const SAYS: &str = "omnifrog: ";
 
 /// What the two sides must agree on: the worker's script and these words.
 /// Bumped with any change to `remote-worker`'s arguments or words.
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 
 /// The directory of a remote's work directory a pass's files live in.
 const DIR: &str = "remote";
+/// The same, for the worker on the second seat, and its lock.
+const DIR_BESIDE: &str = "remote-beside";
+const LOCK_BESIDE: &str = ".separating-beside.lock";
+
+/// Which of a machine's two seats a run's worker has there: the first,
+/// which holds the machine's lock, or the second, beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seat {
+    First,
+    Second,
+}
 
 /// The host the tests' remote answers to: its commands run in this
 /// machine's shell.
@@ -652,22 +672,23 @@ fn device_lines(python: &Path) -> std::result::Result<Vec<String>, String> {
 /// The remote's side of a pass: decline if another run has the GPU, else
 /// fetch the model, say where the files go and become the worker, on this
 /// process's own standard streams. The worker itself declines when other
-/// programs hold its device (`idle=`, see [`worker::command`]). Returns the
+/// programs hold its device (`idle=`, see [`worker::command`]). `beside`:
+/// the second seat, beside a worker that has the first. Returns the
 /// worker's exit code.
 pub fn serve(
     config: &Config,
     model: &Model,
     inference: Inference,
     idle_below_gib: f64,
+    beside: bool,
 ) -> Result<i32> {
     let say = |line: &str| {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
     };
-    // A run on this machine, or another machine's pass, has the GPU.
-    let lock = match Lock::take(&config.work_dir()) {
-        Ok(lock) => lock,
+    let (lock, dir) = match seat(&config.work_dir(), beside) {
+        Ok(seat) => seat,
         Err(why) => {
             say(&format!("BUSY {why}"));
             return Ok(0);
@@ -678,9 +699,8 @@ pub fn serve(
             eprintln!("{SAYS}{text}");
         }
     })?;
-    // One pass at a time here, under the lock: whatever is in it was left
-    // by a pass that did not end.
-    let dir = config.work_dir().join(DIR);
+    // One pass at a time on a seat, under its lock: whatever is in its
+    // directory was left by a pass that did not end.
     if dir.exists() {
         fs::remove_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
     }
@@ -704,6 +724,24 @@ pub fn serve(
     let _ = fs::remove_dir_all(&dir);
     drop(lock);
     Ok(status.and_then(|status| status.code()).unwrap_or(1))
+}
+
+/// The lock of a seat in `work_dir`, and the directory its files go to; or
+/// why the seat is not to be had. The first is the machine's lock: a run on
+/// this machine, or another machine's pass, has the GPU otherwise. The
+/// second is had only beside a worker that has the first.
+fn seat(work_dir: &Path, beside: bool) -> std::result::Result<(Lock, PathBuf), String> {
+    if !beside {
+        return Lock::take(work_dir)
+            .map(|lock| (lock, work_dir.join(DIR)))
+            .map_err(|why| why.to_string());
+    }
+    if !Lock::held(work_dir) {
+        return Err("no worker of that run is here to work beside".to_string());
+    }
+    Lock::take_named(work_dir, LOCK_BESIDE)
+        .map(|lock| (lock, work_dir.join(DIR_BESIDE)))
+        .map_err(|why| why.to_string())
 }
 
 /// Pass this process's standard input on to the worker's, line by line,
@@ -939,6 +977,32 @@ mod tests {
         assert_eq!(among(Some("")), Agent::Found(first.clone()));
         assert_eq!(agent_among(None, None), Agent::None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// **Two seats, one run.** The first is the machine's lock, as before;
+    /// the second is had only beside a worker that has the first, once,
+    /// with files of its own: the two never clear each other's.
+    #[test]
+    fn the_second_seat_is_only_had_beside_the_first() {
+        let work = std::env::temp_dir().join(format!("omnifrog-seats-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        // Nobody here: nothing to stand beside.
+        let alone = seat(&work, true).err().unwrap();
+        assert!(alone.contains("no worker of that run"), "{alone}");
+        let (first, first_dir) = seat(&work, false).unwrap();
+        assert!(seat(&work, false).err().unwrap().contains("another run"));
+        let (second, second_dir) = seat(&work, true).unwrap();
+        assert_ne!(first_dir, second_dir);
+        assert!(seat(&work, true).err().unwrap().contains("another run"));
+        // The first gone, its seat is free again, and the second keeps its
+        // own until it goes.
+        drop(first);
+        let (again, _) = seat(&work, false).unwrap();
+        assert!(seat(&work, true).is_err());
+        drop(second);
+        assert!(seat(&work, true).is_ok());
+        drop(again);
+        let _ = fs::remove_dir_all(&work);
     }
 
     #[test]

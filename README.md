@@ -236,7 +236,9 @@ remux, never a separation. See `crates/core/src/duplicates.rs`.
 
 The separation takes the GPU, and only one run may have it: a lock is taken in the working
 directory while a model is loaded, and a second run is told to wait rather than allowed to try.
-Other machines' GPUs can take passes beside it: see [Other machines](#other-machines).
+During the extraction a run has two workers on a machine, one per model, which share the lock and
+never separate at the same time (below). Other machines' GPUs can take passes beside it: see
+[Other machines](#other-machines).
 
 **During the extraction.** The extraction reads the whole container and is bound by the disk — a
 quarter of an hour for a film — and the GPUs would wait through it. Under pymss every machine that
@@ -264,9 +266,24 @@ the depth the original was mastered at is known. A decode that fails or is stopp
 followed (the extraction starts again anyway). The steps stay six: while the extraction runs, the
 separation says how far it is under its own step's name, as a second bar in the window and at the
 end of the decoding's line in a terminal, and its own step carries on from there; the
-extraction's time takes in at most the end of the block in flight. Not followed: the dub (another model, after the extraction as
-before), and the original under MSST, on a CPU, or in pairs when it has objects — those are paired
-by where each one is over the whole film.
+extraction's time takes in at most the end of the block in flight.
+
+**The dub, in the time the original leaves.** Following the original rarely keeps a GPU busy all
+through the extraction (about 80 % of it, measured with a 9070 XT and a 7900 XTX on a 1 h 46
+film), and the dub's channels grow in step with it. So each machine also loads the dub's model, in
+a second worker (about 3.3 GiB more of its memory, as torch reserves it), and follows the dub's
+channels the same way, from a line of their own. The machine drives its two workers one request
+at a time, and the original comes first: its block whenever one is ready, its line whenever there
+is time for one more. The dub has what is left; a machine that falls behind lets the dub's last
+channel go before anything of the original. What was followed of the dub, and the workers that
+followed it, wait loaded through the original's step and go to the dub's, which finishes them
+first, then takes from its line; its comparison of the voices and its measure of the dialogue run
+on the finished channels, as before. A channel comes out the same followed or made whole. On a
+remote, the second worker takes a second seat beside the first (`remote-worker --beside`): a
+remote of an earlier version speaks another protocol, and is left out until it is updated.
+
+Not followed: anything under MSST or on a CPU, the original in pairs when it has objects — those
+are paired by where each one is over the whole film — and the dub in pairs.
 
 Progress goes to standard error, a line per percent; `--json` makes it one JSON object per line,
 which is what a front end reads.
