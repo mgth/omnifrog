@@ -26,17 +26,23 @@
 //! on a block [`FAR_GRACE`] later, is let go rather than hold the
 //! extraction's end up: what it followed is made whole after it.
 //!
-//! **The dub, in the time the original leaves.** The original rarely keeps
+//! **The dub, in the gaps the original leaves.** The original rarely keeps
 //! a GPU busy all through the extraction, and the dub's channels grow in
 //! step with it. Each machine has a second worker, with the dub's model,
-//! that follows the dub's channels the same way, from a line of their own.
-//! The machine's one thread drives both workers, one request at a time —
-//! a GPU never separates two things at once (see [`Lock`]) — and the
-//! original comes first: its block when one is ready, and its line when
-//! there is time for one more. So the dub gets what the original leaves,
-//! and what falls behind of it is let go, as above, before anything of the
-//! original is. The two workers load side by side with the first blocks,
-//! the dub's after the original's.
+//! that follows the dub's channels block by block, from a line of their
+//! own. The machine's one thread drives both workers, one request at a
+//! time — a GPU never separates two things at once (see [`Lock`]) — and
+//! the original comes first: its block when one is ready, its line when
+//! there is time for one more, and a block of the dub only when it ends,
+//! with room to spare, before the original's next one is ready. That room
+//! is the original's slack, which it needs: the extraction does not write
+//! at one rate, and where the video is lighter the film comes faster — on
+//! a film, a dub served whenever the original had nothing ready cost the
+//! original element after element there. So the original fares as it
+//! would alone; the dub is never let go for falling behind, and what was
+//! made of it is kept when the decode ends if it is half of it or more.
+//! The two workers load side by side with the first blocks, the dub's
+//! after the original's.
 //!
 //! **The same stems.** The worker cuts an element by a plan that is a
 //! function of its length alone, whole or growing, and fades one block into
@@ -99,9 +105,18 @@ pub(super) fn dir_of(stage: Stage) -> &'static str {
 
 /// What a follower follows, in the order a machine serves them.
 const STAGES: [Stage; 2] = [Stage::Original, Stage::Dub];
-/// Blocks a followed element may be behind the extraction before the last
-/// of the followed is let go.
+/// Blocks a followed element of the original may be behind the extraction
+/// before the last of the followed is let go.
 const BEHIND: u64 = 2;
+/// How much room a block of the dub needs before the original's next one
+/// is ready, over what a block costs: the extraction does not write at one
+/// rate — where the video is lighter, the film comes faster — and the
+/// original needs that slack.
+const DUB_FIT: f64 = 1.25;
+/// The share of its blocks a channel of the dub must have made when the
+/// decode ends to be finished by the machine that followed it; less, it is
+/// let go, and made whole by any.
+const DUB_KEPT: f64 = 0.5;
 /// How much older than the follower a master set's header may look and
 /// still be this extraction's: some file systems keep coarse times.
 const FRESH: Duration = Duration::from_secs(2);
@@ -287,6 +302,9 @@ struct Side {
     loading: bool,
     /// Its line may still give it a pass.
     open: bool,
+    /// What one of its blocks costs: the frames the extraction writes
+    /// while the machine makes one, on average.
+    cost: Option<u64>,
     /// What left it out of the extraction, and whether it was stopped
     /// then — the decode failed, or a remote was still loading as it ended:
     /// nothing to say.
@@ -770,6 +788,7 @@ impl<'a> Follower<'a> {
             grid: None,
             loading: commons[s].is_some(),
             open: commons[s].is_some(),
+            cost: None,
             failed: None,
         });
         let wanted = [commons[0].is_some(), commons[1].is_some()];
@@ -792,31 +811,52 @@ impl<'a> Follower<'a> {
         if self.decode_ended() != Some(true) {
             return sides;
         }
-        // The decoder is done: every file is as long as it will be.
-        for side in &mut sides {
-            let Some(machine) = &mut side.machine else {
+        // The decoder is done: every file is as long as it will be. What
+        // was never begun goes, and so does the dub's that is less than
+        // half made: whole, it can be made anywhere.
+        for (s, side) in sides.iter_mut().enumerate() {
+            let (Some(machine), Some(common)) = (&mut side.machine, &commons[s]) else {
                 continue;
             };
-            let (begun, idle): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut machine.streams)
-                .into_iter()
-                .partition(|stream| stream.blocks > 0);
-            for stream in idle {
-                machine.let_go(stream);
-            }
-            machine.streams = begun;
+            let grid = side.grid;
             for stream in &mut machine.streams {
                 stream.length = stream.held();
             }
+            let (kept, gone): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut machine.streams)
+                .into_iter()
+                .partition(|stream| {
+                    stream.blocks > 0
+                        && (common.stage == Stage::Original
+                            || grid.is_some_and(|grid| {
+                                stream.blocks as f64 >= DUB_KEPT * grid.blocks(stream.length) as f64
+                            }))
+                });
+            for stream in gone {
+                common.made(stream.pass, None, progress);
+                machine.let_go(stream);
+            }
+            machine.streams = kept;
         }
         sides
     }
 
     /// One block at a time, the original's first: the first element with
-    /// one ready first. A pass is taken from a line at once, and another
-    /// each time a block was made since, while the line is not too far
-    /// behind — the original's line first. A machine that falls behind on
-    /// any lets the last of the dub's go, or with none left the last of the
-    /// original's, once a block was made since the last went.
+    /// one ready first. A pass is taken from the original's line at once,
+    /// and another each time a block was made since, while the line is not
+    /// too far behind; a machine that falls [`BEHIND`] on the original lets
+    /// the last of it go, once a block was made since the last went — as
+    /// when the original was followed alone.
+    ///
+    /// The dub has the gaps: a block of it only when the original has none
+    /// ready, and only if the block would end before the original's next
+    /// one is ready, with room to spare ([`DUB_FIT`]), by what a block
+    /// costs that machine in frames of the extraction ([`Side::cost`]). A
+    /// burst of film, where the extraction goes faster, raises that cost
+    /// and leaves no gap: the original keeps its slack. So it never holds
+    /// the original back,
+    /// and it is never let go for falling behind: it makes what it can,
+    /// and what it took and made too little of is let go when the decode
+    /// ends ([`DUB_KEPT`]).
     fn serve(
         &self,
         device: usize,
@@ -850,43 +890,69 @@ impl<'a> Follower<'a> {
                 // Nothing to follow with.
                 return;
             }
-            let behind = sides.iter().any(|side| {
-                side.grid
-                    .zip(side.machine.as_ref())
-                    .is_some_and(|(grid, machine)| {
-                        machine
-                            .streams
-                            .iter()
-                            .any(|stream| grid.ready(stream.held()) >= stream.blocks + BEHIND)
-                    })
-            });
-            if behind && may_let_go {
-                // The dub's last, while it has one: it only ever has the
-                // time the original leaves.
-                for s in [1, 0] {
-                    let (Some(common), Some(machine)) = (&commons[s], &mut sides[s].machine) else {
-                        continue;
-                    };
-                    let Some(stream) = machine.streams.pop() else {
-                        continue;
-                    };
-                    common.made(stream.pass, None, progress);
-                    progress(Event::message(format!(
-                        "  {prefix}{} let go: {} does not keep up with the extraction on that \
-                         many; it is separated after it",
-                        stream.base,
-                        name_of(self.config, device)
-                    )));
-                    machine.let_go(stream);
-                    may_let_go = false;
-                    continue 'serve;
-                }
+            if may_let_go
+                && let (Some(common), Some(grid), Some(machine)) =
+                    (&commons[0], sides[0].grid, &mut sides[0].machine)
+                && machine
+                    .streams
+                    .iter()
+                    .any(|stream| grid.ready(stream.held()) >= stream.blocks + BEHIND)
+            {
+                let stream = machine.streams.pop().expect("one is behind");
+                common.made(stream.pass, None, progress);
+                progress(Event::message(format!(
+                    "  {prefix}{} let go: {} does not keep up with the extraction on that \
+                     many; it is separated after it",
+                    stream.base,
+                    name_of(self.config, device)
+                )));
+                machine.let_go(stream);
+                may_let_go = false;
+                continue 'serve;
             }
-            for s in 0..2 {
+            // Frames until the original has a block ready again.
+            let gap = match (sides[0].grid, &sides[0].machine) {
+                (Some(grid), Some(machine)) => machine
+                    .streams
+                    .iter()
+                    .map(|stream| grid.ready_at(stream.blocks).saturating_sub(stream.held()))
+                    .min()
+                    .unwrap_or(u64::MAX),
+                _ => u64::MAX,
+            };
+            // The original's block, its line, the dub's block, its line.
+            for (s, intake) in [(0, false), (0, true), (1, false), (1, true)] {
                 let (Some(common), Some(grid)) = (&commons[s], sides[s].grid) else {
                     continue;
                 };
-                let Some(machine) = &mut sides[s].machine else {
+                if intake {
+                    if !may_take || !sides[s].open {
+                        continue;
+                    }
+                    match self.intake(common, grid) {
+                        Ok(Some(stream)) => {
+                            if let Some(machine) = &mut sides[s].machine {
+                                machine.streams.push(stream);
+                            }
+                            may_take = false;
+                            continue 'serve;
+                        }
+                        Ok(None) => sides[s].open = false,
+                        Err(why) => {
+                            let stopped = self.stops[s][device].raised();
+                            out(&mut sides[s], common, device, (why, stopped), progress);
+                        }
+                    }
+                    continue;
+                }
+                if s == 1 {
+                    let cost = sides[1].cost.or(sides[0].cost).unwrap_or(0);
+                    if cost as f64 * DUB_FIT > gap as f64 {
+                        continue;
+                    }
+                }
+                let side = &mut sides[s];
+                let Some(machine) = &mut side.machine else {
                     continue;
                 };
                 let held: Vec<u64> = machine.streams.iter().map(Stream::held).collect();
@@ -904,6 +970,10 @@ impl<'a> Follower<'a> {
                         match stream.step(worker, &inputs, held[i], false) {
                             Ok(_) => {
                                 common.made(stream.pass, Some((device, stream.written)), progress);
+                                // What the extraction wrote meanwhile.
+                                let spent = stream.held().saturating_sub(held[i]);
+                                side.cost =
+                                    Some(side.cost.map_or(spent, |cost| (3 * cost + spent) / 4));
                                 Stepped::Made
                             }
                             // The decode failed, or the worker is gone: what
@@ -935,29 +1005,6 @@ impl<'a> Follower<'a> {
                     }
                 }
                 continue 'serve;
-            }
-            if may_take {
-                for s in 0..2 {
-                    let (Some(common), Some(grid), true) =
-                        (&commons[s], sides[s].grid, sides[s].open)
-                    else {
-                        continue;
-                    };
-                    match self.intake(common, grid) {
-                        Ok(Some(stream)) => {
-                            if let Some(machine) = &mut sides[s].machine {
-                                machine.streams.push(stream);
-                            }
-                            may_take = false;
-                            continue 'serve;
-                        }
-                        Ok(None) => sides[s].open = false,
-                        Err(why) => {
-                            let stopped = self.stops[s][device].raised();
-                            out(&mut sides[s], common, device, (why, stopped), progress);
-                        }
-                    }
-                }
             }
             if sides.iter().any(|side| side.loading) {
                 // Not following yet: the tests' extraction waits for it.
@@ -2480,8 +2527,9 @@ mod tests {
 
     /// [`follow`], each stage's worker on this machine started for its
     /// `envs`, the dub too when `film` has one. With `gate`, the machines
-    /// make that many blocks for every chunk written, and the extraction
-    /// waits for them (`in_step`).
+    /// make that many blocks for every chunk written, by its rank — on
+    /// average, a share of one carried over to the next chunk — and the
+    /// extraction waits for them (`in_step`).
     #[allow(clippy::too_many_arguments)]
     fn follow_with(
         bench: &Bench,
@@ -2491,7 +2539,7 @@ mod tests {
         chunk: u64,
         pause: Duration,
         in_step: bool,
-        gate: Option<u64>,
+        gate: Option<&dyn Fn(usize) -> f64>,
     ) -> Ran {
         let mut job = bench.job("followed", pairs);
         // The manifest's film is the one grown here, which is what the
@@ -2533,10 +2581,15 @@ mod tests {
             // A follower that never is gets a minute, then the extraction
             // runs on.
             let late = std::cell::Cell::new(false);
+            let owed = std::cell::Cell::new(0.0);
+            let chunks = std::cell::Cell::new(0);
             let caught_up = || {
                 let seen: Vec<u64> = (0..devices).map(|d| follower.waits(d)).collect();
                 if let Some(blocks) = gate {
-                    follower.gate.grant(blocks);
+                    let due = owed.get() + blocks(chunks.get());
+                    chunks.set(chunks.get() + 1);
+                    owed.set(due.fract());
+                    follower.gate.grant(due.trunc() as u64);
                 }
                 let deadline = std::time::Instant::now() + Duration::from_secs(60);
                 while !late.get()
@@ -2851,47 +2904,100 @@ mod tests {
         same(&ran.outputs, &whole);
     }
 
-    /// **The dub has what the original leaves.** A machine that makes six
-    /// blocks for every block of film the extraction writes keeps the
-    /// original's four elements and two of the dub's channels; the third it
-    /// took falls behind and is let go — nothing of the original is — and
-    /// the rest of the dub is never taken. Everything comes out as whole.
-    #[test]
-    fn a_machine_that_does_not_keep_up_lets_the_dub_go_before_the_original() {
-        let bench = Bench::new("dub-behind");
-        let film = Film::objects(4, 80_000).dubbed();
+    /// A machine held to `per_chunk(n)` blocks for the `n`-th `chunk` of
+    /// frames the extraction writes follows the original's four elements,
+    /// and a 5.1 dub when `dubbed`: what it said, after checking that
+    /// everything came out as whole.
+    fn held_to(
+        name: &str,
+        chunk: u64,
+        per_chunk: &dyn Fn(usize) -> f64,
+        dubbed: bool,
+    ) -> Arc<Said> {
+        let bench = Bench::new(name);
+        let mut film = Film::objects(4, 160_000);
+        if dubbed {
+            film = film.dubbed();
+        }
         let whole = bench.whole(&film, Pairs::default());
         let ran = follow_with(
             &bench,
             &film,
             Pairs::default(),
             [Vec::new(), Vec::new()],
-            STEP,
+            chunk,
             Duration::ZERO,
             true,
-            Some(6),
+            Some(per_chunk),
         );
-        let said = &ran.said;
+        same(&ran.outputs, &whole);
+        ran.said
+    }
+
+    /// What the follower said of the original, at the end of the
+    /// extraction, and what of it it let go.
+    fn the_original_s(said: &Said) -> (Vec<String>, Vec<String>) {
+        let let_go = lines_with(said, " let go: ")
+            .into_iter()
+            .filter(|line| {
+                !DUB.iter()
+                    .any(|name| line.contains(&format!(" {name} let go")))
+            })
+            .collect();
+        (
+            lines_with(said, "of the original's 4 elements followed"),
+            let_go,
+        )
+    }
+
+    /// **The dub has the gaps the original leaves.** A machine that makes
+    /// eight blocks while the extraction writes one keeps the original's
+    /// four elements and follows some of the dub in the time left; nothing
+    /// is let go.
+    #[test]
+    fn the_dub_has_the_gaps_the_original_leaves() {
+        let said = held_to("dub-gaps", STEP / 4, &|_| 2.0, true);
         assert!(
             said.any("during the extraction: 4 of the original's 4 elements followed"),
             "{}",
             said.lines()
         );
         assert!(
-            said.any("during the extraction: 2 of the dub's 5 channels followed"),
+            lines_with(&said, " let go: ").is_empty(),
             "{}",
             said.lines()
         );
+        assert!(
+            lines_with(&said, "of the dub's 5 channels followed").len() == 1,
+            "{}",
+            said.lines()
+        );
+    }
+
+    /// **The dub never holds the original back.** The extraction does not
+    /// write at one rate: where the video is lighter the film comes faster,
+    /// and a machine that keeps up with the original with a fifth to spare
+    /// keeps up with none of it there. Seen on a film: the dub, taken at the
+    /// start and served whenever the original had nothing ready, left the
+    /// original no slack for those stretches, and both machines let one
+    /// element of it go after another. The original must fare the same with
+    /// the dub beside it as alone.
+    #[test]
+    fn the_dub_never_holds_the_original_back() {
+        // About five blocks for every one of film, three in a stretch of
+        // two blocks of film that come twice as fast.
+        let bursty = |n: usize| if (32..48).contains(&n) { 0.3 } else { 0.6 };
+        let alone = held_to("dub-tight-alone", STEP / 8, &bursty, false);
+        let beside = held_to("dub-tight", STEP / 8, &bursty, true);
+        let (followed, let_go) = the_original_s(&alone);
+        assert_eq!(followed.len(), 1, "{}", alone.lines());
         assert_eq!(
-            lines_with(said, " let go: "),
-            [
-                "  R let go: this machine does not keep up with the extraction on that many; it is \
-              separated after it"
-            ],
-            "{}",
-            said.lines()
+            the_original_s(&beside),
+            (followed, let_go),
+            "alone:\n{}\n\nbeside the dub:\n{}",
+            alone.lines(),
+            beside.lines()
         );
-        same(&ran.outputs, &whole);
     }
 
     /// **A dub the worker cannot follow.** Its worker separates whole
