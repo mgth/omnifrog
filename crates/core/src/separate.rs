@@ -789,6 +789,11 @@ struct Queue {
     /// Per device: a pass it claimed and whose outputs it writes while it
     /// is on the next one (a remote's, see [`Shared::set_aside`]).
     writing: Vec<Option<Run>>,
+    /// Per device: made first elsewhere, the pass it is on, while it was
+    /// writing the one before. It is stopped once that one is written or
+    /// given back, not before: the stop kills the transfers of what it
+    /// writes, and a remote's worker that ends empties its directory there.
+    stop_once_written: Vec<bool>,
     /// Per pass of the plan: the device that has its stems and writes its
     /// outputs.
     claimed: Vec<Option<usize>>,
@@ -838,6 +843,7 @@ impl Shared {
                 todo,
                 running: vec![None; devices],
                 writing: vec![None; devices],
+                stop_once_written: vec![false; devices],
                 claimed: vec![None; passes],
                 numbers: vec![0; passes],
                 pending: vec![0; devices],
@@ -944,6 +950,7 @@ impl Shared {
             since: Instant::now(),
             patience: Duration::ZERO,
         });
+        queue.stop_once_written[device] = false;
         self.stops[device].lower();
         Took {
             pass,
@@ -977,7 +984,8 @@ impl Shared {
     }
 
     /// `device` has the stems of its pass. `true` if it is the first: it
-    /// writes the outputs, and the device making it beside it is stopped.
+    /// writes the outputs, and the device making it beside it is stopped —
+    /// once it has written the pass before, if it is writing one.
     fn claim(&self, device: usize) -> bool {
         let mut queue = self.queue();
         let Some(run) = queue.running[device] else {
@@ -994,9 +1002,13 @@ impl Shared {
         if queue.todo.len() < before {
             queue.taken += 1;
         }
-        for (d, other) in queue.running.iter().enumerate() {
-            if d != device && other.is_some_and(|other| other.pass == run.pass) {
-                self.stops[d].raise();
+        for d in 0..queue.running.len() {
+            if d != device && queue.running[d].is_some_and(|other| other.pass == run.pass) {
+                // Writing the pass before, it is stopped once that is done.
+                match queue.writing[d] {
+                    Some(_) => queue.stop_once_written[d] = true,
+                    None => self.stops[d].raise(),
+                }
             }
         }
         self.changed.notify_all();
@@ -1039,7 +1051,9 @@ impl Shared {
         let elsewhere = queue.claimed[run.pass].is_some()
             || queue.todo.contains(&run.pass)
             || queue.running.iter().enumerate().any(|(d, other)| {
-                other.is_some_and(|other| other.pass == run.pass) && !self.stops[d].raised()
+                other.is_some_and(|other| other.pass == run.pass)
+                    && !self.stops[d].raised()
+                    && !queue.stop_once_written[d]
             });
         if !elsewhere {
             queue.taken -= 1;
@@ -1061,6 +1075,7 @@ impl Shared {
     /// `device` wrote the outputs of the pass it set aside.
     fn written(&self, device: usize) {
         let mut queue = self.queue();
+        self.stop_if_beaten(&mut queue, device);
         if queue.writing[device].take().is_some() {
             queue.finished += 1;
         }
@@ -1074,8 +1089,17 @@ impl Shared {
     /// claim goes, and the pass back in line.
     fn unwritten(&self, device: usize) {
         let mut queue = self.queue();
+        self.stop_if_beaten(&mut queue, device);
         if let Some(run) = queue.writing[device].take() {
             self.back(&mut queue, device, run);
+        }
+    }
+
+    /// `device` is done with the pass it wrote: if the one it is on was made
+    /// first elsewhere meanwhile, it is stopped now.
+    fn stop_if_beaten(&self, queue: &mut Queue, device: usize) {
+        if std::mem::take(&mut queue.stop_once_written[device]) {
+            self.stops[device].raise();
         }
     }
 
@@ -2342,6 +2366,53 @@ mod tests {
         };
         shared.written(1);
         assert_eq!(waiting.join().unwrap(), None);
+        assert!(shared.stop(1).raised());
+    }
+
+    /// **A remote beaten to its pass while it writes the one before.** It
+    /// is stopped once that one is written, or given back, and not before:
+    /// the stop would kill the transfer of its last stems, and a remote's
+    /// worker that ends empties its directory there, so a pass already
+    /// made would be made again. A remote writing nothing is stopped at
+    /// once.
+    #[test]
+    fn a_remote_beaten_to_its_pass_is_stopped_once_the_pass_before_is_written() {
+        for written in [true, false] {
+            let shared = Shared::new(VecDeque::from([0, 1, 2]), 3, 2);
+            assert_eq!(shared.take(1, false), next(0, 1));
+            assert!(shared.claim(1));
+            shared.set_aside(1);
+            assert_eq!(shared.take(1, false), next(1, 2));
+            // This machine makes the remote's pass first.
+            assert_eq!(shared.take(0, false), next(2, 3));
+            assert!(shared.claim(0));
+            shared.done(0);
+            assert_eq!(shared.take(0, true), again(1, 2, 1));
+            assert!(shared.claim(0));
+            assert!(!shared.stop(1).raised());
+            match written {
+                true => shared.written(1),
+                false => shared.unwritten(1),
+            }
+            assert!(shared.stop(1).raised());
+            shared.give_back(1);
+            shared.done(0);
+            // The pass it could not write is back in line, made here.
+            match written {
+                true => assert_eq!(shared.take(0, true), None),
+                false => {
+                    assert_eq!(shared.take(0, true), next(0, 3));
+                    assert!(shared.claim(0));
+                    shared.done(0);
+                    assert_eq!(shared.take(0, true), None);
+                }
+            }
+        }
+        // Writing nothing, it is stopped at once.
+        let shared = Shared::new(VecDeque::from([0]), 1, 2);
+        assert_eq!(shared.take(1, false), next(0, 1));
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(shared.claim(0));
         assert!(shared.stop(1).raised());
     }
 
