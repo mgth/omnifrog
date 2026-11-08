@@ -2,7 +2,7 @@
 
 use crate::config::{Config, Encoder};
 use crate::models::Catalogue;
-use crate::{encode, run, setup, tools, worker};
+use crate::{encode, rocm, run, setup, tools, worker};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,24 @@ pub fn run(config: &Config) -> Vec<Check> {
         ),
     ));
 
+    // A ROCm override the card cannot run resets the GPU at the first copy:
+    // broken, like a tool that cannot start.
+    let rocm = rocm::check();
+    if let Some(report) = &rocm {
+        checks.push(check(
+            "rocm arch",
+            if report.broken.is_some() {
+                Status::Missing
+            } else if report.warnings.is_empty() {
+                Status::Ok
+            } else {
+                Status::Warning
+            },
+            report.detail(),
+        ));
+    }
+    let override_broken = rocm.is_some_and(|report| report.broken.is_some());
+
     let work = config.work_dir();
     checks.push(check(
         "work dir",
@@ -105,7 +123,7 @@ pub fn run(config: &Config) -> Vec<Check> {
 
     let python = config.python();
     if python.is_file() {
-        match torch_report(&python, &config.msst_dir()) {
+        match torch_report(&python, &config.msst_dir(), override_broken) {
             Ok(report) => checks.push(check(
                 "python",
                 Status::Ok,
@@ -304,13 +322,31 @@ fn iamf(config: &Config, harlettizer: &Path) -> Check {
 }
 
 /// torch's version and device, with MSST importable, from the venv itself.
-fn torch_report(python: &Path, msst: &Path) -> Result<String, String> {
+/// Under a ROCm override the card cannot run (`without_override`), torch
+/// is asked without any (`HSA_OVERRIDE_GFX_VERSION` and each node's
+/// `HSA_OVERRIDE_GFX_VERSION_<n>`): the `rocm arch` check already says it
+/// is broken.
+fn torch_report(python: &Path, msst: &Path, without_override: bool) -> Result<String, String> {
     let mut c = run::command(python);
     c.arg("-c")
         .arg("import sys, torch; sys.path.insert(0, sys.argv[1]); dev = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'; hip = getattr(torch.version, 'hip', None); print(f\"torch {torch.__version__}, device {dev}\" + (f\" (ROCm {hip})\" if hip else ''))")
         .arg(msst)
         .env("PYTHONWARNINGS", "ignore");
-    run::output(c).map_err(|e| match e {
+    if without_override {
+        // Every card's override and each node's own.
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(rocm::is_override) {
+                c.env_remove(&key);
+            }
+        }
+    }
+    let report = run::output(c);
+    let report = if without_override {
+        report.map(|r| format!("{r} (asked without the {} variables)", rocm::OVERRIDE))
+    } else {
+        report
+    };
+    report.map_err(|e| match e {
         crate::Error::Command { detail, .. } => detail
             .lines()
             .last()
