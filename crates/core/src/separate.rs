@@ -70,6 +70,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod follow;
+use follow::Machine;
 pub use follow::{Followed, Follower, follows};
 
 /// Everything the pipeline hands around is at this rate, whatever the
@@ -700,6 +701,14 @@ pub fn mode_dub(pairs: Pairs) -> &'static str {
 const BUSY_RETRY: Duration = Duration::from_secs(60);
 /// Failures in a row after which a remote is left out of the step.
 const REMOTE_FAILURES: u32 = 2;
+/// How long a remote may take over the rest of an element it followed
+/// before this machine, with nothing else left, makes it again whole: a
+/// block or two, a few seconds each, against minutes for a whole element.
+const TAIL_PATIENCE: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(120)
+};
 
 /// The passes still to make, shared by the devices that make them: this
 /// machine's (0) and the remotes'.
@@ -726,6 +735,9 @@ struct Queue {
     claimed: Vec<Option<usize>>,
     /// Per pass of the plan: its number in this run, once taken.
     numbers: Vec<usize>,
+    /// Per device: the passes it followed during the extraction and has not
+    /// begun yet ([`Shared::begin`]).
+    pending: Vec<usize>,
     /// Passes this run has to make.
     total: usize,
     /// Passes taken in this run, for « pair 3/12 ».
@@ -743,6 +755,8 @@ struct Run {
     /// How far into it the device is.
     fraction: f64,
     since: Instant,
+    /// How long it is left to the device before another makes it again.
+    patience: Duration,
 }
 
 /// A pass a device takes.
@@ -766,6 +780,7 @@ impl Shared {
                 running: vec![None; devices],
                 claimed: vec![None; passes],
                 numbers: vec![0; passes],
+                pending: vec![0; devices],
                 taken: 0,
                 finished: 0,
                 failed: None,
@@ -804,23 +819,42 @@ impl Shared {
             if !waits {
                 return None;
             }
-            let oldest = queue
+            let now = Instant::now();
+            let others: Vec<(usize, Run)> = queue
                 .running
                 .iter()
                 .enumerate()
                 .filter_map(|(d, run)| run.map(|run| (d, run)))
                 .filter(|(d, run)| *d != device && queue.claimed[run.pass].is_none())
+                .collect();
+            let oldest = others
+                .iter()
+                .filter(|(_, run)| now >= run.since + run.patience)
                 .min_by_key(|(_, run)| run.since);
-            if let Some((beside, run)) = oldest {
+            if let Some(&(beside, run)) = oldest {
                 return Some(self.start(&mut queue, device, run.pass, Some(beside)));
             }
-            if queue.running.iter().all(Option::is_none) {
+            if queue.running.iter().all(Option::is_none) && queue.pending.iter().all(|&n| n == 0) {
                 return None;
             }
-            queue = self
-                .changed
-                .wait(queue)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A pass a remote is finishing is looked at again once its
+            // patience is out.
+            let soonest = others
+                .iter()
+                .map(|(_, run)| (run.since + run.patience).saturating_duration_since(now))
+                .min();
+            queue = match soonest {
+                Some(left) => {
+                    self.changed
+                        .wait_timeout(queue, left)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .0
+                }
+                None => self
+                    .changed
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            };
         }
     }
 
@@ -829,6 +863,7 @@ impl Shared {
             pass,
             fraction: 0.0,
             since: Instant::now(),
+            patience: Duration::ZERO,
         });
         self.stops[device].lower();
         Took {
@@ -924,6 +959,38 @@ impl Shared {
             queue.taken -= 1;
             queue.todo.push_front(run.pass);
         }
+        self.changed.notify_all();
+    }
+
+    /// `count` more passes this run makes that are not in line: those the
+    /// remote `device` followed during the extraction, each
+    /// [`Shared::begin`]-ed by it in turn. Until they all are, this machine
+    /// does not end its step.
+    fn expect(&self, device: usize, count: usize) {
+        let mut queue = self.queue();
+        queue.total += count;
+        queue.pending[device] += count;
+    }
+
+    /// `device` goes on `pass`, one it followed during the extraction and
+    /// was counted for ([`Shared::expect`]): a pass under way like any
+    /// other, which another device makes again, and may claim first, once
+    /// [`TAIL_PATIENCE`] is out.
+    fn begin(&self, device: usize, pass: usize) {
+        let mut queue = self.queue();
+        queue.pending[device] = queue.pending[device].saturating_sub(1);
+        queue.taken += 1;
+        queue.numbers[pass] = queue.taken;
+        self.start(&mut queue, device, pass, None);
+        if let Some(run) = &mut queue.running[device] {
+            run.patience = TAIL_PATIENCE;
+        }
+        self.changed.notify_all();
+    }
+
+    /// `device` begins nothing more of what it followed: gone, or done.
+    fn ends(&self, device: usize) {
+        self.queue().pending[device] = 0;
         self.changed.notify_all();
     }
 
@@ -1085,11 +1152,16 @@ fn run(
         return Ok(done);
     }
     if !following.is_empty() {
+        let on = followed.as_ref().map_or(0, Followed::following_on);
         progress(Event::message(format!(
-            "{} {kind}{} followed during the extraction: this machine finishes {} first",
+            "{} {kind}{} followed during the extraction: {} first",
             following.len(),
             if following.len() > 1 { "s" } else { "" },
-            if following.len() > 1 { "them" } else { "it" },
+            match (on, following.len()) {
+                (2.., _) => "each machine finishes its own",
+                (_, 2..) => "this machine finishes them",
+                _ => "this machine finishes it",
+            },
         )));
     }
 
@@ -1116,11 +1188,21 @@ fn run(
                     (None, None) => unreachable!("fetched when there is no start"),
                 }
             };
-            let shared = Shared::new(
-                todo.iter().copied().collect(),
-                plan.passes.len(),
-                1 + config.remotes.len(),
-            );
+            let devices = 1 + config.remotes.len();
+            // What each machine followed during the extraction, with its
+            // worker, still loaded: it finishes them first.
+            let mut handed: Vec<Option<Machine>> = (0..devices)
+                .map(|device| followed.as_mut().and_then(|f| f.machine(device)))
+                .collect();
+            let shared = Shared::new(todo.iter().copied().collect(), plan.passes.len(), devices);
+            // A remote's are passes of the line once it is on them, which
+            // this machine makes again whole when it has nothing else left:
+            // a remote that hangs costs nothing there either.
+            for (device, began) in handed.iter().enumerate().skip(1) {
+                if let Some(began) = began {
+                    shared.expect(device, began.followed());
+                }
+            }
             // With remotes, every line says which machine it is about.
             let named = !config.remotes.is_empty();
             let prefix = |device: usize| -> String {
@@ -1243,12 +1325,13 @@ fn run(
             // were remotes. With nothing left in line, it makes again the
             // passes the remotes are on rather than wait for them (see
             // `Shared`).
+            let mut began_here = handed[0].take();
             let mut here = || {
                 let stop = shared.stop(0);
                 let mut worker: Option<Worker> = None;
                 // What the extraction's follower began, finished first by the
                 // worker that began it: nobody else has the fades it keeps.
-                if let Some(mut began) = followed.take() {
+                if let Some(mut began) = began_here.take() {
                     worker = began.take_worker();
                     let mut left = Vec::new();
                     for stream in began.streams() {
@@ -1266,16 +1349,21 @@ fn run(
                             stream.describe(),
                         )));
                         let finished = match &mut worker {
-                            Some(running) => {
-                                stream.finish(running, units, &frames, mastered_at, |made| {
+                            Some(running) => stream.finish(
+                                running,
+                                units,
+                                &frames,
+                                mastered_at,
+                                |made| {
                                     *tails.lock().unwrap_or_else(|p| p.into_inner()) += made;
                                     fraction(0, 0.0);
-                                })
-                            }
+                                },
+                                || true,
+                            ),
                             None => Err(Error::msg("the worker that followed it is gone")),
                         };
                         match finished {
-                            Ok(()) => done_in(0, pass, started),
+                            Ok(_) => done_in(0, pass, started),
                             Err(why) => {
                                 progress(Event::message(format!(
                                     "  {}{}: {why}; made whole instead",
@@ -1390,18 +1478,117 @@ fn run(
             // (see `remote`). It never fails the step: what it does not
             // make, this machine makes. Whatever it runs is killed when its
             // stop is raised.
-            let far = |device: usize, remote: &Remote| {
+            let far = |device: usize, remote: &Remote, began: Option<Machine>| {
                 let who = &remote.host;
                 let ssh = Ssh::new(who).stopped_by(shared.stop(device));
                 let stop = ssh.stop().clone();
-                match remote::probe(remote, &ssh) {
+                let mut failures = 0;
+                let mut said_busy = false;
+                let mut peak: Option<f64> = None;
+                let mut worker: Option<Box<Worker>> = None;
+                // The most a worker that is let go reserved on its device.
+                let mut keep_peak = |worker: &Worker| {
+                    if let Some(p) = worker.device_peak() {
+                        peak = Some(peak.map_or(p, |q: f64| q.max(p)));
+                    }
+                };
+                // Whatever happens to this thread, this machine is not left
+                // waiting for what it would have begun.
+                struct Ends<'s>(&'s Shared, usize);
+                impl Drop for Ends<'_> {
+                    fn drop(&mut self) {
+                        self.0.ends(self.1);
+                    }
+                }
+                let ends = Ends(&shared, device);
+                // What it followed during the extraction, finished first by
+                // the worker that began it, which then serves the step.
+                let handed_on = began.is_some();
+                if let Some(mut began) = began {
+                    if let Some(mut running) = began.take_worker() {
+                        running.set_stop(Some(stop.clone()));
+                        worker = Some(Box::new(running));
+                    }
+                    for stream in began.streams() {
+                        let pass = stream.pass();
+                        let started = Instant::now();
+                        shared.begin(device, pass);
+                        progress(Event::message(format!(
+                            "{}{} {} ({}): the rest of it, followed during the extraction",
+                            prefix(device),
+                            if plan.passes[pass].right.is_some() {
+                                "pair"
+                            } else {
+                                kind
+                            },
+                            names[pass],
+                            stream.describe(),
+                        )));
+                        let finished = match &mut worker {
+                            Some(running) => stream.finish(
+                                running,
+                                units,
+                                &frames,
+                                mastered_at,
+                                |made| {
+                                    *tails.lock().unwrap_or_else(|p| p.into_inner()) += made;
+                                    fraction(device, 0.0);
+                                },
+                                || shared.claim(device),
+                            ),
+                            None => Err(Error::msg("the worker that followed it is gone")),
+                        };
+                        // From here on, the line counts it, made or not.
+                        *tails.lock().unwrap_or_else(|p| p.into_inner()) -= stream.made();
+                        match finished {
+                            Ok(true) => {
+                                done_in(device, pass, started);
+                                shared.done(device);
+                            }
+                            Ok(false) => {
+                                dropped(device, pass);
+                                shared.give_back(device);
+                            }
+                            Err(_) if stop.raised() => {
+                                dropped(device, pass);
+                                shared.give_back(device);
+                            }
+                            Err(why) => {
+                                progress(Event::message(format!(
+                                    "  {}{}: {why}; made whole instead",
+                                    prefix(device),
+                                    names[pass]
+                                )));
+                                shared.give_back(device);
+                                // What it was sent of it goes from there.
+                                if let Some(running) = &mut worker
+                                    && running.is_alive()
+                                {
+                                    let _ = running.forget(&names[pass]);
+                                }
+                            }
+                        }
+                        if let Some(dead) = worker.take_if(|worker| !worker.is_alive()) {
+                            keep_peak(&dead);
+                        }
+                    }
+                }
+                drop(ends);
+                // Checked during the extraction, when it was handed on.
+                let probed = if handed_on {
+                    Ok(None)
+                } else {
+                    remote::probe(remote, &ssh).map(Some)
+                };
+                match probed {
+                    Ok(None) => {}
                     // The step was over before the remote answered.
                     Err(_) if stop.raised() => return,
                     Err(why) => {
                         progress(Event::message(format!("{who}: left out: {why}")));
                         return;
                     }
-                    Ok(probe) => match probe.unfit() {
+                    Ok(Some(probe)) => match probe.unfit() {
                         Some(why) => {
                             progress(Event::message(format!("{who}: left out: {why}")));
                             return;
@@ -1420,16 +1607,6 @@ fn run(
                     /// The remote's GPU is someone else's: why.
                     Busy(String),
                 }
-                let mut failures = 0;
-                let mut said_busy = false;
-                let mut peak: Option<f64> = None;
-                let mut worker: Option<Box<Worker>> = None;
-                // The most a worker that is let go reserved on its device.
-                let mut keep_peak = |worker: &Worker| {
-                    if let Some(p) = worker.device_peak() {
-                        peak = Some(peak.map_or(p, |q: f64| q.max(p)));
-                    }
-                };
                 while let Some(took) = shared.take(device, false) {
                     let pass = took.pass;
                     let started = Instant::now();
@@ -1528,11 +1705,13 @@ fn run(
             };
 
             std::thread::scope(|scope| {
-                // With everything followed, the remotes have nothing to take.
+                // With everything followed, a remote has nothing to take but
+                // what it followed itself.
                 for (index, remote) in config.remotes.iter().enumerate() {
                     let far = &far;
-                    if !todo.is_empty() {
-                        scope.spawn(move || far(index + 1, remote));
+                    let began = handed[index + 1].take();
+                    if !todo.is_empty() || began.is_some() {
+                        scope.spawn(move || far(index + 1, remote, began));
                     }
                 }
                 here();
@@ -1737,6 +1916,7 @@ fn clear_parts(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::job::ModelRef;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn next(pass: usize, number: usize) -> Option<Took> {
         Some(Took {
@@ -1752,6 +1932,43 @@ mod tests {
             number,
             beside: Some(beside),
         })
+    }
+
+    #[test]
+    fn this_machine_waits_for_what_a_remote_followed_and_makes_it_again_late() {
+        // Nothing in line; the remote followed two passes during the
+        // extraction and finishes them one after the other.
+        let shared = Shared::new(VecDeque::new(), 2, 2);
+        shared.expect(1, 2);
+        let returned = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let here = scope.spawn(|| {
+                let took = shared.take(0, true);
+                returned.store(true, Ordering::SeqCst);
+                took
+            });
+            shared.begin(1, 0);
+            assert!(shared.claim(1));
+            shared.done(1);
+            // Between its two, nothing runs: this machine still waits, or
+            // its end would stop the remote's second.
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!returned.load(Ordering::SeqCst));
+            shared.begin(1, 1);
+            // Within its patience, the remote's pass is not made again.
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!returned.load(Ordering::SeqCst));
+            assert!(shared.claim(1));
+            shared.done(1);
+            assert_eq!(here.join().unwrap(), None);
+        });
+        // Past its patience, it is.
+        let shared = Shared::new(VecDeque::new(), 1, 2);
+        shared.expect(1, 1);
+        shared.begin(1, 0);
+        let started = Instant::now();
+        assert_eq!(shared.take(0, true), again(0, 1, 1));
+        assert!(started.elapsed() >= TAIL_PATIENCE - Duration::from_millis(50));
     }
 
     #[test]

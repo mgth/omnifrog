@@ -22,7 +22,10 @@
 //! The inputs go there and the stems come back through `ssh … cat`, over
 //! the connection the first command opened and kept (on Unix): a pass of a
 //! two-hour film is about 1.5 GB out and 5 GB back, seconds on a 10 Gb/s
-//! link against minutes of inference.
+//! link against minutes of inference. An element the remote follows during
+//! the extraction goes there a piece at a time — what its waveform gained
+//! since the last block, appended (`cat >>`) — and each block's stems come
+//! back as it is made.
 //!
 //! **A GPU in use is left alone.** The worker starts only if the other
 //! programs there hold less than `idle_below_gib` of the memory of the
@@ -49,7 +52,7 @@ use crate::run::Stop;
 use crate::worker::{self, Lock};
 use crate::{Error, Result};
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -67,6 +70,11 @@ const PROTOCOL: u32 = 1;
 
 /// The directory of a remote's work directory a pass's files live in.
 const DIR: &str = "remote";
+
+/// The host the tests' remote answers to: its commands run in this
+/// machine's shell.
+#[cfg(test)]
+pub(crate) const SHELL: &str = "shell.invalid";
 
 /// `text` as one word of a POSIX shell, whatever it holds.
 pub fn quote(text: &str) -> String {
@@ -146,6 +154,13 @@ impl Ssh {
     /// `ssh` running `line` in the remote's shell; the streams are the
     /// caller's to set.
     pub fn command(&self, line: &str) -> Command {
+        // The tests' remote: this machine's shell, standing in for ssh.
+        #[cfg(test)]
+        if self.host == SHELL {
+            let mut command = crate::run::command("sh");
+            command.arg("-c").arg(line);
+            return command;
+        }
         let mut command = crate::run::command("ssh");
         // No terminal, never a question: a key or nothing. A link that dies
         // is noticed within a minute rather than at the next request.
@@ -200,9 +215,43 @@ impl Ssh {
 
     /// Copy `from` to the path `to` on that machine.
     pub fn upload(&self, from: &Path, to: &str) -> Result<()> {
+        let file = fs::File::open(from).map_err(|e| Error::io(from, e))?;
+        self.feed(from, file, &format!("cat > {}", quote(to)))
+            .map(|_| ())
+    }
+
+    /// Copy `length` bytes of `from`, from byte `offset`, to the path `to`
+    /// on that machine: a new file there, its directory made, when `offset`
+    /// is 0, and added to the end of it otherwise. A file still growing here
+    /// goes there a piece at a time.
+    pub fn send(&self, from: &Path, offset: u64, length: u64, to: &str) -> Result<()> {
         let mut file = fs::File::open(from).map_err(|e| Error::io(from, e))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::io(from, e))?;
+        let line = if offset == 0 {
+            let dir = to.rsplit_once('/').map_or(".", |(dir, _)| dir);
+            format!("mkdir -p -- {} && cat > {}", quote(dir), quote(to))
+        } else {
+            format!("cat >> {}", quote(to))
+        };
+        let sent = self.feed(from, file.take(length), &line)?;
+        if sent != length {
+            return Err(self.failed(
+                "cut short",
+                format!(
+                    "sending {}: {sent} of its {length} bytes from {offset}",
+                    from.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run `line` there, its input `source` (read from `from`); returns the
+    /// bytes it was given.
+    fn feed(&self, from: &Path, mut source: impl Read + Send + 'static, line: &str) -> Result<u64> {
         let mut child = self
-            .command(&format!("cat > {}", quote(to)))
+            .command(line)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -214,7 +263,7 @@ impl Ssh {
             let sent = Arc::clone(&sent);
             // The pipe closes when the copy ends, which is the end of the
             // file for `cat` over there; a killed ssh ends the copy too.
-            std::thread::spawn(move || copy_counting(&mut file, &mut stdin, &sent))
+            std::thread::spawn(move || copy_counting(&mut source, &mut stdin, &sent))
         });
         let moved = || sent.load(Ordering::Relaxed);
         let what = |detail: &str| format!("sending {}: {}", from.display(), detail.trim());
@@ -222,14 +271,15 @@ impl Ssh {
         let status = self
             .watch(&mut child, None, Some(&moved))
             .map_err(|cut| self.failed(cut, what("")))?;
-        if let Some(feed) = feed {
-            let _ = feed.join();
-        }
+        let copied = feed.map(|feed| feed.join());
         let err = joined(err);
         if !status.success() {
             return Err(self.failed(&status.to_string(), what(&err)));
         }
-        Ok(())
+        match copied {
+            Some(Ok(Err(e))) => Err(Error::io(from, e)),
+            _ => Ok(moved()),
+        }
     }
 
     /// Copy the path `from` on that machine to `to`, aside and then

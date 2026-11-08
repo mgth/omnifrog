@@ -5,17 +5,24 @@
 //! Every waveform grows in step with the others, so no element is whole
 //! before the very end; but the worker cuts an element into blocks anyway
 //! (`block_seconds`), and a block only needs the frames it covers and a
-//! window past them. So the follower hands this machine's worker one block
+//! window past them. So the follower hands each machine's worker one block
 //! at a time, as the decoder writes them, and keeps what comes back.
 //!
-//! **As many as it keeps up with.** It starts on every element and serves
-//! them in order, the first one with a block ready first. The GPU is faster
-//! than the disk, but not thirteen times: the last elements fall behind, and
-//! one that is [`BEHIND`] blocks behind is let go — the next one, if the
-//! others still do not keep up, once another block is made. What is let go
-//! is separated whole after the extraction, by any machine, like the
-//! elements nobody followed. Only this machine follows: a remote would need
-//! every block carried there, and is handed whole elements as before.
+//! **Every machine, as many as each keeps up with.** This machine and every
+//! remote that is ready (see [`crate::remote`]) follow side by side, each on
+//! a thread of its own, taking elements from one line in the plan's order:
+//! one at once, then another each time it made a block since, while the
+//! extraction is less than [`BEHIND`] blocks ahead of the next in line —
+//! about the first two blocks of film. So a machine takes about as many as
+//! it keeps up with, a faster one more. Each serves its own in order, the
+//! first with a block ready first; one that is [`BEHIND`] blocks behind is
+//! let go anyway — the next one, if the others still do not keep up, once
+//! another block is made. What is let go, or left in line, is separated
+//! whole after the extraction, by any machine, like the elements nobody
+//! followed. A remote is sent what its inputs gained before each block, and
+//! its stems come back after it; one that is busy or left out follows
+//! nothing, and one still loading its model when the decode ends is let go
+//! rather than hold the extraction's end up.
 //!
 //! **The same stems.** The worker cuts an element by a plan that is a
 //! function of its length alone, whole or growing, and fades one block into
@@ -28,9 +35,11 @@
 //!
 //! **Handed to the next step.** When the decode ends, what each element
 //! still needs is its last block or two, and the fade the worker keeps for
-//! it: the worker and what it followed go to the separation of the original
-//! ([`Followed`]), which finishes them first while the remotes start on the
-//! rest. The model is loaded once for both steps.
+//! it: each machine's worker and what it followed go to the separation of
+//! the original ([`Followed`]), where each machine finishes its own first,
+//! then takes from the line. The model is loaded once for both steps, on
+//! every machine. What a remote finishes is made again here, whole, if it
+//! takes too long, as any pass a remote is on.
 //!
 //! **Nothing half-made survives.** A decode that fails or is stopped kills
 //! the worker at once and drops everything (the extraction runs again from
@@ -49,11 +58,14 @@ use crate::job::Job;
 use crate::master::MasterSet;
 use crate::models::{self, Model};
 use crate::progress::{Event, Progress};
+use crate::remote::{self, Ssh};
 use crate::run::Stop;
-use crate::worker::{Ask, Grid, REST_SUFFIX, VOICE_SUFFIX, Worker};
+use crate::worker::{Ask, Grid, REST_SUFFIX, Started, VOICE_SUFFIX, Worker};
 use crate::{Error, Result, wav};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -84,14 +96,18 @@ pub struct Follower<'a> {
     start: Option<Start<'a>>,
     /// How often the decoder's files are looked at.
     poll: Duration,
-    /// Raised, the worker is killed wherever it is.
+    /// Raised, this machine's worker is killed wherever it is.
     stop: Stop,
+    /// Per remote: raised, its worker and its commands are killed.
+    far_stops: Vec<Stop>,
+    /// Per remote: its worker is loaded, and follows.
+    following: Vec<AtomicBool>,
     end: Mutex<End>,
     changed: Condvar,
-    /// The times it found nothing to do: the tests' extraction keeps in step
-    /// with it.
+    /// Per machine, the times it found nothing to do once following: the
+    /// tests' extraction keeps in step with them.
     #[cfg(test)]
-    waits: std::sync::atomic::AtomicU64,
+    waits: Vec<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Default)]
@@ -102,8 +118,33 @@ struct End {
     quiet: bool,
 }
 
+/// What the machines following share.
+struct Common<'c> {
+    plan: &'c Plan,
+    units: &'c [Unit],
+    master: &'c MasterSet,
+    /// Where the followed elements grow.
+    dir: &'c Path,
+    /// Per pass of the plan: its name.
+    names: &'c [String],
+    /// The passes no machine took yet, in the plan's order.
+    line: Mutex<VecDeque<usize>>,
+    /// Several machines: every line says which one it is about.
+    named: bool,
+}
+
+/// What a machine is called: `device` 0 is this one, `d` the remote
+/// `remotes[d - 1]`.
+fn name_of(config: &Config, device: usize) -> &str {
+    match device {
+        0 => "this machine",
+        d => &config.remotes[d - 1].host,
+    }
+}
+
 impl<'a> Follower<'a> {
     pub fn new(config: &'a Config, job: &'a Job, model: &'a Model, pairs: Pairs) -> Self {
+        let remotes = config.remotes.len();
         Self {
             config,
             job,
@@ -112,10 +153,12 @@ impl<'a> Follower<'a> {
             start: None,
             poll: extract::POLL,
             stop: Stop::new(),
+            far_stops: (0..remotes).map(|_| Stop::new()).collect(),
+            following: (0..remotes).map(|_| AtomicBool::new(false)).collect(),
             end: Mutex::new(End::default()),
             changed: Condvar::new(),
             #[cfg(test)]
-            waits: Default::default(),
+            waits: (0..=remotes).map(|_| Default::default()).collect(),
         }
     }
 
@@ -127,10 +170,12 @@ impl<'a> Follower<'a> {
         self.end().decoded
     }
 
-    /// Nothing to do: up to a poll, or until the decode ends.
-    fn wait(&self) {
+    /// Nothing to do on `device`: up to a poll, or until the decode ends.
+    fn wait(&self, device: usize) {
         #[cfg(test)]
-        self.waits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.waits[device].fetch_add(1, Ordering::SeqCst);
+        #[cfg(not(test))]
+        let _ = device;
         self.pause(self.poll);
     }
 
@@ -142,16 +187,31 @@ impl<'a> Follower<'a> {
             .wait_timeout_while(end, timeout, |end| end.decoded.is_none());
     }
 
+    /// What kills `device`'s worker, and its commands.
+    fn stop_of(&self, device: usize) -> &Stop {
+        match device {
+            0 => &self.stop,
+            d => &self.far_stops[d - 1],
+        }
+    }
+
     /// The decode is over: `ok` when it succeeded. Returns once the follower
-    /// makes no more requests — after the block in flight, which is worth
-    /// having, or at once when the decode failed: its worker is killed and
-    /// nothing it made is kept. Called again, it only waits.
+    /// makes no more requests — after the blocks in flight, which are worth
+    /// having, or at once when the decode failed: every worker is killed and
+    /// nothing they made is kept. A remote still loading its model is let go
+    /// rather than hold the extraction's end up: the separation starts it
+    /// again. Called again, it only waits.
     pub fn decoded(&self, ok: bool) {
         let mut end = self.end();
         if end.decoded.is_none() {
             end.decoded = Some(ok);
             if !ok {
                 self.stop.raise();
+            }
+            for (stop, following) in self.far_stops.iter().zip(&self.following) {
+                if !ok || !following.load(Ordering::SeqCst) {
+                    stop.raise();
+                }
             }
             self.changed.notify_all();
         }
@@ -161,7 +221,7 @@ impl<'a> Follower<'a> {
     }
 
     /// Follow the original until the decode ends. What was followed, with
-    /// the worker that followed it, when the decode succeeded; `None` when
+    /// the workers that followed it, when the decode succeeded; `None` when
     /// it failed, or when nothing could be followed.
     pub fn follow(&self, progress: Progress) -> Option<Followed> {
         /// Says, however the follower ends, that it makes no more requests.
@@ -208,7 +268,7 @@ impl<'a> Follower<'a> {
             if fresh && let Ok(master) = MasterSet::read(&header) {
                 break master;
             }
-            self.wait();
+            self.pause(self.poll);
         };
         let elements = elements_of(&master);
         let units: Vec<Unit> = elements
@@ -238,145 +298,309 @@ impl<'a> Follower<'a> {
             return Ok(None);
         }
 
-        let worker = match self.start {
-            Some(start) => start(self.stop.clone())?,
-            None => {
-                let local = models::fetch(self.model, self.config, progress)?;
-                Worker::start_under(
-                    self.config,
-                    self.model,
-                    &local,
-                    progress,
-                    Some(self.stop.clone()),
-                )?
-            }
+        let names: Vec<String> = plan.passes.iter().map(|p| pass_name(p, &units)).collect();
+        let kind = if plan.passes.len() < units.len() {
+            "pairs"
+        } else {
+            "elements"
         };
-        let mut followed = Followed {
-            worker: Some(worker),
-            streams: Vec::new(),
+        let remotes = &self.config.remotes;
+        let common = Common {
+            plan: &plan,
+            units: &units,
+            master: &master,
+            dir: &dir,
+            names: &names,
+            line: Mutex::new(wanted.iter().copied().collect()),
+            named: !remotes.is_empty(),
+        };
+        progress(Event::message(format!(
+            "separating the original as the extraction writes it, {}: as many of its {} {kind} \
+             as {} up with",
+            match remotes.len() {
+                0 => "on this machine".to_string(),
+                1 => format!("on this machine and on {}", remotes[0].host),
+                n => format!("on this machine and on {n} others"),
+            },
+            wanted.len(),
+            if remotes.is_empty() {
+                "it keeps"
+            } else {
+                "they keep"
+            }
+        )));
+        // Each machine on a thread of its own, this one on this thread.
+        let machines: Vec<Machine> = std::thread::scope(|scope| {
+            let common = &common;
+            let far: Vec<_> = (1..=remotes.len())
+                .map(|device| scope.spawn(move || self.machine(device, common, progress)))
+                .collect();
+            let mut machines = vec![self.machine(0, common, progress)];
+            machines.extend(far.into_iter().map(|far| far.join().unwrap_or(None)));
+            machines.into_iter().flatten().collect()
+        });
+        let followed = Followed {
+            machines,
             plan: plan.clone(),
             channels: master.channels.iter().map(|c| (c.index, c.id)).collect(),
             dir: dir.clone(),
         };
-        let grid = match followed.worker_mut()?.grid(self.model.rate) {
-            Ok(grid) => grid,
-            // Loaded all the same: the separation gets it as it is.
-            Err(why) => {
+        // Dropped, it takes what it grew with it.
+        if self.decode_ended() != Some(true) || followed.machines.is_empty() {
+            return Ok(None);
+        }
+        let streams: Vec<&Stream> = followed
+            .machines
+            .iter()
+            .flat_map(|machine| &machine.streams)
+            .collect();
+        if !streams.is_empty() {
+            let (made, length): (u64, u64) = streams
+                .iter()
+                .fold((0, 0), |(m, l), s| (m + s.written, l + s.length));
+            let split = if common.named {
+                let each: Vec<String> = followed
+                    .machines
+                    .iter()
+                    .filter(|machine| !machine.streams.is_empty())
+                    .map(|machine| match machine.device {
+                        0 => format!("{} here", machine.streams.len()),
+                        d => format!("{} on {}", machine.streams.len(), remotes[d - 1].host),
+                    })
+                    .collect();
+                format!(" ({})", each.join(", "))
+            } else {
+                String::new()
+            };
+            progress(Event::message(format!(
+                "during the extraction: {} of the original's {} {kind} followed{split}, {:.0} % of \
+                 them separated; the rest of them is made first in the next step",
+                streams.len(),
+                plan.passes.len(),
+                100.0 * made as f64 / length.max(1) as f64,
+            )));
+        }
+        Ok(Some(followed))
+    }
+
+    /// One machine following, this one (`device` 0) or a remote: what it
+    /// followed and its worker once the decode is over; `None` when it has
+    /// no worker to hand on. What goes wrong on one is said, and leaves its
+    /// elements to be separated after the extraction.
+    fn machine(&self, device: usize, common: &Common, progress: Progress) -> Option<Machine> {
+        let followed = self.follow_on(device, common, progress);
+        // Done: the tests' extraction no longer waits for it.
+        #[cfg(test)]
+        self.waits[device].store(tests::DONE, Ordering::SeqCst);
+        match followed {
+            Ok(machine) => machine,
+            // The decode failed, or the remote was still loading its model
+            // as it ended: nothing to say.
+            Err(_) if self.stop_of(device).raised() => None,
+            Err(why) if device == 0 && !common.named => {
                 progress(Event::message(format!(
                     "the original is separated after the extraction: {why}"
                 )));
+                None
+            }
+            Err(why) => {
+                progress(Event::message(format!(
+                    "{}: left out of the extraction: {why}; what it followed is separated after it",
+                    name_of(self.config, device)
+                )));
+                None
+            }
+        }
+    }
+
+    fn follow_on(
+        &self,
+        device: usize,
+        common: &Common,
+        progress: Progress,
+    ) -> Result<Option<Machine>> {
+        let Some(worker) = self.start_on(device, progress)? else {
+            return Ok(None);
+        };
+        let prefix = match device {
+            _ if !common.named => String::new(),
+            0 => "[local] ".to_string(),
+            d => format!("[{}] ", self.config.remotes[d - 1].host),
+        };
+        let mut machine = Machine {
+            device,
+            worker: Some(worker),
+            streams: Vec::new(),
+        };
+        let grid = match machine.worker_mut()?.grid(self.model.rate) {
+            Ok(grid) => grid,
+            // Loaded all the same: the separation gets it as it is.
+            Err(why) => {
+                progress(Event::message(if common.named {
+                    format!("{prefix}follows nothing during the extraction: {why}")
+                } else {
+                    format!("the original is separated after the extraction: {why}")
+                }));
                 while self.decode_ended().is_none() {
-                    self.wait();
+                    self.wait(device);
                 }
-                return Ok(Some(followed));
+                return Ok(Some(machine));
             }
         };
-        let names: Vec<String> = plan.passes.iter().map(|p| pass_name(p, &units)).collect();
-        for &pass in &wanted {
-            followed.streams.push(Stream::new(
-                pass,
-                &names[pass],
-                &plan,
-                &units,
-                &master,
-                &dir,
-                grid,
-                self.model.rate,
-            )?);
-        }
-        progress(Event::message(format!(
-            "separating the original as the extraction writes it, on this machine: as many of \
-             its {} {} as it keeps up with",
-            wanted.len(),
-            if plan.passes.len() < units.len() {
-                "pairs"
-            } else {
-                "elements"
-            }
-        )));
 
-        // One block at a time, the first element with one ready first; one
-        // that falls behind lets the last of the followed go, once a block
-        // was made since the last went.
+        // One block at a time, the first element with one ready first. A
+        // pass is taken from the line at once, and another each time a block
+        // was made since, while the line is not too far behind; one that
+        // falls behind lets the last of the followed go, once a block was
+        // made since the last went.
         let mut may_let_go = true;
-        while self.decode_ended().is_none() && !followed.streams.is_empty() {
-            let held: Vec<u64> = followed.streams.iter().map(Stream::held).collect();
-            let behind = followed
+        let mut may_take = true;
+        let mut open = true;
+        while self.decode_ended().is_none() {
+            let held: Vec<u64> = machine.streams.iter().map(Stream::held).collect();
+            let behind = machine
                 .streams
                 .iter()
                 .zip(&held)
                 .any(|(stream, &held)| grid.ready(held) >= stream.blocks + BEHIND);
             if behind && may_let_go {
-                let stream = followed.streams.pop().expect("not empty");
+                let stream = machine.streams.pop().expect("not empty");
                 progress(Event::message(format!(
-                    "  {} let go: this machine does not keep up with the extraction on that many; \
+                    "  {prefix}{} let go: {} does not keep up with the extraction on that many; \
                      it is separated after it",
-                    stream.base
+                    stream.base,
+                    name_of(self.config, device)
                 )));
-                followed.let_go(stream);
+                machine.let_go(stream);
                 may_let_go = false;
                 continue;
             }
-            let ready = (0..followed.streams.len())
-                .find(|&i| held[i] >= grid.ready_at(followed.streams[i].blocks));
-            let Some(i) = ready else {
-                self.wait();
+            let ready = (0..machine.streams.len())
+                .find(|&i| held[i] >= grid.ready_at(machine.streams[i].blocks));
+            if let Some(i) = ready {
+                let (worker, stream) = machine.split(i)?;
+                let inputs = stream.raw.clone();
+                match stream.step(worker, &inputs, held[i], false) {
+                    Ok(_) => {
+                        may_let_go = true;
+                        may_take = true;
+                    }
+                    // The decode failed, or the worker is gone: what it
+                    // followed goes.
+                    Err(why) if self.stop_of(device).raised() || !worker.is_alive() => {
+                        return Err(why);
+                    }
+                    Err(why) => {
+                        let stream = machine.streams.remove(i);
+                        progress(Event::message(format!(
+                            "  {prefix}{}: {why}; it is separated after the extraction",
+                            stream.base
+                        )));
+                        machine.let_go(stream);
+                    }
+                }
                 continue;
-            };
-            let (worker, stream) = followed.split(i)?;
-            let inputs = stream.raw.clone();
-            match stream.step(worker, &inputs, held[i], false) {
-                Ok(_) => may_let_go = true,
-                // The decode failed, or the worker is gone: nothing is kept.
-                Err(why) if self.stop.raised() || !worker.is_alive() => return Err(why),
-                Err(why) => {
-                    let stream = followed.streams.remove(i);
-                    progress(Event::message(format!(
-                        "  {}: {why}; it is separated after the extraction",
-                        stream.base
-                    )));
-                    followed.let_go(stream);
+            }
+            if open && may_take {
+                match self.intake(common, grid)? {
+                    Some(stream) => {
+                        machine.streams.push(stream);
+                        may_take = false;
+                        continue;
+                    }
+                    None => open = false,
                 }
             }
-        }
-        // Everything let go, the worker waits all the same: the next step
-        // gets it loaded.
-        while self.decode_ended().is_none() {
-            self.wait();
+            self.wait(device);
         }
         if self.decode_ended() != Some(true) {
             return Ok(None);
         }
         // The decoder is done: every file is as long as it will be.
-        let (begun, idle): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut followed.streams)
+        let (begun, idle): (Vec<Stream>, Vec<Stream>) = std::mem::take(&mut machine.streams)
             .into_iter()
             .partition(|stream| stream.blocks > 0);
         for stream in idle {
-            followed.let_go(stream);
+            machine.let_go(stream);
         }
-        followed.streams = begun;
-        for stream in &mut followed.streams {
+        machine.streams = begun;
+        for stream in &mut machine.streams {
             stream.length = stream.held();
         }
-        if !followed.streams.is_empty() {
-            let (made, length): (u64, u64) = followed
-                .streams
-                .iter()
-                .fold((0, 0), |(m, l), s| (m + s.written, l + s.length));
-            progress(Event::message(format!(
-                "during the extraction: {} of the original's {} {} followed, {:.0} % of them \
-                 separated; the rest of them is made first in the next step",
-                followed.streams.len(),
-                plan.passes.len(),
-                if plan.passes.len() < units.len() {
-                    "pairs"
-                } else {
-                    "elements"
-                },
-                100.0 * made as f64 / length.max(1) as f64,
-            )));
+        Ok(Some(machine))
+    }
+
+    /// `device`'s worker, loaded; `None` for a remote left out, which is
+    /// said.
+    fn start_on(&self, device: usize, progress: Progress) -> Result<Option<Worker>> {
+        if device == 0 {
+            let stop = self.stop.clone();
+            return match self.start {
+                Some(start) => start(stop).map(Some),
+                None => {
+                    let local = models::fetch(self.model, self.config, progress)?;
+                    Worker::start_under(self.config, self.model, &local, progress, Some(stop))
+                        .map(Some)
+                }
+            };
         }
-        Ok(Some(followed))
+        let remote = &self.config.remotes[device - 1];
+        let who = &remote.host;
+        let ssh = Ssh::new(who).stopped_by(self.far_stops[device - 1].clone());
+        let probe = remote::probe(remote, &ssh)?;
+        if let Some(why) = probe.unfit() {
+            progress(Event::message(format!(
+                "{who}: left out of the extraction: {why}"
+            )));
+            return Ok(None);
+        }
+        progress(Event::message(format!(
+            "{who}: {}, following beside this machine",
+            probe.describe()
+        )));
+        match Worker::start_remote(remote, &ssh, self.model, self.config.inference, progress)? {
+            Started::Busy(why) => {
+                progress(Event::message(format!(
+                    "{who}: {why}; asked again for the separation"
+                )));
+                Ok(None)
+            }
+            Started::Ready(worker) => {
+                self.following[device - 1].store(true, Ordering::SeqCst);
+                Ok(Some(*worker))
+            }
+        }
+    }
+
+    /// The next pass in line, for a machine that has time for one more,
+    /// while it would start fewer than [`BEHIND`] blocks behind the
+    /// extraction; `None` once the line is empty or that far behind.
+    fn intake(&self, common: &Common, grid: Grid) -> Result<Option<Stream>> {
+        let mut line = common.line.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(&pass) = line.front() else {
+            return Ok(None);
+        };
+        let held = raw_of(common.plan, pass, common.units, common.master)?
+            .iter()
+            .map(|path| wav::frames(path))
+            .min()
+            .unwrap_or(0);
+        if grid.ready(held) >= BEHIND {
+            return Ok(None);
+        }
+        line.pop_front();
+        drop(line);
+        Stream::new(
+            pass,
+            &common.names[pass],
+            common.plan,
+            common.units,
+            common.master,
+            common.dir,
+            grid,
+            self.model.rate,
+        )
+        .map(Some)
     }
 
     /// [`Follower::new`], this machine's worker started by `start` and the
@@ -398,8 +622,8 @@ impl<'a> Follower<'a> {
     }
 
     #[cfg(test)]
-    fn waits(&self) -> u64 {
-        self.waits.load(std::sync::atomic::Ordering::SeqCst)
+    fn waits(&self, device: usize) -> u64 {
+        self.waits[device].load(Ordering::SeqCst)
     }
 }
 
@@ -415,12 +639,34 @@ fn serving(plan: &Plan, pass: usize) -> impl Iterator<Item = (usize, Option<usiz
     })
 }
 
-/// What was followed during the extraction, and the worker that followed
-/// it: for the separation of the original to finish. Dropped, its worker
-/// lets the device go and what it grew goes from the disk.
+/// The decoder's files a pass reads while the extraction runs: its left
+/// element's, then its right one's.
+fn raw_of(plan: &Plan, pass: usize, units: &[Unit], master: &MasterSet) -> Result<Vec<PathBuf>> {
+    let step = plan.passes[pass];
+    let raw_dir = master.header.parent().unwrap_or(Path::new("."));
+    std::iter::once(step.left)
+        .chain(step.right)
+        .map(|u| {
+            let id: u32 = units[u]
+                .name
+                .parse()
+                .map_err(|_| Error::msg(format!("{}: not an element", units[u].name)))?;
+            let channel = master
+                .channels
+                .iter()
+                .find(|c| c.id == id)
+                .ok_or_else(|| Error::msg(format!("element {id}: not in the master set")))?;
+            Ok(raw_dir.join(format!("{}{}.wav", extract::RAW, channel.index)))
+        })
+        .collect()
+}
+
+/// What was followed during the extraction, and the workers that followed
+/// it, machine by machine: for the separation of the original to finish.
+/// Dropped, its workers let their devices go and what they grew goes from
+/// the disk.
 pub struct Followed {
-    worker: Option<Worker>,
-    streams: Vec<Stream>,
+    machines: Vec<Machine>,
     /// The passes it was cut into.
     plan: Plan,
     /// The master set's elements as it read them: the decoder's rank, the
@@ -430,6 +676,83 @@ pub struct Followed {
 }
 
 impl Followed {
+    /// The passes being followed.
+    pub(super) fn passes(&self) -> Vec<usize> {
+        self.machines
+            .iter()
+            .flat_map(|machine| &machine.streams)
+            .map(|stream| stream.pass)
+            .collect()
+    }
+
+    /// How much of them is made, in passes.
+    pub(super) fn made(&self) -> f64 {
+        self.machines
+            .iter()
+            .flat_map(|machine| &machine.streams)
+            .map(Stream::made)
+            .sum()
+    }
+
+    /// Itself, if what it followed is what the separation is about to make:
+    /// the same elements, from the same waveforms, in the same passes. Its
+    /// workers are kept either way.
+    pub(super) fn fits(
+        mut self,
+        master: &MasterSet,
+        plan: &Plan,
+        progress: Progress,
+    ) -> Option<Self> {
+        let channels: Vec<(usize, u32)> = master.channels.iter().map(|c| (c.index, c.id)).collect();
+        if !self.passes().is_empty() && (channels != self.channels || *plan != self.plan) {
+            progress(Event::message(
+                "the master set is not the one the extraction was followed on: what was \
+                 separated during it is dropped",
+            ));
+            for machine in &mut self.machines {
+                for stream in std::mem::take(&mut machine.streams) {
+                    machine.let_go(stream);
+                }
+            }
+        }
+        Some(self)
+    }
+
+    /// How many machines followed some of it.
+    pub(super) fn following_on(&self) -> usize {
+        self.machines
+            .iter()
+            .filter(|machine| !machine.streams.is_empty())
+            .count()
+    }
+
+    /// What `device` followed, and its worker, taken out.
+    pub(super) fn machine(&mut self, device: usize) -> Option<Machine> {
+        let at = self
+            .machines
+            .iter()
+            .position(|machine| machine.device == device)?;
+        Some(self.machines.swap_remove(at))
+    }
+}
+
+impl Drop for Followed {
+    fn drop(&mut self) {
+        self.machines.clear();
+        let _ = discard(&self.dir);
+    }
+}
+
+/// What one machine followed, and its worker. Dropped, the worker lets the
+/// device go and what the streams grew goes.
+pub(super) struct Machine {
+    /// 0: this one; `d`: the remote `remotes[d - 1]`.
+    device: usize,
+    worker: Option<Worker>,
+    streams: Vec<Stream>,
+}
+
+impl Machine {
     fn worker_mut(&mut self) -> Result<&mut Worker> {
         self.worker
             .as_mut()
@@ -454,40 +777,13 @@ impl Followed {
         stream.remove();
     }
 
-    /// The passes being followed.
-    pub(super) fn passes(&self) -> Vec<usize> {
-        self.streams.iter().map(|stream| stream.pass).collect()
-    }
-
-    /// How much of them is made, in passes.
-    pub(super) fn made(&self) -> f64 {
-        self.streams.iter().map(Stream::made).sum()
-    }
-
-    /// Itself, if what it followed is what the separation is about to make:
-    /// the same elements, from the same waveforms, in the same passes. Its
-    /// worker is kept either way.
-    pub(super) fn fits(
-        mut self,
-        master: &MasterSet,
-        plan: &Plan,
-        progress: Progress,
-    ) -> Option<Self> {
-        let channels: Vec<(usize, u32)> = master.channels.iter().map(|c| (c.index, c.id)).collect();
-        if !self.streams.is_empty() && (channels != self.channels || *plan != self.plan) {
-            progress(Event::message(
-                "the master set is not the one the extraction was followed on: what was \
-                 separated during it is dropped",
-            ));
-            for stream in std::mem::take(&mut self.streams) {
-                self.let_go(stream);
-            }
-        }
-        Some(self)
-    }
-
     pub(super) fn take_worker(&mut self) -> Option<Worker> {
         self.worker.take()
+    }
+
+    /// How many passes it followed.
+    pub(super) fn followed(&self) -> usize {
+        self.streams.len()
     }
 
     pub(super) fn streams(&mut self) -> &mut [Stream] {
@@ -495,7 +791,7 @@ impl Followed {
     }
 }
 
-impl Drop for Followed {
+impl Drop for Machine {
     fn drop(&mut self) {
         // The device first, then the files: closed before they go, which
         // Windows asks.
@@ -503,7 +799,6 @@ impl Drop for Followed {
         for stream in self.streams.drain(..) {
             stream.remove();
         }
-        let _ = discard(&self.dir);
     }
 }
 
@@ -556,21 +851,7 @@ impl Stream {
     ) -> Result<Self> {
         let step = plan.passes[pass];
         let sides: Vec<usize> = std::iter::once(step.left).chain(step.right).collect();
-        let raw_dir = master.header.parent().unwrap_or(Path::new("."));
-        let raw = sides
-            .iter()
-            .map(|&u| {
-                let id: u32 = units[u]
-                    .name
-                    .parse()
-                    .map_err(|_| Error::msg(format!("{}: not an element", units[u].name)))?;
-                let channel =
-                    master.channels.iter().find(|c| c.id == id).ok_or_else(|| {
-                        Error::msg(format!("element {id}: not in the master set"))
-                    })?;
-                Ok(raw_dir.join(format!("{}{}.wav", extract::RAW, channel.index)))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let raw = raw_of(plan, pass, units, master)?;
         let mut outputs = Vec::new();
         for (u, side) in serving(plan, pass) {
             for output in &units[u].outputs {
@@ -690,6 +971,8 @@ impl Stream {
 
     /// What is left of it, from the extraction's finished waveforms, and its
     /// outputs written whole; `made` is told each block's share of the pass.
+    /// `claim` is asked before anything is written: `false` (another machine
+    /// made the pass first), nothing is, and `Ok(false)` says so.
     pub(super) fn finish(
         &mut self,
         worker: &mut Worker,
@@ -697,7 +980,8 @@ impl Stream {
         frames: &[u64],
         mastered_at: u32,
         mut made: impl FnMut(f64),
-    ) -> Result<()> {
+        claim: impl FnOnce() -> bool,
+    ) -> Result<bool> {
         let inputs: Vec<PathBuf> = self
             .sides
             .iter()
@@ -721,10 +1005,13 @@ impl Stream {
                 return Err(Error::msg("the worker made nothing of a whole element"));
             }
         }
+        if !claim() {
+            return Ok(false);
+        }
         for grown in &mut self.outputs {
             grown.settle(frames[grown.unit], mastered_at)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// What it grew goes.
@@ -792,10 +1079,22 @@ mod tests {
 
     /// Set in the child's environment: it is the mock, not the tests.
     const MOCK: &str = "OMNIFROG_MOCK_WORKER";
+    /// A machine's count of waits once it is done following.
+    pub(super) const DONE: u64 = u64::MAX / 2;
     /// Milliseconds the mock spends on a block, as a GPU would.
     const MOCK_BLOCK_MS: &str = "OMNIFROG_MOCK_BLOCK_MS";
     /// `<base>:<block>`: the block the mock fails on.
     const MOCK_FAIL: &str = "OMNIFROG_MOCK_FAIL";
+    /// `<base>:<block>`: the block the mock dies on, as a GPU reset kills a
+    /// worker.
+    const MOCK_DIE: &str = "OMNIFROG_MOCK_DIE";
+    /// The mock as a remote's `remote-worker`: the directory it says its
+    /// files go to.
+    const MOCK_DIR: &str = "OMNIFROG_MOCK_DIR";
+    /// Set, the mock as a remote's `remote-worker` says its GPU is busy.
+    const MOCK_BUSY: &str = "OMNIFROG_MOCK_BUSY";
+    /// `<base>:<block>`: the block the mock hangs on, as a GPU that stalls.
+    const MOCK_HANG: &str = "OMNIFROG_MOCK_HANG";
     /// The mock's grid, in frames: a block's step, the fade, the lookahead.
     const STEP: u64 = 8_000;
     const FADE: u64 = 1_000;
@@ -930,14 +1229,41 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .map(Duration::from_millis);
         let fail = std::env::var(MOCK_FAIL).ok();
+        let die = std::env::var(MOCK_DIE).ok();
+        let hang = std::env::var(MOCK_HANG).ok();
         let say = |line: &str| {
             let mut out = std::io::stdout().lock();
             let _ = writeln!(out, "{line}");
             let _ = out.flush();
         };
         // The test harness has printed « test …mock_worker ... » with no end
-        // of line: this one ends it, so that `PRET` is a line of its own.
+        // of line: this one ends it, so that what follows is on lines of its
+        // own.
         say("");
+        // Started as a remote's omnifrog: the two commands this side runs
+        // there, after the harness's own arguments.
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|arg| arg == "remote-check") {
+            say(&format!(
+                "OMNIFROG {} {}",
+                env!("CARGO_PKG_VERSION"),
+                remote::protocol()
+            ));
+            say("DEVICE Mock GPU");
+            say("VRAM 0.00 24.00");
+            return 0;
+        }
+        if args.iter().any(|arg| arg == "remote-worker") {
+            if std::env::var_os(MOCK_BUSY).is_some() {
+                say("BUSY another run has its GPU");
+                return 0;
+            }
+            let dir = PathBuf::from(std::env::var_os(MOCK_DIR).expect("the mock's directory"));
+            for sub in ["in", "out"] {
+                fs::create_dir_all(dir.join(sub)).unwrap();
+            }
+            say(&format!("DIR {}", dir.display()));
+        }
         say("PRET");
         let mut streams: HashMap<String, (u64, Option<Stems>)> = HashMap::new();
         for line in std::io::stdin().lock().lines() {
@@ -980,6 +1306,12 @@ mod tests {
                     let (k, tail) = streams.remove(base).unwrap_or((0, None));
                     if fail.as_deref() == Some(&format!("{base}:{k}")) {
                         return Err("RuntimeError: the mock fails here".to_string());
+                    }
+                    if die.as_deref() == Some(&format!("{base}:{k}")) {
+                        std::process::exit(3);
+                    }
+                    if hang.as_deref() == Some(&format!("{base}:{k}")) {
+                        std::thread::sleep(Duration::from_secs(600));
                     }
                     let from = k * STEP;
                     let ready = held >= from + STEP + AHEAD;
@@ -1335,16 +1667,25 @@ mod tests {
         let dir = job.extract_dir();
         let followed = std::thread::scope(|scope| {
             let following = scope.spawn(|| follower.follow(&progress));
-            let begun =
-                || said.any("as the extraction writes it") || said.any("known once it is read");
-            // Caught up once it found nothing to do twice since the chunk was
-            // written: the second time, it had seen the chunk. A follower that
-            // never is gets a minute, then the extraction runs on.
+            let devices = 1 + bench.config.remotes.len();
+            // Every machine has its first element, or is done: a slow one
+            // starting its worker does not find the extraction over.
+            let begun = || following.is_finished() || (0..devices).all(|d| follower.waits(d) > 0);
+            // Caught up once every machine found nothing to do twice since the
+            // chunk was written, or is done: the second time, it had seen the
+            // chunk. A follower that never is gets a minute, then the
+            // extraction runs on.
             let late = std::cell::Cell::new(false);
             let caught_up = || {
-                let seen = follower.waits();
+                let seen: Vec<u64> = (0..devices).map(|d| follower.waits(d)).collect();
                 let deadline = std::time::Instant::now() + Duration::from_secs(60);
-                while !late.get() && follower.waits() < seen + 2 && !following.is_finished() {
+                while !late.get()
+                    && !following.is_finished()
+                    && (0..devices).any(|d| {
+                        let waits = follower.waits(d);
+                        waits < DONE && waits < seen[d] + 2
+                    })
+                {
                     late.set(std::time::Instant::now() >= deadline);
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -1604,5 +1945,179 @@ mod tests {
             "{}",
             said.lines()
         );
+    }
+
+    /// A remote that is the mock, reached through this machine's shell, its
+    /// files under the bench's `far/`; `env` is its environment. The shell
+    /// becomes the mock (`exec`), so that killing one kills the other, as
+    /// ssh's end does over there.
+    #[cfg(unix)]
+    fn far_mock(bench: &Bench, env: &[(&str, String)]) -> crate::config::Remote {
+        let mut command = format!(
+            "exec env {MOCK}=1 {MOCK_DIR}={}",
+            remote::quote(&bench.root.join("far").to_string_lossy())
+        );
+        for (key, value) in env {
+            command.push_str(&format!(" {key}={}", remote::quote(value)));
+        }
+        command.push_str(&format!(
+            " {} separate::follow::tests::mock_worker --exact --nocapture --test-threads=1",
+            remote::quote(&std::env::current_exe().unwrap().to_string_lossy())
+        ));
+        crate::config::Remote {
+            host: remote::SHELL.to_string(),
+            command,
+            idle_below_gib: 0.0,
+        }
+    }
+
+    /// What is left in the remote's directory `sub`.
+    #[cfg(unix)]
+    fn left_there(bench: &Bench, sub: &str) -> Vec<String> {
+        fs::read_dir(bench.root.join("far").join(sub))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_follows_beside_this_machine_and_finishes_what_it_followed() {
+        let mut bench = Bench::new("far");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[])];
+        let (made, followed, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        let far = remote::SHELL;
+        assert!(made > 2.0, "{made}\n{}", said.lines());
+        assert!(
+            said.any("following beside this machine"),
+            "{}",
+            said.lines()
+        );
+        // Both followed some: the first in line went here, the second there.
+        assert!(said.any(&format!(" on {far})")), "{}", said.lines());
+        assert!(said.any("here, "), "{}", said.lines());
+        assert!(said.any("each machine finishes its own first"));
+        assert!(
+            said.any(&format!(
+                "[{far}] element 11 (7 of its 8 blocks made): the rest of it"
+            )),
+            "{}",
+            said.lines()
+        );
+        same(&followed, &whole);
+        // Every input and stem carried there went once it had served.
+        assert_eq!(
+            left_there(&bench, "in"),
+            Vec::<String>::new(),
+            "{}",
+            said.lines()
+        );
+        assert_eq!(left_there(&bench, "out"), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_dies_leaves_what_it_followed_to_be_made_whole() {
+        let mut bench = Bench::new("far-dies");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        // The second element in line is the remote's: it dies on its second
+        // block.
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_DIE, "11:1".to_string())])];
+        let (_, followed, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        let far = remote::SHELL;
+        assert!(
+            said.any(&format!("{far}: left out of the extraction: ")),
+            "{}",
+            said.lines()
+        );
+        assert!(said.any("what it followed is separated after it"));
+        // This machine kept following.
+        assert!(said.any("followed during the extraction: this machine finishes"));
+        same(&followed, &whole);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_remote_follows_nothing_and_the_rest_is_made_here() {
+        let mut bench = Bench::new("far-busy");
+        let film = Film::objects(3, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_BUSY, "1".to_string())])];
+        let (made, followed, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        assert!(
+            said.any("another run has its GPU; asked again for the separation"),
+            "{}",
+            said.lines()
+        );
+        assert!(made > 1.0, "{made}\n{}", said.lines());
+        assert!(!said.any(&format!(" on {})", remote::SHELL)));
+        same(&followed, &whole);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_that_hangs_on_what_it_followed_is_overtaken_here() {
+        let mut bench = Bench::new("far-hangs");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        // The remote's element hangs on its last block, after the
+        // extraction.
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_HANG, "11:7".to_string())])];
+        let (_, followed, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        let far = remote::SHELL;
+        assert!(
+            said.any(&format!(
+                "(11) again, beside {far}: the first to finish keeps it"
+            )),
+            "{}",
+            said.lines()
+        );
+        assert!(
+            said.any(&format!(
+                "[{far}] 11: made first by another machine; this one's is dropped"
+            )),
+            "{}",
+            said.lines()
+        );
+        same(&followed, &whole);
     }
 }
