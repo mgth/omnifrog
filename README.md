@@ -396,8 +396,8 @@ of the GPU its torch computes on — the first one `HIP_VISIBLE_DEVICES` or `CUD
 leaves it, read from that card's own counters (`0`: whatever is on it). Nothing there is ever
 stopped or unloaded. A busy remote is asked again every minute; one that fails twice in a row is
 left out for the rest of the step, and what it did not make is made here. A machine whose torch
-sees no GPU, or whose omnifrog is another version, is left out from the start, and the progress
-says why.
+sees no GPU, whose omnifrog is another version, or whose card is under a ROCm override it cannot
+run (see [Linux](#linux)), is left out from the start, and the progress says why.
 
 **A remote never holds the step up.** Once nothing is left in line, this machine makes again,
 itself, the pass a remote is still on; whichever finishes first keeps it, and the other is
@@ -468,7 +468,8 @@ variable — or a card's own `HSA_OVERRIDE_GFX_VERSION_<node>`, which ROCm reads
 the kernel says the cards are (`/sys/class/kfd/kfd/topology`, minding `ROCR_VISIBLE_DEVICES` and
 `HIP_VISIBLE_DEVICES` as ROCm reads them): `doctor` reports an override of another
 generation than the card the separation runs on as broken (`rocm arch`), and no inference starts
-under it, for a run on this machine or for another machine's pass over SSH. Most often it is a line
+under it, for a run on this machine or for another machine's pass over SSH; a remote under one is
+left out without its torch being asked about the card. Most often it is a line
 left in `~/.profile`, `~/.bashrc` or `~/.zshrc` from an earlier card; remove it. A
 `PYTORCH_ROCM_ARCH` naming none of the cards gets a warning.
 
