@@ -2237,6 +2237,10 @@ mod tests {
     /// A file the mock waits for (a minute at most) before every whole
     /// separation but its first.
     const MOCK_SEP_WAIT: &str = "OMNIFROG_MOCK_SEP_WAIT";
+    /// Set, the mock as a remote's `remote-worker` loses the voice of every
+    /// element's last block once it is made: the fetch that comes for it
+    /// fails, and the worker lives on.
+    const MOCK_LOSE_LAST: &str = "OMNIFROG_MOCK_LOSE_LAST";
     /// The mock's grid, in frames: a block's step, the fade, the lookahead.
     const STEP: u64 = 8_000;
     const FADE: u64 = 1_000;
@@ -2378,6 +2382,7 @@ mod tests {
         let log = std::env::var_os(MOCK_LOG).map(PathBuf::from);
         let wait_for = std::env::var_os(MOCK_WAIT_FOR).map(PathBuf::from);
         let sep_wait = std::env::var_os(MOCK_SEP_WAIT).map(PathBuf::from);
+        let lose_last = std::env::var_os(MOCK_LOSE_LAST).is_some();
         let mut separations = 0;
         let await_file = |flag: &Path| {
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -2598,6 +2603,10 @@ mod tests {
                             Some((base.to_string(), k, out.to_string(), rate, piece, !ready));
                     } else {
                         write_stems(out, base, rate, &piece);
+                        if lose_last && far_dir.is_some() && !ready {
+                            let voice = Path::new(out).join(format!("{base}{VOICE_SUFFIX}"));
+                            fs::remove_file(&voice).map_err(|e| e.to_string())?;
+                        }
                     }
                     say(&format!("BLK {base} {from} {}", from + made));
                     if ready {
@@ -4639,6 +4648,35 @@ mod tests {
         assert_eq!(
             lines_with(&said, "failed, made here instead").len(),
             2,
+            "{}",
+            said.lines()
+        );
+        assert_eq!(made_there(&said), 0, "{}", said.lines());
+    }
+
+    /// **A remote whose elements' last stems never come back.** Each element
+    /// it makes is claimed and set aside, its GPU on to the next, and the
+    /// fetch of its last block then fails: a failure of the remote's, as a
+    /// pass's, which the next element made meanwhile does not undo — only
+    /// outputs written do. Two in a row and it is left out of the rest of
+    /// the step; the element it had set aside by then fails too. Every
+    /// element is made here, as this machine makes it alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_remote_whose_last_stems_fail_twice_in_a_row_is_left_out() {
+        let mut bench = Bench::new("far-tails-fail");
+        let film = Film::objects(4, 60_000);
+        let whole = bench.whole(&film, Pairs::default());
+        bench.config.remotes = vec![far_mock(&bench, &[(MOCK_LOSE_LAST, "1".to_string())])];
+        let left_out = format!("{}: left out for the rest of this step", remote::SHELL);
+        // This machine starts once the remote is left out.
+        let (outputs, said) =
+            beside_remotes(&bench, &film, &[], |said| said.any(&left_out), |_| {});
+        same(&outputs, &whole);
+        assert!(said.any(&left_out), "{}", said.lines());
+        assert_eq!(
+            lines_with(&said, "failed, made here instead").len(),
+            3,
             "{}",
             said.lines()
         );

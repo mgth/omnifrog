@@ -1807,9 +1807,12 @@ fn run(
                 let settle = |tail: Tail, failures: &mut u32| {
                     let (pass, started, dir) = (tail.pass, tail.started, tail.dir.clone());
                     match write(tail) {
+                        // Only outputs written end a run of failures: a
+                        // pass set aside has none yet.
                         Ok(()) => {
                             done_in(device, pass, started);
                             shared.written(device);
+                            *failures = 0;
                         }
                         Err(_) if stop.raised() => {
                             progress(Event::message(format!(
@@ -1989,8 +1992,9 @@ fn run(
                             failures = 0;
                             said_busy = false;
                         }
+                        // Its outputs are not written yet: whether this
+                        // ends a run of failures is its tail's to say.
                         Ok(Made::Aside) => {
-                            failures = 0;
                             said_busy = false;
                         }
                         Ok(Made::Lost) => {
