@@ -220,6 +220,7 @@ impl Run {
                 self.push_log(format!("── {number}/{total} {label}"));
             }
             Event::Message { text } => self.push_log(text),
+            Event::Trace { .. } => {}
             Event::Fraction {
                 what,
                 done,

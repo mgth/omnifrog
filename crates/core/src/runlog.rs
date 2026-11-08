@@ -62,8 +62,9 @@ impl RunLog {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Keep what `event` says: a step, or a message. How far a step is
-    /// would be thousands of lines, and says nothing a message does not.
+    /// Keep what `event` says: a step, a message, or a trace. How far a
+    /// step is would be thousands of lines, and says nothing a message does
+    /// not.
     pub fn record(&self, event: &Event) {
         let text = match event {
             Event::Step {
@@ -71,7 +72,7 @@ impl RunLog {
                 total,
                 label,
             } => format!("── {number}/{total} {label}"),
-            Event::Message { text } => text.clone(),
+            Event::Message { text } | Event::Trace { text } => text.clone(),
             Event::Took { .. } => format!("   {}", event.took_line().unwrap_or_default()),
             Event::Fraction { .. } => return,
         };
@@ -208,6 +209,9 @@ mod tests {
             seconds: 893.4,
             earlier: false,
         });
+        log.record(&Event::trace(
+            "  follow, this machine: 10 block 0 in 10.40 s",
+        ));
         log.note("failed: the disk is full");
         let text = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -219,8 +223,10 @@ mod tests {
             "{}",
             lines[3]
         );
-        assert!(lines[4].ends_with("] failed: the disk is full"));
-        assert_eq!(lines.len(), 5, "a fraction leaves no line");
+        // A trace is the log's alone, and it has it.
+        assert!(lines[4].ends_with("]   follow, this machine: 10 block 0 in 10.40 s"));
+        assert!(lines[5].ends_with("] failed: the disk is full"));
+        assert_eq!(lines.len(), 6, "a fraction leaves no line");
         assert_eq!(log.path(), Some(path.clone()));
 
         // A second run on the same job adds to it.

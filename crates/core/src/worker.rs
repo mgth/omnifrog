@@ -66,7 +66,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The worker's source.
 pub const SOURCE: &str = include_str!("../../../py/separer_msst.py");
@@ -174,6 +174,20 @@ pub struct Block {
     pub to: u64,
     /// The element is done.
     pub last: bool,
+    /// How long it took.
+    pub took: Took,
+}
+
+/// How long a block took, by what it waited on: a local worker's is all
+/// the request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Took {
+    /// Carrying a remote what its inputs gained.
+    pub send: Duration,
+    /// The worker's answer, from the request to its end.
+    pub run: Duration,
+    /// A remote's stems coming back, and going from there.
+    pub back: Duration,
 }
 
 /// What a block is asked of.
@@ -794,6 +808,8 @@ impl Worker {
     /// stems come back into `out_dir`.
     pub fn block(&mut self, ask: &Ask, mut fraction: impl FnMut(f64)) -> Result<Block> {
         fs::create_dir_all(ask.out_dir).map_err(|e| Error::io(ask.out_dir, e))?;
+        let mut took = Took::default();
+        let at = Instant::now();
         let (out_dir, inputs) = match &mut self.remote {
             None => (
                 ask.out_dir.to_string_lossy().into_owned(),
@@ -815,6 +831,10 @@ impl Worker {
             request.push('\t');
             request.push_str(input);
         }
+        if self.remote.is_some() {
+            took.send = at.elapsed();
+        }
+        let at = Instant::now();
         let (mut span, mut last) = (None, false);
         self.request(&request, |word| match word {
             Word::Fraction(f) => fraction(f.clamp(0.0, 1.0)),
@@ -822,6 +842,8 @@ impl Worker {
             Word::Done => last = true,
             _ => {}
         })?;
+        took.run = at.elapsed();
+        let at = Instant::now();
         let (from, to) = span.ok_or_else(|| {
             Error::msg(format!("the worker said nothing of {}'s block", ask.base))
         })?;
@@ -850,8 +872,14 @@ impl Worker {
             if last {
                 far.forget(ask.base)?;
             }
+            took.back = at.elapsed();
         }
-        Ok(Block { from, to, last })
+        Ok(Block {
+            from,
+            to,
+            last,
+            took,
+        })
     }
 
     /// Forget a followed element: what the worker kept of it goes, and on a

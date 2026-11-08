@@ -321,6 +321,11 @@ impl Reporter {
     }
 
     fn report(&self, event: Event) {
+        // The run's log has it; a terminal, or a front end reading the
+        // JSON, would drown in it.
+        if matches!(event, Event::Trace { .. }) {
+            return;
+        }
         let mut err = std::io::stderr().lock();
         if self.json {
             if let Ok(line) = serde_json::to_string(&event) {
@@ -348,6 +353,7 @@ impl Reporter {
         };
         match event {
             Event::Step { .. } | Event::Took { .. } => unreachable!("worded as a message above"),
+            Event::Trace { .. } => unreachable!("left out above"),
             Event::Message { text } => {
                 if self.tty && state.open {
                     let _ = writeln!(err);

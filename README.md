@@ -244,9 +244,17 @@ is ready, this one and each of the [other machines](#other-machines), separates 
 elements as the decoder writes them, a block (`inference.block_seconds`) at a time. They take the
 elements from one line, in order: one each at first, then another each time a machine made a
 block, during about the first two blocks of film — so each ends up with about as many as it keeps
-up with, a faster one more. Each serves its own, the first with a block ready first; one that
-falls two blocks behind lets the last of its own go, which is then separated whole after the
-extraction, like the elements nobody followed. A remote is sent what each of its elements gained
+up with, a faster one more. Each serves its own, the first with a block ready first. The disk
+reads the container at its own pace, so the film comes faster where the picture is light, and the
+element served last falls behind first: a machine with one two blocks behind is watched over
+rounds of as many blocks as it follows elements, and lets the last of its own go only after two
+rounds in a row that did not shrink what it has left to separate — a burst it catches up on loses
+nothing, and it never lets one go a block — and only one less than half made, which costs less
+made again whole than finished after the extraction. What is let go is separated whole after the
+extraction, like the elements nobody followed. Every block a machine asks for, what it took (a
+remote's transfers, the worker, folding the stems in), every stretch with nothing to do and what it
+waited for, and every round watched go to the run's log, as `follow, …` lines. A remote is sent
+what each of its elements gained
 before every block, and the block's stems come back after it: about 80 MB out and 400 MB back per
 block of ten minutes. How many each keeps depends on its GPU against the disk; by the times of a
 card that separates an element of a whole film in 107 s, a remote that does it in 128 s and an
