@@ -698,7 +698,7 @@ impl<'a> Follower<'a> {
                             format!(
                                 "{} block {} in {} ({}), {} of film written",
                                 stream.base,
-                                stream.blocks - 1,
+                                stream.blocks.saturating_sub(1),
                                 secs(asked.elapsed()),
                                 made.describe(),
                                 film(held[i])
