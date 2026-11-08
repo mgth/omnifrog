@@ -1561,6 +1561,24 @@ fn lock(file: &fs::File) -> std::result::Result<(), fs::TryLockError> {
     }
 }
 
+/// What `f` gives once it gives it, trying for up to two seconds: a lock
+/// just let go can still be held for an instant by a child another test is
+/// starting — forked with a copy of its file, until it runs its program and
+/// the copy closes (close-on-exec). The tests' lock checks after a `drop`.
+#[cfg(test)]
+pub(crate) fn soon<T, E>(
+    mut f: impl FnMut() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match f() {
+            Ok(value) => return Ok(value),
+            Err(why) if Instant::now() >= deadline => return Err(why),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1657,7 +1675,7 @@ mod tests {
         }
         // Released: the next run gets it, although the file is still there.
         assert!(dir.join(".separating.lock").is_file());
-        let _next = Lock::take(&dir).unwrap();
+        let _next = soon(|| Lock::take(&dir)).unwrap();
         drop(_next);
         let _ = fs::remove_dir_all(&dir);
     }

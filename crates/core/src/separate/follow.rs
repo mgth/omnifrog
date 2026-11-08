@@ -3523,7 +3523,7 @@ mod tests {
         assert!(Lock::take(&work).is_err());
         drop(beside);
         drop(followed);
-        assert!(Lock::take(&work).is_ok());
+        assert!(crate::worker::soon(|| Lock::take(&work)).is_ok());
     }
 
     #[test]

@@ -1032,6 +1032,7 @@ mod tests {
     /// first is gone and its second still separates there.
     #[test]
     fn a_seat_is_only_had_beside_the_same_run() {
+        use crate::worker::soon;
         let work = std::env::temp_dir().join(format!("omnifrog-seats-{}", std::process::id()));
         let _ = fs::remove_dir_all(&work);
         let (a, b) = (Some("run-a"), Some("run-b"));
@@ -1049,18 +1050,29 @@ mod tests {
         assert!(seat(&work, a).is_err());
         // The first gone, its second still there: another run, or a run on
         // that machine itself, is kept out...
+        // (A lock let go can look held for an instant: `soon`.)
         drop(first);
-        let why = seat(&work, b).err().unwrap();
-        assert!(why.contains("second worker"), "{why}");
-        let why = Lock::take(&work).err().unwrap().to_string();
-        assert!(why.contains("second worker"), "{why}");
+        let second_worker = |why: String| match why.contains("second worker") {
+            true => Ok(why),
+            false => Err(why),
+        };
+        let refused = soon(|| match seat(&work, b) {
+            Ok(_) => panic!("another run got a seat beside run a's second"),
+            Err(why) => second_worker(why),
+        });
+        assert!(refused.is_ok(), "{refused:?}");
+        let refused = soon(|| match Lock::take(&work) {
+            Ok(_) => panic!("a run here got the lock beside run a's second"),
+            Err(why) => second_worker(why.to_string()),
+        });
+        assert!(refused.is_ok(), "{refused:?}");
         // ...and the same run gets the first again.
-        let (again, again_dir) = seat(&work, a).unwrap();
+        let (again, again_dir) = soon(|| seat(&work, a)).unwrap();
         assert_eq!(again_dir, first_dir);
         drop(second);
         drop(again);
         // All gone: any run.
-        let (other, _) = seat(&work, b).unwrap();
+        let (other, _) = soon(|| seat(&work, b)).unwrap();
         drop(other);
         let _ = fs::remove_dir_all(&work);
     }
