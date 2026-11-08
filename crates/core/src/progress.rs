@@ -31,6 +31,11 @@ pub enum Event {
     /// A line worth showing: what is starting, what was decided, what a
     /// subprocess said.
     Message { text: String },
+    /// A line for the run's log alone: what a machine following the
+    /// extraction asked of its worker, how long that took, and why it
+    /// waited. Hundreds in a film, worth reading only when a run did not go
+    /// as it should; a front end leaves them out.
+    Trace { text: String },
     /// Progress of one unit of work; `total` is `None` when the server or
     /// the tool did not say.
     Fraction {
@@ -85,6 +90,10 @@ impl Event {
 
     pub fn message(text: impl Into<String>) -> Self {
         Self::Message { text: text.into() }
+    }
+
+    pub fn trace(text: impl Into<String>) -> Self {
+        Self::Trace { text: text.into() }
     }
 
     /// The line a [`Event::Took`] is told as: « 2/6 dialogue out of the

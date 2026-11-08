@@ -130,7 +130,13 @@ fn send(reply: &Reply) {
 }
 
 fn perform(request: &Request) -> Result<Option<PathBuf>, String> {
-    let progress = |event: Event| send(&Reply::Progress { event });
+    // A trace is for the run's log, which the run keeps here: the window
+    // has nothing to do with it.
+    let progress = |event: Event| {
+        if !matches!(event, Event::Trace { .. }) {
+            send(&Reply::Progress { event });
+        }
+    };
     let text = |e: omnifrog_core::Error| e.to_string();
     match request {
         Request::Setup {

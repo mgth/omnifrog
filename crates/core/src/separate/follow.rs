@@ -16,11 +16,31 @@
 //! extraction is less than [`BEHIND`] blocks ahead of the next in line —
 //! about the first two blocks of film. So a machine takes about as many as
 //! it keeps up with, a faster one more. Each serves its own in order, the
-//! first with a block ready first; one that is [`BEHIND`] blocks behind is
-//! let go anyway — the next one, if the others still do not keep up, once
-//! another block is made. What is let go, or left in line, is separated
-//! whole after the extraction, by any machine, like the elements nobody
-//! followed. A remote is sent what its inputs gained before each block, and
+//! first with a block ready first.
+//!
+//! **Behind, through a burst.** The extraction reads the container at the
+//! disk's pace, so the film comes faster where the picture is light, and
+//! the element served last falls behind first. A machine with one element
+//! of the original [`BEHIND`] blocks behind is watched over a round — as
+//! many blocks of the original as it follows elements of it ([`Trend`]):
+//! what its inputs hold that it has not separated yet, summed, shrinks over
+//! a round when it keeps up, and a burst only holds it back for a while.
+//! Only [`STUCK`] rounds in a row over which it did not shrink let the last
+//! of the followed go — one round, once one was let go since it fell
+//! behind — and only one under half made: one further along costs more
+//! made again whole than finished after the extraction, unless the machine
+//! already has more left than a whole element and another machine could
+//! take it. So a machine never lets one go a block. What is let go, or
+//! left in line, is separated whole after the extraction, by any machine,
+//! like the elements nobody followed.
+//!
+//! **A trace.** Every block a machine asks for, how long it took and on
+//! what (a remote's transfers, the worker, folding the stems in), every
+//! stretch of a few seconds with nothing to do and what it waited for, and
+//! every round watched go to the run's log ([`Event::Trace`]): enough to
+//! tell a GPU that stalled from an extraction that did.
+//!
+//! A remote is sent what its inputs gained before each block, and
 //! its stems come back after it; one that is busy or left out follows
 //! nothing, and one still loading its model when the decode ends, or still
 //! on a block [`FAR_GRACE`] later, is let go rather than hold the
@@ -85,7 +105,7 @@ use crate::models::{self, Model};
 use crate::progress::{Event, Progress};
 use crate::remote::{self, Seat, Ssh};
 use crate::run::Stop;
-use crate::worker::{Ask, Grid, Lock, REST_SUFFIX, Started, VOICE_SUFFIX, Worker};
+use crate::worker::{Ask, Grid, Lock, REST_SUFFIX, Started, Took, VOICE_SUFFIX, Worker};
 use crate::{Error, Result, wav};
 use std::collections::VecDeque;
 use std::fs;
@@ -93,7 +113,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Condvar, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Where a follower keeps what it grows, in the separation's directory.
 pub(super) fn dir_of(stage: Stage) -> &'static str {
@@ -106,8 +126,23 @@ pub(super) fn dir_of(stage: Stage) -> &'static str {
 /// What a follower follows, in the order a machine serves them.
 const STAGES: [Stage; 2] = [Stage::Original, Stage::Dub];
 /// Blocks a followed element of the original may be behind the extraction
-/// before the last of the followed is let go.
+/// before the machine is watched for a round ([`Trend`]); and how far ahead
+/// of the next pass in line the extraction may be for a machine to still
+/// take it.
 const BEHIND: u64 = 2;
+/// Rounds in a row over which a machine behind did not catch up before it
+/// lets the last of the original's followed go: the round a burst ends in
+/// looks like one that does not, and the next one tells. Once one was let
+/// go, one round is enough for the next ([`Trend::needed`]).
+const STUCK: usize = 2;
+/// How long a machine may have nothing to do before the trace says so: a
+/// poll or two is not worth a line. The tests' machines wait for
+/// milliseconds.
+const IDLE_TRACED: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_secs(2)
+};
 /// How much room a block of the dub needs before the original's next one
 /// is ready, over what a block costs: the extraction does not write at one
 /// rate — where the video is lighter, the film comes faster — and the
@@ -318,6 +353,123 @@ enum Stepped {
     Out(Error),
     /// The worker refused that element: it is let go.
     Refused(Error),
+}
+
+/// Whether a machine behind the extraction catches up with it: what it has
+/// left to separate of what its inputs hold — the frames, summed over the
+/// elements of the original it follows — read after every block of the
+/// original it makes. The first read opens a round of as many blocks as it
+/// follows elements, and the round ends on whether that shrank since. Read
+/// after a block every time, so that a block's own frames do not look like
+/// a burst; over a whole round, so that the element served last, which a
+/// burst leaves furthest behind, does not pass for a machine that does not
+/// keep up.
+#[derive(Default)]
+struct Trend {
+    /// What was left at the round's start, and the blocks made since.
+    mark: Option<(u64, usize)>,
+    /// The rounds in a row that ended on no less.
+    stuck: usize,
+    /// One was let go since the machine fell behind: it is known not to keep
+    /// up, and a round that does not shrink is enough for the next.
+    shed: bool,
+}
+
+/// Where a round is, after a block.
+#[derive(Debug, PartialEq, Eq)]
+enum Round {
+    /// That block opened the first.
+    Opened,
+    Going,
+    /// One ended on less than `was`, what was left when it opened.
+    Shrank {
+        was: u64,
+    },
+    /// One ended on no less than `was`: the `rounds`-th in a row.
+    Stuck {
+        was: u64,
+        rounds: usize,
+    },
+}
+
+impl Trend {
+    /// A block was made, the machine behind: `left` to separate, of
+    /// `streams` elements. The next round opens where one ends.
+    fn made(&mut self, left: u64, streams: usize) -> Round {
+        let Some((was, blocks)) = self.mark else {
+            self.mark = Some((left, 0));
+            return Round::Opened;
+        };
+        let blocks = blocks + 1;
+        if blocks < streams {
+            self.mark = Some((was, blocks));
+            return Round::Going;
+        }
+        self.mark = Some((left, 0));
+        if left < was {
+            self.stuck = 0;
+            Round::Shrank { was }
+        } else {
+            self.stuck += 1;
+            Round::Stuck {
+                was,
+                rounds: self.stuck,
+            }
+        }
+    }
+
+    fn watching(&self) -> bool {
+        self.mark.is_some()
+    }
+
+    /// The rounds in a row that let the next one go.
+    fn needed(&self) -> usize {
+        if self.shed { 1 } else { STUCK }
+    }
+
+    /// One was let go: a round opens afresh, of one element fewer.
+    fn shed(&mut self) {
+        *self = Self {
+            shed: true,
+            ..Self::default()
+        };
+    }
+}
+
+/// Whether an element `written` frames into a film of `whole` is kept
+/// rather than let go, its machine `left` frames behind what its inputs
+/// hold: half made or more, making it again whole costs more than
+/// finishing it — unless another machine could take it (`others`) and this
+/// one already has more left than a whole element, which it alone would
+/// finish after the extraction while that machine made the element whole.
+fn kept_half_made(written: u64, whole: u64, left: u64, others: bool) -> bool {
+    whole > 0 && written.saturating_mul(2) >= whole && !(others && left >= whole)
+}
+
+/// A stretch with nothing to do: since when, and the element nearest a
+/// block — its side, its rank there, and what its inputs held then.
+struct Idle {
+    since: Instant,
+    next: Option<(usize, usize, u64)>,
+}
+
+/// « 3190.4 s »: the decoder's frames as film.
+fn film(frames: u64) -> String {
+    format!("{:.1} s", frames as f64 / extract::RATE as f64)
+}
+
+/// « 10.42 s ».
+fn secs(took: Duration) -> String {
+    format!("{:.2} s", took.as_secs_f64())
+}
+
+/// How a trace line names a stream of `stage`: the original's by its name,
+/// the dub's after « the dub's ».
+fn traced(stage: Stage, base: &str) -> String {
+    match stage {
+        Stage::Original => base.to_string(),
+        Stage::Dub => format!("the dub's {base}"),
+    }
 }
 
 /// What a machine is called: `device` 0 is this one, `d` the remote
@@ -836,6 +988,25 @@ impl<'a> Follower<'a> {
                 machine.let_go(stream);
             }
             machine.streams = kept;
+            if let Some(grid) = grid {
+                let left: u64 = machine
+                    .streams
+                    .iter()
+                    .map(|stream| grid.blocks(stream.length).saturating_sub(stream.blocks))
+                    .sum();
+                self.trace(
+                    device,
+                    format!(
+                        "the decode is over: {} followed{}, {left} blocks of them left",
+                        machine.streams.len(),
+                        match common.stage {
+                            Stage::Original => "",
+                            Stage::Dub => " of the dub",
+                        }
+                    ),
+                    progress,
+                );
+            }
         }
         sides
     }
@@ -843,9 +1014,8 @@ impl<'a> Follower<'a> {
     /// One block at a time, the original's first: the first element with
     /// one ready first. A pass is taken from the original's line at once,
     /// and another each time a block was made since, while the line is not
-    /// too far behind; a machine that falls [`BEHIND`] on the original lets
-    /// the last of it go, once a block was made since the last went — as
-    /// when the original was followed alone.
+    /// too far behind; a machine [`BEHIND`] on the original is watched for
+    /// rounds of blocks (`watch`) — as when the original was followed alone.
     ///
     /// The dub has the gaps: a block of it only when the original has none
     /// ready, and only if the block would end before the original's next
@@ -870,8 +1040,11 @@ impl<'a> Follower<'a> {
             0 => "[local] ".to_string(),
             d => format!("[{}] ", self.config.remotes[d - 1].host),
         };
-        let mut may_let_go = true;
+        let mut trend = Trend::default();
         let mut may_take = true;
+        let mut idle: Option<Idle> = None;
+        // A block of the original was made since the last look.
+        let mut made_one = false;
         'serve: while self.decode_ended().is_none() {
             while let Ok((s, worker)) = started.try_recv() {
                 self.arrived(
@@ -890,25 +1063,16 @@ impl<'a> Follower<'a> {
                 // Nothing to follow with.
                 return;
             }
-            if may_let_go
+            if std::mem::take(&mut made_one)
                 && let (Some(common), Some(grid), Some(machine)) =
                     (&commons[0], sides[0].grid, &mut sides[0].machine)
-                && machine
-                    .streams
-                    .iter()
-                    .any(|stream| grid.ready(stream.held()) >= stream.blocks + BEHIND)
             {
-                let stream = machine.streams.pop().expect("one is behind");
-                common.made(stream.pass, None, progress);
-                progress(Event::message(format!(
-                    "  {prefix}{} let go: {} does not keep up with the extraction on that \
-                     many; it is separated after it",
-                    stream.base,
-                    name_of(self.config, device)
-                )));
-                machine.let_go(stream);
-                may_let_go = false;
-                continue 'serve;
+                let held: Vec<u64> = machine.streams.iter().map(Stream::held).collect();
+                if self.watch(
+                    device, machine, &mut trend, grid, &held, common, &prefix, progress,
+                ) {
+                    continue 'serve;
+                }
             }
             // Frames until the original has a block ready again.
             let gap = match (sides[0].grid, &sides[0].machine) {
@@ -931,13 +1095,41 @@ impl<'a> Follower<'a> {
                     }
                     match self.intake(common, grid) {
                         Ok(Some(stream)) => {
+                            if let Some(idle) = idle.take() {
+                                self.trace_idle(device, sides, commons, idle, progress);
+                            }
+                            self.trace(
+                                device,
+                                format!(
+                                    "takes {}, {} of film written",
+                                    traced(common.stage, &stream.base),
+                                    film(stream.held())
+                                ),
+                                progress,
+                            );
                             if let Some(machine) = &mut sides[s].machine {
                                 machine.streams.push(stream);
+                            }
+                            if s == 0 {
+                                trend = Trend::default();
                             }
                             may_take = false;
                             continue 'serve;
                         }
-                        Ok(None) => sides[s].open = false,
+                        Ok(None) => {
+                            sides[s].open = false;
+                            self.trace(
+                                device,
+                                format!(
+                                    "takes no more{}: the line is empty, or {BEHIND} blocks behind",
+                                    match common.stage {
+                                        Stage::Original => "",
+                                        Stage::Dub => " of the dub",
+                                    }
+                                ),
+                                progress,
+                            );
+                        }
                         Err(why) => {
                             let stopped = self.stops[s][device].raised();
                             out(&mut sides[s], common, device, (why, stopped), progress);
@@ -951,27 +1143,46 @@ impl<'a> Follower<'a> {
                         continue;
                     }
                 }
+                let ready = sides[s].machine.as_ref().and_then(|machine| {
+                    let held: Vec<u64> = machine.streams.iter().map(Stream::held).collect();
+                    (0..machine.streams.len())
+                        .find(|&i| held[i] >= grid.ready_at(machine.streams[i].blocks))
+                        .map(|i| (i, held[i]))
+                });
+                let Some((i, held_i)) = ready else {
+                    continue;
+                };
+                if let Some(idle) = idle.take() {
+                    self.trace_idle(device, sides, commons, idle, progress);
+                }
                 let side = &mut sides[s];
                 let Some(machine) = &mut side.machine else {
                     continue;
                 };
-                let held: Vec<u64> = machine.streams.iter().map(Stream::held).collect();
-                let Some(i) = (0..machine.streams.len())
-                    .find(|&i| held[i] >= grid.ready_at(machine.streams[i].blocks))
-                else {
-                    continue;
-                };
                 #[cfg(test)]
                 self.gate.pass();
+                let asked = Instant::now();
                 let stepped = match machine.split(i) {
                     Err(why) => Stepped::Out(why),
                     Ok((worker, stream)) => {
                         let inputs = stream.raw.clone();
-                        match stream.step(worker, &inputs, held[i], false) {
-                            Ok(_) => {
+                        match stream.step(worker, &inputs, held_i, false) {
+                            Ok(made) => {
                                 common.made(stream.pass, Some((device, stream.written)), progress);
+                                self.trace(
+                                    device,
+                                    format!(
+                                        "{} block {} in {} ({}), {} of film written",
+                                        traced(common.stage, &stream.base),
+                                        stream.blocks.saturating_sub(1),
+                                        secs(asked.elapsed()),
+                                        made.describe(),
+                                        film(held_i)
+                                    ),
+                                    progress,
+                                );
                                 // What the extraction wrote meanwhile.
-                                let spent = stream.held().saturating_sub(held[i]);
+                                let spent = stream.held().saturating_sub(held_i);
                                 side.cost =
                                     Some(side.cost.map_or(spent, |cost| (3 * cost + spent) / 4));
                                 Stepped::Made
@@ -987,8 +1198,8 @@ impl<'a> Follower<'a> {
                 };
                 match stepped {
                     Stepped::Made => {
-                        may_let_go = true;
                         may_take = true;
+                        made_one |= s == 0;
                     }
                     Stepped::Refused(why) => {
                         let stream = machine.streams.remove(i);
@@ -998,13 +1209,37 @@ impl<'a> Follower<'a> {
                             stream.base
                         )));
                         machine.let_go(stream);
+                        if s == 0 {
+                            trend = Trend::default();
+                        }
                     }
                     Stepped::Out(why) => {
                         let stopped = self.stops[s][device].raised();
                         out(&mut sides[s], common, device, (why, stopped), progress);
+                        if s == 0 {
+                            trend = Trend::default();
+                        }
                     }
                 }
                 continue 'serve;
+            }
+            if idle.is_none() {
+                // What it waits for: the original's element nearest a
+                // block, or the dub's.
+                let next = (0..2).find_map(|s| {
+                    let (grid, machine) = (sides[s].grid?, sides[s].machine.as_ref()?);
+                    (0..machine.streams.len())
+                        .map(|i| (i, machine.streams[i].held()))
+                        .min_by_key(|&(i, held)| {
+                            grid.ready_at(machine.streams[i].blocks)
+                                .saturating_sub(held)
+                        })
+                        .map(|(i, held)| (s, i, held))
+                });
+                idle = Some(Idle {
+                    since: Instant::now(),
+                    next,
+                });
             }
             if sides.iter().any(|side| side.loading) {
                 // Not following yet: the tests' extraction waits for it.
@@ -1013,6 +1248,169 @@ impl<'a> Follower<'a> {
                 self.wait(device);
             }
         }
+    }
+
+    /// After a block of the original `device` made, its inputs holding
+    /// `held`: whether it is behind the extraction, and once [`STUCK`]
+    /// rounds of blocks behind it in a row did not shrink what it has left
+    /// to separate ([`Trend`]), the last of the followed let go — unless it
+    /// is half made ([`kept_half_made`]). `true` when one was.
+    #[allow(clippy::too_many_arguments)]
+    fn watch(
+        &self,
+        device: usize,
+        machine: &mut Machine,
+        trend: &mut Trend,
+        grid: Grid,
+        held: &[u64],
+        common: &Common,
+        prefix: &str,
+        progress: Progress,
+    ) -> bool {
+        let behind = |i: usize| {
+            grid.ready(held[i])
+                .saturating_sub(machine.streams[i].blocks)
+        };
+        let worst = (0..machine.streams.len()).max_by_key(|&i| behind(i));
+        let Some(worst) = worst.filter(|&i| behind(i) >= BEHIND) else {
+            if trend.watching() {
+                self.trace(device, "caught up".to_string(), progress);
+            }
+            *trend = Trend::default();
+            return false;
+        };
+        let streams = machine.streams.len();
+        let lag: u64 = machine
+            .streams
+            .iter()
+            .zip(held)
+            .map(|(stream, &held)| held.saturating_sub(stream.written))
+            .sum();
+        let needed = trend.needed();
+        let was = match trend.made(lag, streams) {
+            Round::Going => return false,
+            Round::Opened => {
+                self.trace(
+                    device,
+                    format!(
+                        "behind: {} is {} blocks behind, {} left to separate of what its {streams} \
+                         elements hold; looked at again in {streams} blocks",
+                        machine.streams[worst].base,
+                        behind(worst),
+                        film(lag)
+                    ),
+                    progress,
+                );
+                return false;
+            }
+            Round::Shrank { was } => {
+                self.trace(
+                    device,
+                    format!(
+                        "a round behind: {} left to separate, {} before it: catching up, all kept",
+                        film(lag),
+                        film(was)
+                    ),
+                    progress,
+                );
+                return false;
+            }
+            Round::Stuck { was, rounds } if rounds < needed => {
+                self.trace(
+                    device,
+                    format!(
+                        "a round behind: {} left to separate, {} before it: not catching up, \
+                         {rounds} round of {needed} in a row",
+                        film(lag),
+                        film(was)
+                    ),
+                    progress,
+                );
+                return false;
+            }
+            Round::Stuck { was, .. } => was,
+        };
+        let last = machine.streams.last().expect("one is behind");
+        let others = !self.config.remotes.is_empty();
+        if kept_half_made(last.written, common.whole, lag, others) {
+            self.trace(
+                device,
+                format!(
+                    "a round behind: {} left to separate, {} before it: not catching up, {needed} \
+                     rounds in a row, but {} is half made: kept, and finished after the extraction",
+                    film(lag),
+                    film(was),
+                    last.base
+                ),
+                progress,
+            );
+            return false;
+        }
+        self.trace(
+            device,
+            format!(
+                "a round behind: {} left to separate, {} before it: not catching up, {needed} \
+                 rounds in a row: {} let go",
+                film(lag),
+                film(was),
+                last.base
+            ),
+            progress,
+        );
+        let stream = machine.streams.pop().expect("one is behind");
+        common.made(stream.pass, None, progress);
+        progress(Event::message(format!(
+            "  {prefix}{} let go: {} does not keep up with the extraction on that many; it is \
+             separated after it",
+            stream.base,
+            name_of(self.config, device)
+        )));
+        machine.let_go(stream);
+        trend.shed();
+        true
+    }
+
+    /// One line of the trace ([`Event::Trace`]): what `device` did.
+    fn trace(&self, device: usize, text: String, progress: Progress) {
+        progress(Event::trace(format!(
+            "  follow, {}: {text}",
+            name_of(self.config, device)
+        )));
+    }
+
+    /// The end of a stretch `device` had nothing to do: said if it was long
+    /// enough to matter, with what it waited for and how far the extraction
+    /// got meanwhile.
+    fn trace_idle(
+        &self,
+        device: usize,
+        sides: &[Side; 2],
+        commons: &[Option<Common>; 2],
+        idle: Idle,
+        progress: Progress,
+    ) {
+        let long = idle.since.elapsed();
+        if long < IDLE_TRACED {
+            return;
+        }
+        let waited = idle.next.and_then(|(s, i, then)| {
+            let (grid, machine, common) = (
+                sides[s].grid?,
+                sides[s].machine.as_ref()?,
+                commons[s].as_ref()?,
+            );
+            let stream = machine.streams.get(i)?;
+            Some(format!(
+                "waiting for {} block {}, which needs {} of film: {} written then, {} now",
+                traced(common.stage, &stream.base),
+                stream.blocks,
+                film(grid.ready_at(stream.blocks)),
+                film(then),
+                film(stream.held())
+            ))
+        });
+        let waited = waited.unwrap_or_else(|| "nothing followed".to_string());
+        self.trace(device, format!("idle {}, {waited}", secs(long)), progress);
     }
 
     /// A stage's worker on `device`, loaded — or not: taken in.
@@ -1455,6 +1853,32 @@ pub(super) struct Stream {
     outputs: Vec<Grown>,
 }
 
+/// A block made: whether it was the last, and how long it took.
+struct Made {
+    last: bool,
+    took: Took,
+    /// Folding its stems into the outputs.
+    fold: Duration,
+}
+
+impl Made {
+    /// « worker 10.40 s, fold 0.05 s »; a remote's with its transfers.
+    fn describe(&self) -> String {
+        let Took { send, run, back } = self.took;
+        let fold = secs(self.fold);
+        if send.is_zero() && back.is_zero() {
+            format!("worker {}, fold {fold}", secs(run))
+        } else {
+            format!(
+                "send {}, worker {}, back {}, fold {fold}",
+                secs(send),
+                secs(run),
+                secs(back)
+            )
+        }
+    }
+}
+
 /// One output of a followed unit, growing.
 struct Grown {
     unit: usize,
@@ -1531,14 +1955,14 @@ impl Stream {
     }
 
     /// The next block, its inputs holding `held` frames (`whole`: and no
-    /// more), added to the outputs. `true` once the last one is in.
+    /// more), added to the outputs.
     fn step(
         &mut self,
         worker: &mut Worker,
         inputs: &[PathBuf],
         held: u64,
         whole: bool,
-    ) -> Result<bool> {
+    ) -> Result<Made> {
         let block = worker.block(
             &Ask {
                 base: &self.base,
@@ -1556,6 +1980,7 @@ impl Stream {
                 self.base, block.from, self.written
             )));
         }
+        let folding = Instant::now();
         if block.to > block.from {
             let voice = self.stems.join(format!("{}{VOICE_SUFFIX}", self.base));
             let rest = self.stems.join(format!("{}{REST_SUFFIX}", self.base));
@@ -1587,7 +2012,11 @@ impl Stream {
             self.written = block.to;
             self.blocks += 1;
         }
-        Ok(block.last)
+        Ok(Made {
+            last: block.last,
+            took: block.took,
+            fold: folding.elapsed(),
+        })
     }
 
     /// What is left of it, from the extraction's finished waveforms, and its
@@ -1617,7 +2046,7 @@ impl Stream {
         }
         loop {
             let before = self.written;
-            let last = self.step(worker, &inputs, length, true)?;
+            let last = self.step(worker, &inputs, length, true)?.last;
             made((self.written - before) as f64 / length.max(1) as f64);
             if last {
                 break;
@@ -2371,7 +2800,9 @@ mod tests {
         fn progress(self: &Arc<Self>) -> impl Fn(Event) + Sync + use<> {
             let said = Arc::clone(self);
             move |event| match event {
-                Event::Message { text } => said.0.lock().unwrap().push(text),
+                Event::Message { text } | Event::Trace { text } => {
+                    said.0.lock().unwrap().push(text)
+                }
                 Event::Fraction {
                     what,
                     done,
@@ -2521,6 +2952,32 @@ mod tests {
             pause,
             in_step,
             None,
+        );
+        (ran.made[0], ran.outputs, ran.said)
+    }
+
+    /// [`follow`], and with `gate`, this machine makes that many blocks for
+    /// every chunk written ([`follow_with`]).
+    #[allow(clippy::too_many_arguments)]
+    fn follow_gated(
+        bench: &Bench,
+        film: &Film,
+        pairs: Pairs,
+        env: Vec<(&'static str, String)>,
+        chunk: u64,
+        pause: Duration,
+        in_step: bool,
+        gate: Option<&dyn Fn(usize) -> f64>,
+    ) -> (f64, Outputs, Arc<Said>) {
+        let ran = follow_with(
+            bench,
+            film,
+            pairs,
+            [env.clone(), env],
+            chunk,
+            pause,
+            in_step,
+            gate,
         );
         (ran.made[0], ran.outputs, ran.said)
     }
@@ -2786,30 +3243,227 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_that_falls_behind_lets_the_last_elements_go() {
-        let bench = Bench::new("behind");
+    fn a_round_tells_a_machine_that_catches_up_from_one_that_does_not() {
+        let mut trend = Trend::default();
+        assert!(!trend.watching());
+        // Three elements: a round is three blocks after the one that opens it.
+        assert_eq!(trend.made(100, 3), Round::Opened);
+        assert!(trend.watching());
+        assert_eq!(trend.made(140, 3), Round::Going);
+        assert_eq!(trend.made(120, 3), Round::Going);
+        assert_eq!(
+            trend.made(100, 3),
+            Round::Stuck {
+                was: 100,
+                rounds: 1
+            }
+        );
+        // Less than when it opened, though it went up meanwhile.
+        assert_eq!(trend.made(150, 3), Round::Going);
+        assert_eq!(trend.made(110, 3), Round::Going);
+        assert_eq!(trend.made(99, 3), Round::Shrank { was: 100 });
+        // The count of rounds in a row starts again.
+        for _ in 0..2 {
+            trend.made(120, 3);
+        }
+        assert_eq!(trend.made(99, 3), Round::Stuck { was: 99, rounds: 1 });
+        for _ in 0..2 {
+            trend.made(120, 3);
+        }
+        assert_eq!(trend.made(130, 3), Round::Stuck { was: 99, rounds: 2 });
+        // Two in a row let one go; then one is enough, until it catches up.
+        assert_eq!(trend.needed(), STUCK);
+        trend.shed();
+        assert!(!trend.watching());
+        assert_eq!(trend.needed(), 1);
+        assert_eq!(trend.made(130, 2), Round::Opened);
+        assert_eq!(Trend::default().needed(), STUCK);
+    }
+
+    #[test]
+    fn half_made_is_kept_unless_another_machine_would_be_done_sooner() {
+        let whole = 1_000;
+        // Under half: let go.
+        assert!(!kept_half_made(499, whole, 5_000, false));
+        // Half made: kept, alone or not, while what is left is less than an
+        // element whole.
+        assert!(kept_half_made(500, whole, 5_000, false));
+        assert!(kept_half_made(500, whole, 999, true));
+        // More left than an element whole, and another machine to take it.
+        assert!(!kept_half_made(500, whole, 1_000, true));
+        // The film's length unknown: nothing is kept for it.
+        assert!(!kept_half_made(500, 0, 0, false));
+    }
+
+    /// The lines the run said that `needle` is in, in order.
+    fn lines_in<'s>(said: &'s [String], needle: &str) -> Vec<&'s String> {
+        said.iter().filter(|line| line.contains(needle)).collect()
+    }
+
+    /// **A burst the machine catches up on loses nothing.** The film comes
+    /// four times as fast as this machine separates it for three blocks of
+    /// it: the elements served last fall two and three blocks behind, the
+    /// point at which the follower used to let one go every block made. It
+    /// catches up once the burst is over, and keeps them all.
+    #[test]
+    fn a_burst_the_machine_catches_up_on_loses_nothing() {
+        let bench = Bench::new("burst");
         let film = Film::objects(4, 160_000);
         let whole = bench.whole(&film, Pairs::default());
-        // A block takes the mock ten times as long as the decoder takes to
-        // write one.
-        let env = vec![(MOCK_BLOCK_MS, "20".to_string())];
-        let (made, followed, said) = follow(
+        // A chunk is a quarter of a block of each of the four elements: a
+        // block of work. Twice what comes, but a quarter of it from the
+        // fifth block of film to the eighth.
+        let blocks = |n: usize| if (20..32).contains(&n) { 0.25 } else { 2.0 };
+        let (made, followed, said) = follow_gated(
             &bench,
             &film,
             Pairs::default(),
-            env,
-            4_000,
-            Duration::from_millis(1),
-            false,
+            Vec::new(),
+            STEP / 4,
+            Duration::ZERO,
+            true,
+            Some(&blocks),
+        );
+        let lines = said.0.lock().unwrap().clone();
+        let all = lines.join("\n");
+        assert_eq!(
+            lines_in(&lines, ": behind: 13 is 2 blocks behind").len(),
+            1,
+            "{all}"
         );
         assert!(
-            said.any("does not keep up with the extraction"),
-            "{}",
-            said.lines()
+            !lines_in(&lines, "not catching up, 1 round of 2").is_empty(),
+            "{all}"
+        );
+        assert!(
+            !lines_in(&lines, "catching up, all kept").is_empty(),
+            "{all}"
+        );
+        assert!(!lines_in(&lines, ": caught up").is_empty(), "{all}");
+        assert!(lines_in(&lines, "let go").is_empty(), "{all}");
+        assert!(said.any("4 of the original's 4 elements followed"), "{all}");
+        ends_on_what_was_made(&said, made, 4);
+        same(&followed, &whole);
+    }
+
+    /// **A machine that does not keep up lets one go after two rounds.**
+    /// Fast enough to take every element at first, it then separates three
+    /// fifths of what comes: the last two are let go, one at a time — the
+    /// first after two rounds behind in a row, the next after one more —
+    /// not one every block made.
+    #[test]
+    fn a_machine_that_falls_behind_lets_the_last_elements_go_a_round_apart() {
+        let bench = Bench::new("behind");
+        let film = Film::objects(4, 160_000);
+        let whole = bench.whole(&film, Pairs::default());
+        let blocks = |n: usize| if n < 9 { 3.0 } else { 0.6 };
+        let (made, followed, said) = follow_gated(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            STEP / 4,
+            Duration::ZERO,
+            true,
+            Some(&blocks),
+        );
+        let lines = said.0.lock().unwrap().clone();
+        let all = lines.join("\n");
+        let let_go: Vec<String> = lines_in(&lines, "does not keep up with the extraction")
+            .into_iter()
+            .cloned()
+            .collect();
+        assert_eq!(let_go.len(), 2, "{all}");
+        assert!(let_go[0].contains("  13 let go"), "{all}");
+        assert!(let_go[1].contains("  12 let go"), "{all}");
+        // Between being behind and the first let go, two rounds of as many
+        // blocks as elements followed; then one round for the next.
+        let mut since = lines.iter().position(|l| l.contains(": behind: ")).unwrap();
+        for (gone, rounds) in let_go.iter().zip([STUCK * 4, 3]) {
+            let at = lines.iter().position(|l| l == gone).unwrap();
+            let blocks = lines[since..at]
+                .iter()
+                .filter(|l| l.contains(" block ") && l.contains(" of film written"))
+                .count();
+            assert!(blocks >= rounds, "{blocks} blocks\n{all}");
+            since = at;
+        }
+        assert!(
+            said.any("not catching up, 1 rounds in a row: 12 let go"),
+            "{all}"
         );
         // What was made of an element let go is no longer counted.
         ends_on_what_was_made(&said, made, 4);
         same(&followed, &whole);
+    }
+
+    /// **Half made, an element is kept.** The machine keeps up through the
+    /// first three fifths of the film, then falls behind for good: what is
+    /// left of every element is finished after the extraction, rather than
+    /// made again whole.
+    #[test]
+    fn an_element_half_made_is_kept_however_far_behind() {
+        let bench = Bench::new("half");
+        let film = Film::objects(4, 160_000);
+        let whole = bench.whole(&film, Pairs::default());
+        let blocks = |n: usize| if n < 48 { 2.0 } else { 0.4 };
+        let (made, followed, said) = follow_gated(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            STEP / 4,
+            Duration::ZERO,
+            true,
+            Some(&blocks),
+        );
+        let all = said.lines();
+        assert!(
+            said.any("rounds in a row, but 13 is half made: kept"),
+            "{all}"
+        );
+        assert!(!said.any("let go"), "{all}");
+        assert!(made < 3.5, "{made}: it did not fall behind\n{all}");
+        ends_on_what_was_made(&said, made, 4);
+        same(&followed, &whole);
+    }
+
+    /// **The trace says what each request took.** Every block on this
+    /// machine, every element taken, and the end of the decode.
+    #[test]
+    fn the_trace_says_every_block_and_what_it_took() {
+        let bench = Bench::new("trace");
+        let film = Film::objects(3, 60_000);
+        let (_, _, said) = follow(
+            &bench,
+            &film,
+            Pairs::default(),
+            Vec::new(),
+            2_000,
+            Duration::from_millis(2),
+            true,
+        );
+        let lines = said.0.lock().unwrap().clone();
+        let all = lines.join("\n");
+        for element in ["10", "11", "12"] {
+            assert!(
+                said.any(&format!("  follow, this machine: takes {element}, ")),
+                "{all}"
+            );
+            assert!(
+                said.any(&format!("  follow, this machine: {element} block 0 in ")),
+                "{all}"
+            );
+        }
+        assert!(said.any(" (worker "), "{all}");
+        assert!(said.any(", fold "), "{all}");
+        // What it waited for while the film came: the first block of each.
+        assert!(said.any("  follow, this machine: idle "), "{all}");
+        assert!(said.any(", waiting for 10 block 0, which needs "), "{all}");
+        assert!(
+            said.any("this machine: the decode is over: 3 followed, "),
+            "{all}"
+        );
     }
 
     #[test]
@@ -3243,6 +3897,13 @@ mod tests {
             "{}",
             said.lines()
         );
+        // A remote's blocks are traced with its transfers.
+        let traced = said.0.lock().unwrap().iter().any(|l| {
+            l.contains(&format!("  follow, {far}: 11 block 0 in "))
+                && l.contains(" (send ")
+                && l.contains(", back ")
+        });
+        assert!(traced, "{}", said.lines());
         same(&followed, &whole);
         // Every input and stem carried there went once it had served.
         assert_eq!(

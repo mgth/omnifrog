@@ -331,6 +331,11 @@ impl Reporter {
             }
             return;
         }
+        // The run's log has it, and a terminal would drown in it; a front
+        // end reading the JSON gets it, to keep or leave.
+        if matches!(event, Event::Trace { .. }) {
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         let event = match event {
             Event::Step {
@@ -351,6 +356,7 @@ impl Reporter {
         };
         match event {
             Event::Step { .. } | Event::Took { .. } => unreachable!("worded as a message above"),
+            Event::Trace { .. } => unreachable!("left out above"),
             Event::Message { text } => {
                 if self.tty && state.open {
                     let _ = writeln!(err);
