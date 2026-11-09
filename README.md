@@ -283,18 +283,19 @@ extraction's time takes in at most the end of the block in flight.
 through the extraction (about 80 % of it, measured with a 9070 XT and a 7900 XTX on a 1 h 46
 film), and the dub's channels grow in step with it. So each machine also loads the dub's model, in
 a second worker, and follows the dub's channels block by block, from a line of their own — open
-for as long as a channel taken could still be half made by the end of the decode, not only the
-original's first two blocks of film, and to a machine whose channels are not behind. The
-machine drives its two workers one request at a time, and the original comes first: its block
-whenever one is ready, its line whenever there is time for one more, and a block of the dub only
-when it would end, with a quarter to spare, before the original's next one is ready — by what a
-block costs that machine in film the extraction writes meanwhile. Most of that fifth is the
-original's slack, which it needs: the extraction reads the file at one rate, so where the video is
-lighter the film comes several times faster for a while. A dub served whenever the original had
-nothing ready took that slack away, and on the film above both machines let one element of the
-original go after another. The dub is never let go for falling behind; a channel at least half
-made when the decode ends is finished by the machine that followed it, in the dub's step, before
-it takes from the line, and one less made is made whole by any. Its comparison of the voices and
+to a machine once the original's line has closed there, through the first half of the film, and
+while its channels are not behind. The machine drives its two workers one request at a time, and
+the original comes first: its block whenever one is ready, its line whenever there is time for one
+more, and a block of the dub whenever the original has none ready. A dub taken from the start and
+served that way cost the original one element after another on the film above, as the original
+was still taking them: the extraction reads the file at one rate, so where the video is lighter
+the film comes several times faster for a while. Once the original takes no more, a block of the
+dub holds its next one back by at most its own length, and a machine behind always has a block of
+the original ready, so the dub never takes the time it needs to catch up. On that film, the dub
+then filled every gap the original left (25 of its blocks made during the extraction, against 6
+when it waited for a gap a quarter longer than a block), and the original lost nothing. The dub is
+never let go for falling behind; whatever was made of a channel when the decode ends is finished
+by the machine that followed it, in the dub's step, before it takes from the line. Its comparison of the voices and
 its measure of the dialogue run on the finished channels, as before, and a channel comes out the
 same followed or made whole. On the same 9070 XT, with a desktop holding 7.3 GiB of it, the two
 workers took it to 14.8 GiB of 16.3. On a remote, each worker says which run it is for
