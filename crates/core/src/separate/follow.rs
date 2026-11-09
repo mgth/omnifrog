@@ -3160,6 +3160,23 @@ mod tests {
         said: Arc<Said>,
     }
 
+    /// Held by the tests' side of a [`std::thread::scope`] that follows.
+    /// Should that side panic (a write to a full temporary directory, say),
+    /// the follower is told the decode failed, its gate open: the scope
+    /// waits for its threads before it passes the panic on, and the follower
+    /// would wait for the extraction's end for ever — the test hung instead
+    /// of failed.
+    struct Unwinding<'f, 'a>(&'f Follower<'a>);
+
+    impl Drop for Unwinding<'_, '_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.gate.open();
+                self.0.decoded(false);
+            }
+        }
+    }
+
     /// Follow `film` as it grows, then separate it: what was followed of
     /// the original, the outputs, and what the run said. `in_step`, the
     /// extraction writes a chunk once the follower made every block the
@@ -3255,6 +3272,7 @@ mod tests {
         let dir = job.extract_dir();
         let handed = std::thread::scope(|scope| {
             let following = scope.spawn(|| follower.follow(&progress));
+            let _unwinding = Unwinding(&follower);
             let devices = 1 + bench.config.remotes.len();
             // Every machine has its first element, or is done: a slow one
             // starting its worker does not find the extraction over.
@@ -4123,6 +4141,7 @@ mod tests {
         let progress = said.progress();
         let followed = std::thread::scope(|scope| {
             let following = scope.spawn(|| follower.follow(&progress));
+            let _unwinding = Unwinding(&follower);
             film.grow(
                 &job.extract_dir(),
                 2_000,
